@@ -8,7 +8,7 @@ app.use(express.json());
 
 // ===== REPLACE WITH YOUR REAL PAYNECTA CREDENTIALS =====
 const PAYNECTA_API_URL = 'https://paynecta.co.ke/api/v1/payment/initialize';
-const API_KEY = 'hmp_vVyxBm......'; // ⬅️ REPLACE with your full API key
+const API_KEY = 'hmp_BN9eezffYAuSx3S5BLt3vRiOdvnMmgpiDePcYH8s'; // ⬅️ REPLACE with your full API key
 const USER_EMAIL = 'victorngetich388@gmail.com';
 const PAYMENT_CODE = 'PNT_266269';
 // ========================================================
