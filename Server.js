@@ -35,14 +35,19 @@ app.post('/api/initiate-payment', async (req, res) => {
     }
 
     try {
+        // Read environment variables
         const apiKey = process.env.PAYNECTA_API_KEY;
         const userEmail = process.env.PAYNECTA_EMAIL;
         const paymentCode = process.env.PAYNECTA_PAYMENT_CODE;
-        const apiUrl = process.env.PAYNECTA_API_URL || 'https://api.paynecta.co.ke';
+        const apiUrl = process.env.PAYNECTA_API_URL;
 
-        if (!apiKey || !userEmail || !paymentCode) {
-            console.error('Missing Paynecta credentials');
-            return res.status(500).json({ success: false, error: 'Server payment configuration error' });
+        // Check if all required variables are present
+        if (!apiKey || !userEmail || !paymentCode || !apiUrl) {
+            console.error('Missing Paynecta credentials in environment variables');
+            return res.status(500).json({ 
+                success: false, 
+                error: 'Server payment configuration error. Missing credentials.' 
+            });
         }
 
         const payload = {
@@ -51,7 +56,8 @@ app.post('/api/initiate-payment', async (req, res) => {
             amount: amount
         };
 
-        console.log('Initiating Paynecta payment:', payload);
+        console.log('Initiating Paynecta payment to:', apiUrl);
+        console.log('Payload:', payload);
 
         const response = await axios.post(`${apiUrl}/api/v1/payment/initialize`, payload, {
             headers: {
@@ -71,7 +77,7 @@ app.post('/api/initiate-payment', async (req, res) => {
         }
 
     } catch (error) {
-        console.error('Paynecta error:', error.response?.data || error.message);
+        console.error('Paynecta error details:', error.response?.data || error.message);
         const errorMsg = error.response?.data?.message || error.message || 'Payment initiation failed';
         res.status(500).json({ success: false, error: errorMsg });
     }
