@@ -1,5 +1,5 @@
 {
-  "name": "schemevault-backend",
+  "name": "my-backend",
   "version": "1.0.0",
   "description": "Secure Paynecta API backend",
   "main": "server.js",
