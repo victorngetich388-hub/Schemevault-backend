@@ -1,7 +1,6 @@
 {
   "name": "schemevault-backend",
   "version": "1.0.0",
-  "description": "Backend for selling schemes of work with M-Pesa (Paynecta)",
   "main": "Server.js",
   "scripts": {
     "start": "node Server.js"
