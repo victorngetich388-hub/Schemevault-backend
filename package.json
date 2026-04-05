@@ -1,10 +1,10 @@
 {
-  "name": "my-backend",
+  "name": "schemevault-backend",
   "version": "1.0.0",
-  "description": "Secure Paynecta API backend",
-  "main": "server.js",
+  "description": "Backend for selling schemes of work with M-Pesa (Paynecta)",
+  "main": "Server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node Server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
