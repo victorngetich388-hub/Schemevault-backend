@@ -19,15 +19,12 @@ app.use(express.urlencoded({ extended: true }));
 const UPLOAD_DIR = 'uploads';
 const COVERS_DIR = 'covers';
 
-// Create folders if they don't exist
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR);
 
-// Serve static files (so customers can download directly)
 app.use('/uploads', express.static(UPLOAD_DIR));
 app.use('/covers', express.static(COVERS_DIR));
 
-// Configure multer for file uploads
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         if (file.fieldname === 'coverImage') {
@@ -44,7 +41,7 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 // ------------------------------
-// Data Files (JSON storage)
+// Data Files
 // ------------------------------
 const PRODUCTS_FILE = 'products.json';
 const STATS_FILE = 'stats.json';
@@ -64,13 +61,12 @@ const writeJSON = (file, data) => {
 };
 
 // ------------------------------
-// Admin Authentication
+// Admin Authentication - HARDCODED PASSWORD
 // ------------------------------
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '0726019859';
+const ADMIN_PASSWORD = '0726019859';  // <-- CHANGE THIS TO YOUR PASSWORD
 const RECOVERY_EMAIL = 'victorngetich388@gmail.com';
 let resetCodes = {};
 
-// Email setup
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
@@ -79,7 +75,6 @@ const transporter = nodemailer.createTransport({
     },
 });
 
-// Admin login
 app.post('/api/admin/login', (req, res) => {
     const { password } = req.body;
     if (password === ADMIN_PASSWORD) {
@@ -90,14 +85,12 @@ app.post('/api/admin/login', (req, res) => {
     }
 });
 
-// Middleware to protect admin routes
 function isAdmin(req, res, next) {
     const token = req.headers['x-admin-token'];
     if (token) return next();
     res.status(401).json({ error: 'Unauthorized' });
 }
 
-// Forgot password - send reset code
 app.post('/api/admin/forgot-password', async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     resetCodes[code] = Date.now() + 3600000;
@@ -114,23 +107,13 @@ app.post('/api/admin/forgot-password', async (req, res) => {
     }
 });
 
-// Reset password with code
 app.post('/api/admin/reset-password', (req, res) => {
     const { code, newPassword } = req.body;
     if (!resetCodes[code] || resetCodes[code] < Date.now()) {
         return res.status(400).json({ error: 'Invalid or expired code' });
     }
     delete resetCodes[code];
-    res.json({ success: true, message: 'Password reset. Update Render environment variable manually.' });
-});
-
-// Change password
-app.post('/api/admin/change-password', isAdmin, (req, res) => {
-    const { currentPassword, newPassword } = req.body;
-    if (currentPassword !== ADMIN_PASSWORD) {
-        return res.status(401).json({ error: 'Current password incorrect' });
-    }
-    res.json({ success: true, message: 'Password change requested. Please update Render environment variable.' });
+    res.json({ success: true, message: 'Password reset. Update your code manually.' });
 });
 
 // ------------------------------
@@ -206,13 +189,11 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
     const product = products.find(p => p.id === id);
     
     if (product) {
-        // Delete PDF file
         if (product.fileUrl) {
             const filename = product.fileUrl.split('/').pop();
             const filePath = path.join(UPLOAD_DIR, filename);
             if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
         }
-        // Delete cover image
         if (product.coverUrl) {
             const filename = product.coverUrl.split('/').pop();
             const filePath = path.join(COVERS_DIR, filename);
@@ -226,7 +207,7 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Secure Download (hide real file URL)
+// Secure Download Tokens
 // ------------------------------
 const downloadTokens = {};
 
@@ -271,7 +252,7 @@ app.get('/api/download/:token', async (req, res) => {
 });
 
 // ------------------------------
-// Public Endpoints (Customer Frontend)
+// Public Endpoints
 // ------------------------------
 app.get('/api/products', (req, res) => {
     const products = readJSON(PRODUCTS_FILE, []);
@@ -309,7 +290,7 @@ app.post('/api/track-download', (req, res) => {
 });
 
 // ------------------------------
-// Admin Analytics Endpoints
+// Admin Analytics
 // ------------------------------
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -352,7 +333,7 @@ app.get('/api/admin/activity', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Scheduled Messages Endpoints
+// Scheduled Messages
 // ------------------------------
 app.get('/api/admin/messages', isAdmin, (req, res) => {
     res.json(readJSON(MESSAGES_FILE, []));
@@ -396,7 +377,7 @@ app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Payment Endpoint (Placeholder - Replace with Paynecta)
+// Payment Endpoint (Placeholder)
 // ------------------------------
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount } = req.body;
