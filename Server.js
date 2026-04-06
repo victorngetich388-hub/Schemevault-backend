@@ -564,7 +564,6 @@ app.post('/api/payment-webhook', (req, res) => {
     res.sendStatus(200);
 });
 
-// Health check
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
