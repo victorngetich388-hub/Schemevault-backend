@@ -108,7 +108,7 @@ const defaultGrades = [
 ];
 
 // ------------------------------
-// Active Users Tracking (Real-time)
+// Active Users Tracking
 // ------------------------------
 const activeSessions = new Map();
 
@@ -186,7 +186,6 @@ app.post('/api/admin/change-password', isAdmin, (req, res) => {
     res.json({ success: true, message: 'Change requested. Update Render environment variable.' });
 });
 
-// Cache version endpoint for real-time updates
 app.get('/api/cache-version', (req, res) => {
     res.json({ version: cacheVersion });
 });
@@ -286,6 +285,7 @@ app.post('/api/admin/learning-areas', isAdmin, (req, res) => {
     };
     areas.push(newArea);
     writeJSON(LEARNING_AREAS_FILE, areas);
+    cacheVersion = Date.now();
     res.json({ success: true, area: newArea });
 });
 
@@ -298,6 +298,7 @@ app.put('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
     if (name !== undefined) areas[index].name = name;
     if (active !== undefined) areas[index].active = active === true || active === 'true';
     writeJSON(LEARNING_AREAS_FILE, areas);
+    cacheVersion = Date.now();
     res.json({ success: true });
 });
 
@@ -306,6 +307,7 @@ app.delete('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
     let areas = readJSON(LEARNING_AREAS_FILE, []);
     areas = areas.filter(a => a.id !== id);
     writeJSON(LEARNING_AREAS_FILE, areas);
+    cacheVersion = Date.now();
     res.json({ success: true });
 });
 
@@ -344,6 +346,7 @@ app.post('/api/admin/grades', isAdmin, (req, res) => {
     };
     grades.push(newGrade);
     writeJSON(GRADES_FILE, grades);
+    cacheVersion = Date.now();
     res.json({ success: true, grade: newGrade });
 });
 
@@ -356,6 +359,7 @@ app.put('/api/admin/grades/:id', isAdmin, (req, res) => {
     if (name !== undefined) grades[index].name = name;
     if (active !== undefined) grades[index].active = active === true || active === 'true';
     writeJSON(GRADES_FILE, grades);
+    cacheVersion = Date.now();
     res.json({ success: true });
 });
 
@@ -364,6 +368,7 @@ app.delete('/api/admin/grades/:id', isAdmin, (req, res) => {
     let grades = readJSON(GRADES_FILE, []);
     grades = grades.filter(g => g.id !== id);
     writeJSON(GRADES_FILE, grades);
+    cacheVersion = Date.now();
     res.json({ success: true });
 });
 
@@ -432,6 +437,7 @@ app.get('/api/admin/term-settings', isAdmin, (req, res) => {
 app.put('/api/admin/term-settings', isAdmin, (req, res) => {
     const settings = req.body;
     writeJSON(TERM_SETTINGS_FILE, settings);
+    cacheVersion = Date.now();
     res.json({ success: true });
 });
 
@@ -467,10 +473,7 @@ app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile' }, { n
         };
         products.push(newProduct);
         writeJSON(PRODUCTS_FILE, products);
-        
-        // Update cache version to trigger real-time refresh
         cacheVersion = Date.now();
-        
         res.json({ success: true, product: newProduct });
     } catch (err) {
         console.error(err);
@@ -486,10 +489,7 @@ app.put('/api/admin/products/:id', isAdmin, (req, res) => {
     if (index === -1) return res.status(404).json({ error: 'Not found' });
     products[index] = { ...products[index], ...updates };
     writeJSON(PRODUCTS_FILE, products);
-    
-    // Update cache version to trigger real-time refresh
     cacheVersion = Date.now();
-    
     res.json({ success: true, product: products[index] });
 });
 
@@ -511,24 +511,102 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
     }
     products = products.filter(p => p.id !== id);
     writeJSON(PRODUCTS_FILE, products);
-    
-    // Update cache version to trigger real-time refresh
     cacheVersion = Date.now();
-    
     res.json({ success: true });
 });
 
 // ------------------------------
-// SECURE PAYMENT VERIFICATION
+// PAYNECTA STK PUSH INTEGRATION
 // ------------------------------
 const verifiedPayments = new Map();
 const downloadTokens = new Map();
 
+// Paynecta STK Push endpoint
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
-    console.log(`Payment request: ${phone}, KES ${amount} for product ${productId}`);
+    
+    if (!phone || !amount || !productId) {
+        return res.status(400).json({ success: false, error: 'Phone, amount and product ID required' });
+    }
+    
+    // Clean phone number to 254 format
+    let cleanPhone = phone.replace(/\s/g, '');
+    if (cleanPhone.startsWith('0')) {
+        cleanPhone = '254' + cleanPhone.substring(1);
+    } else if (cleanPhone.startsWith('+')) {
+        cleanPhone = cleanPhone.substring(1);
+    }
     
     const transactionId = 'TXN_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    
+    try {
+        // Get Paynecta credentials from environment variables
+        const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://api.paynecta.co.ke/api/v1';
+        const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
+        const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE;
+        const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
+        
+        if (!PAYNECTA_API_KEY || !PAYNECTA_PAYMENT_CODE) {
+            console.error('Paynecta credentials missing');
+            // For demo/testing without Paynecta credentials
+            return simulatePayment(res, phone, amount, productId, transactionId);
+        }
+        
+        // Call Paynecta STK Push API
+        const paynectaResponse = await axios.post(
+            `${PAYNECTA_API_URL}/stkpush`,
+            {
+                phoneNumber: cleanPhone,
+                amount: amount,
+                paymentCode: PAYNECTA_PAYMENT_CODE,
+                email: PAYNECTA_EMAIL || 'customer@schemevault.co.ke',
+                reference: transactionId
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${PAYNECTA_API_KEY}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        
+        if (paynectaResponse.data && paynectaResponse.data.success) {
+            // Record payment attempt
+            const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+            if (!stats.payments) stats.payments = [];
+            stats.payments.push({ 
+                date: new Date().toISOString(), 
+                status: 'pending', 
+                amount, 
+                phone: cleanPhone, 
+                productId,
+                transactionId,
+                ip: getClientIp(req) 
+            });
+            writeJSON(STATS_FILE, stats);
+            
+            res.json({ 
+                success: true, 
+                transactionId: transactionId,
+                message: 'STK Push sent to your phone'
+            });
+        } else {
+            res.status(400).json({ 
+                success: false, 
+                error: paynectaResponse.data?.message || 'Payment initiation failed' 
+            });
+        }
+    } catch (error) {
+        console.error('Paynecta error:', error.response?.data || error.message);
+        
+        // Fallback to simulation for testing
+        return simulatePayment(res, phone, amount, productId, transactionId);
+    }
+});
+
+// Simulate payment for testing (when Paynecta credentials not set)
+function simulatePayment(res, phone, amount, productId, transactionId) {
+    console.log('Using simulated payment (no Paynecta credentials)');
     
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     if (!stats.payments) stats.payments = [];
@@ -543,7 +621,7 @@ app.post('/api/initiate-payment', async (req, res) => {
     });
     writeJSON(STATS_FILE, stats);
     
-    // Simulate payment processing (3 seconds delay)
+    // Simulate successful payment after 5 seconds
     setTimeout(() => {
         const updatedStats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
         const paymentIndex = updatedStats.payments.findIndex(p => p.transactionId === transactionId);
@@ -558,13 +636,45 @@ app.post('/api/initiate-payment', async (req, res) => {
                 amount: amount,
                 expires: Date.now() + 300000
             });
-            console.log(`Payment verified for transaction ${transactionId}`);
+            console.log(`Simulated payment verified for transaction ${transactionId}`);
         }
-    }, 3000);
+    }, 5000);
     
-    res.json({ success: true, transactionId: transactionId });
+    res.json({ 
+        success: true, 
+        transactionId: transactionId,
+        message: 'Simulated payment - STK Push would be sent'
+    });
+}
+
+// Webhook endpoint for Paynecta to confirm payment
+app.post('/api/payment-webhook', (req, res) => {
+    console.log('Paynecta webhook received:', req.body);
+    
+    const { CheckoutRequestID, ResultCode, amount, phoneNumber, reference } = req.body;
+    
+    if (ResultCode === 0) {
+        // Payment successful
+        const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+        const paymentIndex = stats.payments.findIndex(p => p.transactionId === reference);
+        if (paymentIndex !== -1) {
+            stats.payments[paymentIndex].status = 'success';
+            writeJSON(STATS_FILE, stats);
+            
+            const verifyToken = 'VERIFIED_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+            verifiedPayments.set(verifyToken, { 
+                productId: stats.payments[paymentIndex].productId, 
+                transactionId: reference,
+                amount: amount,
+                expires: Date.now() + 300000
+            });
+        }
+    }
+    
+    res.sendStatus(200);
 });
 
+// Check payment status
 app.get('/api/payment-status/:transactionId', (req, res) => {
     const { transactionId } = req.params;
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -599,6 +709,7 @@ app.get('/api/payment-status/:transactionId', (req, res) => {
     }
 });
 
+// Request download token (only after payment)
 app.post('/api/request-download', (req, res) => {
     const { verificationToken, productId } = req.body;
     
@@ -608,7 +719,7 @@ app.post('/api/request-download', (req, res) => {
     
     const verifiedData = verifiedPayments.get(verificationToken);
     if (!verifiedData || verifiedData.expires < Date.now()) {
-        return res.status(403).json({ error: 'Payment not verified or verification expired.' });
+        return res.status(403).json({ error: 'Payment not verified or verification expired. Complete payment first.' });
     }
     
     if (verifiedData.productId !== productId) {
@@ -626,12 +737,13 @@ app.post('/api/request-download', (req, res) => {
     res.json({ success: true, token: downloadToken });
 });
 
+// Download file
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
     const record = downloadTokens.get(token);
     
     if (!record || record.expires < Date.now()) {
-        return res.status(403).send('Download link expired or invalid.');
+        return res.status(403).send('Download link expired or invalid. Complete payment first.');
     }
     
     const products = readJSON(PRODUCTS_FILE, []);
@@ -659,7 +771,7 @@ app.get('/api/download/:token', async (req, res) => {
         
     } catch (err) {
         console.error('Download error:', err);
-        res.status(500).send('Download error.');
+        res.status(500).send('Download error. Please contact support.');
     }
 });
 
@@ -738,7 +850,7 @@ app.post('/api/track-download', (req, res) => {
 });
 
 // ------------------------------
-// Admin Analytics
+// Admin Analytics (short version - same as before)
 // ------------------------------
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -802,7 +914,7 @@ app.put('/api/admin/feedback/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Messages & Popups
+// Messages & Popups (simplified)
 // ------------------------------
 app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
 app.post('/api/admin/messages', isAdmin, (req, res) => {
@@ -938,7 +1050,7 @@ app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Clear Logs Endpoint
+// Clear Logs
 // ------------------------------
 app.post('/api/admin/clear-logs', isAdmin, (req, res) => {
     const { period } = req.body;
@@ -961,11 +1073,6 @@ app.post('/api/admin/clear-logs', isAdmin, (req, res) => {
 // ------------------------------
 app.get('/ping', (req, res) => {
     res.send('OK');
-});
-
-app.post('/api/payment-webhook', (req, res) => {
-    console.log('Webhook received:', req.body);
-    res.sendStatus(200);
 });
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
