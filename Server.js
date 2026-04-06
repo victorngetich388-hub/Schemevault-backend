@@ -14,14 +14,12 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ------------------------------
-// Local Storage Setup
+// Local Storage for Uploads
 // ------------------------------
 const UPLOAD_DIR = 'uploads';
 const COVERS_DIR = 'covers';
-
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR);
-
 app.use('/uploads', express.static(UPLOAD_DIR));
 app.use('/covers', express.static(COVERS_DIR));
 
@@ -38,33 +36,32 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 // ------------------------------
-// Data Files
+// Data Files (JSON)
 // ------------------------------
 const PRODUCTS_FILE = 'products.json';
 const STATS_FILE = 'stats.json';
 const MESSAGES_FILE = 'messages.json';
 const ACTIVITY_FILE = 'activity.json';
+const CLIENTS_FILE = 'clients.json';   // tracks repeat visitors
 
 const readJSON = (file, defaultVal = []) => {
-    if (!fs.existsSync(file)) {
-        fs.writeFileSync(file, JSON.stringify(defaultVal));
-        return defaultVal;
-    }
+    if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(defaultVal));
     return JSON.parse(fs.readFileSync(file));
 };
+const writeJSON = (file, data) => fs.writeFileSync(file, JSON.stringify(data, null, 2));
 
-const writeJSON = (file, data) => {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
-};
+// Helper to get client IP (works behind Render proxy)
+function getClientIp(req) {
+    return req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+}
 
 // ------------------------------
 // Admin Authentication
 // ------------------------------
-const ADMIN_PASSWORD = '0726019859'; // Hardcoded for reliability
+const ADMIN_PASSWORD = '0726019859';  // hardcoded for reliability
 const RECOVERY_EMAIL = 'victorngetich388@gmail.com';
 let resetCodes = {};
 
-// Email setup (optional – for password reset)
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
@@ -101,58 +98,54 @@ app.post('/api/admin/forgot-password', async (req, res) => {
         });
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: 'Email not configured. Use password: 0726019859' });
+        res.status(500).json({ error: 'Failed to send email' });
     }
 });
 
 app.post('/api/admin/reset-password', (req, res) => {
     const { code, newPassword } = req.body;
     if (!resetCodes[code] || resetCodes[code] < Date.now()) {
-        return res.status(400).json({ error: 'Invalid or expired code' });
+        return res.status(400).json({ error: 'Invalid code' });
     }
     delete resetCodes[code];
     res.json({ success: true, message: 'Password reset. Update your code manually.' });
+});
+
+app.post('/api/admin/change-password', isAdmin, (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    if (currentPassword !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Current password incorrect' });
+    res.json({ success: true, message: 'Change requested. Update Render environment variable.' });
 });
 
 // ------------------------------
 // Product Management
 // ------------------------------
 app.get('/api/admin/products', isAdmin, (req, res) => {
-    const products = readJSON(PRODUCTS_FILE, []);
-    res.json(products);
+    res.json(readJSON(PRODUCTS_FILE, []));
 });
 
 app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile' }, { name: 'coverImage' }]), (req, res) => {
     try {
         const { title, grade, term, subject, price, pages, visible } = req.body;
-        if (!title || !grade || !term || !subject || !price) {
-            return res.status(400).json({ error: 'All fields required' });
-        }
+        if (!title || !grade || !term || !subject || !price) return res.status(400).json({ error: 'All fields required' });
         const pdfFile = req.files['pdfFile'] ? req.files['pdfFile'][0] : null;
         const coverFile = req.files['coverImage'] ? req.files['coverImage'][0] : null;
-        if (!pdfFile) return res.status(400).json({ error: 'PDF file required' });
+        if (!pdfFile) return res.status(400).json({ error: 'PDF required' });
 
         const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${pdfFile.filename}`;
         const coverUrl = coverFile ? `${req.protocol}://${req.get('host')}/covers/${coverFile.filename}` : null;
 
         const products = readJSON(PRODUCTS_FILE, []);
-        const newId = products.length > 0 ? Math.max(...products.map(p => p.id)) + 1 : 1;
+        const newId = products.length ? Math.max(...products.map(p => p.id)) + 1 : 1;
         const newProduct = {
-            id: newId,
-            title,
-            grade,
-            term: parseInt(term),
-            subject,
-            price: parseInt(price),
-            pages: pages ? parseInt(pages) : null,
-            fileUrl,
-            coverUrl,
-            visible: visible === 'true' || visible === true,
+            id: newId, title, grade, term: parseInt(term), subject,
+            price: parseInt(price), pages: pages ? parseInt(pages) : null,
+            fileUrl, coverUrl, visible: visible === 'true' || visible === true,
             createdAt: new Date().toISOString(),
         };
         products.push(newProduct);
         writeJSON(PRODUCTS_FILE, products);
-        console.log(`Product added: ${newProduct.title} (ID: ${newId})`);
+        console.log(`Product added: ${title}`);
         res.json({ success: true, product: newProduct });
     } catch (err) {
         console.error(err);
@@ -178,13 +171,13 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
     if (product) {
         if (product.fileUrl) {
             const filename = product.fileUrl.split('/').pop();
-            const filePath = path.join(UPLOAD_DIR, filename);
-            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+            const fpath = path.join(UPLOAD_DIR, filename);
+            if (fs.existsSync(fpath)) fs.unlinkSync(fpath);
         }
         if (product.coverUrl) {
             const filename = product.coverUrl.split('/').pop();
-            const filePath = path.join(COVERS_DIR, filename);
-            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+            const fpath = path.join(COVERS_DIR, filename);
+            if (fs.existsSync(fpath)) fs.unlinkSync(fpath);
         }
     }
     products = products.filter(p => p.id !== id);
@@ -193,15 +186,13 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Secure Download (hide real URL)
+// Secure Download Tokens
 // ------------------------------
 const downloadTokens = {};
 
 app.post('/api/request-download', (req, res) => {
     const { productId, paymentRef } = req.body;
-    if (!productId || !paymentRef) {
-        return res.status(400).json({ error: 'Missing productId or paymentRef' });
-    }
+    if (!productId || !paymentRef) return res.status(400).json({ error: 'Missing data' });
     const token = Math.random().toString(36).substring(2, 15);
     downloadTokens[token] = { productId, expires: Date.now() + 60000 };
     res.json({ token });
@@ -210,32 +201,26 @@ app.post('/api/request-download', (req, res) => {
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
     const record = downloadTokens[token];
-    if (!record || record.expires < Date.now()) {
-        return res.status(404).send('Download link expired');
-    }
+    if (!record || record.expires < Date.now()) return res.status(404).send('Link expired');
     const products = readJSON(PRODUCTS_FILE, []);
     const product = products.find(p => p.id === record.productId);
-    if (!product || !product.fileUrl) {
-        return res.status(404).send('File not found');
-    }
+    if (!product || !product.fileUrl) return res.status(404).send('File not found');
     try {
         const response = await axios({ method: 'GET', url: product.fileUrl, responseType: 'stream' });
         res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
         response.data.pipe(res);
         delete downloadTokens[token];
     } catch (err) {
-        console.error(err);
-        res.status(500).send('Error downloading file');
+        res.status(500).send('Download error');
     }
 });
 
 // ------------------------------
-// Analytics & Public Endpoints
+// Public Endpoints (with Analytics)
 // ------------------------------
 app.get('/api/products', (req, res) => {
     const products = readJSON(PRODUCTS_FILE, []);
-    const visible = products.filter(p => p.visible !== false);
-    res.json(visible);
+    res.json(products.filter(p => p.visible !== false));
 });
 
 app.get('/api/messages', (req, res) => {
@@ -245,91 +230,87 @@ app.get('/api/messages', (req, res) => {
     res.json(active);
 });
 
-// Track visit with IP and timestamp
+// Track visit – records IP, user agent, timestamp, and identifies repeat clients
 app.post('/api/track-visit', (req, res) => {
+    const ip = getClientIp(req);
+    const userAgent = req.headers['user-agent'];
+    const timestamp = new Date().toISOString();
+
+    // Update stats
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    const visit = {
-        date: new Date().toISOString(),
-        ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress || req.ip,
-        userAgent: req.headers['user-agent']
-    };
-    stats.visits.push(visit);
+    stats.visits.push({ date: timestamp, ip, userAgent });
     writeJSON(STATS_FILE, stats);
 
+    // Update clients file (for repeat client tracking)
+    let clients = readJSON(CLIENTS_FILE, []);
+    let client = clients.find(c => c.ip === ip);
+    if (client) {
+        client.lastSeen = timestamp;
+        client.visitCount++;
+    } else {
+        clients.push({ ip, userAgent, firstSeen: timestamp, lastSeen: timestamp, visitCount: 1 });
+    }
+    writeJSON(CLIENTS_FILE, clients);
+
+    // Activity log
     const activity = readJSON(ACTIVITY_FILE, []);
-    activity.push({
-        id: Date.now(),
-        type: 'visit',
-        data: { ip: visit.ip, userAgent: visit.userAgent },
-        timestamp: visit.date
-    });
+    activity.push({ id: Date.now(), type: 'visit', data: { ip, userAgent }, timestamp });
     writeJSON(ACTIVITY_FILE, activity.slice(-1000));
+
     res.json({ success: true });
 });
 
+// Track download – records which product, IP, timestamp
 app.post('/api/track-download', (req, res) => {
     const { productId, productName, price } = req.body;
+    const ip = getClientIp(req);
+    const timestamp = new Date().toISOString();
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    stats.downloads.push({
-        date: new Date().toISOString(),
-        productId, productName, price,
-        ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress
-    });
+    stats.downloads.push({ date: timestamp, productId, productName, price, ip });
     writeJSON(STATS_FILE, stats);
-
     const activity = readJSON(ACTIVITY_FILE, []);
-    activity.push({
-        id: Date.now(),
-        type: 'download',
-        data: { productName, price },
-        timestamp: new Date().toISOString()
-    });
+    activity.push({ id: Date.now(), type: 'download', data: { productName, price, ip }, timestamp });
     writeJSON(ACTIVITY_FILE, activity.slice(-1000));
     res.json({ success: true });
 });
 
 // ------------------------------
-// Admin Analytics
+// Admin Analytics Endpoints
 // ------------------------------
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     const activity = readJSON(ACTIVITY_FILE, []);
+    const clients = readJSON(CLIENTS_FILE, []);
     const totalVisits = stats.visits.length;
     const totalDownloads = stats.downloads.length;
     const successfulPayments = stats.payments?.filter(p => p.status === 'success').length || 0;
     const cancelledPayments = stats.payments?.filter(p => p.status === 'failed' || p.status === 'cancelled').length || 0;
 
+    // Top products
     const productCount = {};
-    stats.downloads.forEach(d => {
-        productCount[d.productName] = (productCount[d.productName] || 0) + 1;
-    });
-    const topProducts = Object.entries(productCount)
-        .map(([name, count]) => ({ name, count }))
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 5);
+    stats.downloads.forEach(d => { productCount[d.productName] = (productCount[d.productName] || 0) + 1; });
+    const topProducts = Object.entries(productCount).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count).slice(0,5);
 
-    // Group visits by date (last 7 days)
+    // Visits per day (last 7 days)
     const visitsByDay = {};
     stats.visits.forEach(v => {
-        const date = v.date.split('T')[0];
-        visitsByDay[date] = (visitsByDay[date] || 0) + 1;
+        const day = v.date.split('T')[0];
+        visitsByDay[day] = (visitsByDay[day] || 0) + 1;
     });
     const last7Days = [];
     for (let i = 6; i >= 0; i--) {
-        const date = new Date();
-        date.setDate(date.getDate() - i);
-        const dateStr = date.toISOString().split('T')[0];
-        last7Days.push({ date: dateStr, visits: visitsByDay[dateStr] || 0 });
+        const d = new Date(); d.setDate(d.getDate() - i);
+        const dayStr = d.toISOString().split('T')[0];
+        last7Days.push({ date: dayStr, visits: visitsByDay[dayStr] || 0 });
     }
 
+    // Repeat clients
+    const repeatClients = clients.filter(c => c.visitCount > 1).length;
+
     res.json({
-        summary: {
-            totalVisits,
-            totalDownloads,
-            successfulPayments,
-            cancelledPayments,
-            conversionRate: totalVisits ? ((successfulPayments / totalVisits) * 100).toFixed(1) : 0,
-        },
+        summary: { totalVisits, totalDownloads, successfulPayments, cancelledPayments,
+                   conversionRate: totalVisits ? ((successfulPayments / totalVisits) * 100).toFixed(1) : 0,
+                   repeatClients, totalClients: clients.length },
         topProducts,
         visitsByDay: last7Days,
         recentActivity: activity.slice(-20).reverse(),
@@ -345,19 +326,20 @@ app.get('/api/admin/activity', isAdmin, (req, res) => {
     res.json(filtered.slice(-100).reverse());
 });
 
-// ------------------------------
-// Scheduled Messages
-// ------------------------------
-app.get('/api/admin/messages', isAdmin, (req, res) => {
-    res.json(readJSON(MESSAGES_FILE, []));
+app.get('/api/admin/clients', isAdmin, (req, res) => {
+    const clients = readJSON(CLIENTS_FILE, []);
+    res.json(clients.sort((a,b) => b.visitCount - a.visitCount));
 });
 
+// ------------------------------
+// Scheduled Messages (unchanged)
+// ------------------------------
+app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
 app.post('/api/admin/messages', isAdmin, (req, res) => {
     const { title, content, type, startDate, endDate, isActive } = req.body;
     const messages = readJSON(MESSAGES_FILE, []);
     const newMsg = {
-        id: Date.now(),
-        title, content, type: type || 'banner',
+        id: Date.now(), title, content, type: type || 'banner',
         startDate: new Date(startDate).toISOString(),
         endDate: endDate ? new Date(endDate).toISOString() : null,
         active: isActive === true || isActive === 'true',
@@ -367,7 +349,6 @@ app.post('/api/admin/messages', isAdmin, (req, res) => {
     writeJSON(MESSAGES_FILE, messages);
     res.json({ success: true, message: newMsg });
 });
-
 app.put('/api/admin/messages/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     const { active } = req.body;
@@ -378,7 +359,6 @@ app.put('/api/admin/messages/:id', isAdmin, (req, res) => {
     writeJSON(MESSAGES_FILE, messages);
     res.json({ success: true });
 });
-
 app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     let messages = readJSON(MESSAGES_FILE, []);
@@ -388,21 +368,18 @@ app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Payment Endpoint (Placeholder)
+// Payment Endpoint (Placeholder – replace with Paynecta)
 // ------------------------------
 app.post('/api/initiate-payment', async (req, res) => {
-    const { phone, amount } = req.body;
+    const { phone, amount, productId } = req.body;
     console.log(`Payment request: ${phone}, KES ${amount}`);
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     if (!stats.payments) stats.payments = [];
-    stats.payments.push({
-        date: new Date().toISOString(),
-        status: 'success',
-        amount,
-        phone,
-        ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress
-    });
+    stats.payments.push({ date: new Date().toISOString(), status: 'success', amount, phone, ip: getClientIp(req) });
     writeJSON(STATS_FILE, stats);
+    const activity = readJSON(ACTIVITY_FILE, []);
+    activity.push({ id: Date.now(), type: 'payment', data: { amount, phone }, timestamp: new Date().toISOString() });
+    writeJSON(ACTIVITY_FILE, activity.slice(-1000));
     res.json({ success: true, checkoutRequestId: 'demo_' + Date.now() });
 });
 
@@ -411,10 +388,4 @@ app.post('/api/payment-webhook', (req, res) => {
     res.sendStatus(200);
 });
 
-// Health check
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Admin password: ${ADMIN_PASSWORD}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
