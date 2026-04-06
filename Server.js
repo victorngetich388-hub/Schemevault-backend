@@ -461,7 +461,6 @@ app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile' }, { n
     }
 });
 
-// EDIT PRODUCT - Update price, visibility, title, etc.
 app.put('/api/admin/products/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     const updates = req.body;
@@ -500,20 +499,50 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 const downloadTokens = new Map();
 const verifiedPayments = new Map();
 
+app.post('/api/initiate-payment', async (req, res) => {
+    const { phone, amount, productId } = req.body;
+    console.log(`Payment request: ${phone}, KES ${amount}`);
+    
+    const transactionId = 'TXN_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+    
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    if (!stats.payments) stats.payments = [];
+    stats.payments.push({ 
+        date: new Date().toISOString(), 
+        status: 'success', 
+        amount, 
+        phone, 
+        productId,
+        transactionId,
+        ip: getClientIp(req) 
+    });
+    writeJSON(STATS_FILE, stats);
+    
+    const activity = readJSON(ACTIVITY_FILE, []);
+    activity.push({ id: Date.now(), type: 'payment', data: { amount, phone, productId, transactionId }, timestamp: new Date().toISOString() });
+    writeJSON(ACTIVITY_FILE, activity.slice(-1000));
+    
+    res.json({ success: true, transactionId, checkoutRequestId: transactionId });
+});
+
 app.post('/api/verify-payment', (req, res) => {
-    const { transactionId, productId, amount, phone } = req.body;
-    // In production, verify with Paynecta here
-    // For demo, we mark as verified
-    const token = Math.random().toString(36).substring(2, 15);
-    verifiedPayments.set(token, { productId, expires: Date.now() + 60000 });
-    res.json({ success: true, token });
+    const { transactionId, productId, amount } = req.body;
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    const payment = stats.payments.find(p => p.transactionId === transactionId && p.status === 'success');
+    
+    if (payment) {
+        const token = Math.random().toString(36).substring(2, 15);
+        verifiedPayments.set(token, { productId, expires: Date.now() + 60000 });
+        res.json({ success: true, verified: true, token });
+    } else {
+        res.json({ success: false, verified: false });
+    }
 });
 
 app.post('/api/request-download', (req, res) => {
     const { productId, paymentRef } = req.body;
     if (!productId || !paymentRef) return res.status(400).json({ error: 'Missing data' });
     
-    // Check if payment was verified
     let validToken = null;
     for (const [token, data] of verifiedPayments.entries()) {
         if (data.productId === productId && data.expires > Date.now()) {
@@ -805,4 +834,46 @@ app.post('/api/admin/banner', isAdmin, (req, res) => {
 });
 
 app.get('/api/admin/whatsapp', isAdmin, (req, res) => {
-    res.json(readJSON(WHATSAPP_FILE
+    res.json(readJSON(WHATSAPP_FILE, { enabled: false, phone: '', message: '' }));
+});
+
+app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
+    const { enabled, phone, message } = req.body;
+    writeJSON(WHATSAPP_FILE, { enabled, phone, message });
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Clear Logs Endpoint
+// ------------------------------
+app.post('/api/admin/clear-logs', isAdmin, (req, res) => {
+    const { period } = req.body;
+    let activity = readJSON(ACTIVITY_FILE, []);
+    const now = new Date();
+    if (period === 'now') {
+        activity = [];
+    } else if (period === 'year') {
+        const oneYearAgo = new Date(now.setFullYear(now.getFullYear() - 1));
+        activity = activity.filter(a => new Date(a.timestamp) > oneYearAgo);
+    } else if (period === 'all') {
+        activity = [];
+    }
+    writeJSON(ACTIVITY_FILE, activity);
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Keep-Alive Ping
+// ------------------------------
+app.get('/ping', (req, res) => {
+    res.send('OK');
+});
+
+app.post('/api/payment-webhook', (req, res) => {
+    console.log('Webhook received:', req.body);
+    res.sendStatus(200);
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
