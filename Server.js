@@ -1,94 +1,431 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Health check
-app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'ok', service: 'SchemeVault' });
+// ------------------------------
+// Local Storage Setup
+// ------------------------------
+const UPLOAD_DIR = 'uploads';
+const COVERS_DIR = 'covers';
+
+// Create folders if they don't exist
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR);
+
+// Serve static files (so customers can download directly)
+app.use('/uploads', express.static(UPLOAD_DIR));
+app.use('/covers', express.static(COVERS_DIR));
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        if (file.fieldname === 'coverImage') {
+            cb(null, COVERS_DIR);
+        } else {
+            cb(null, UPLOAD_DIR);
+        }
+    },
+    filename: (req, file, cb) => {
+        const uniqueName = Date.now() + '-' + file.originalname.replace(/\s/g, '_');
+        cb(null, uniqueName);
+    }
+});
+const upload = multer({ storage });
+
+// ------------------------------
+// Data Files (JSON storage)
+// ------------------------------
+const PRODUCTS_FILE = 'products.json';
+const STATS_FILE = 'stats.json';
+const MESSAGES_FILE = 'messages.json';
+const ACTIVITY_FILE = 'activity.json';
+
+const readJSON = (file, defaultVal = []) => {
+    if (!fs.existsSync(file)) {
+        fs.writeFileSync(file, JSON.stringify(defaultVal));
+        return defaultVal;
+    }
+    return JSON.parse(fs.readFileSync(file));
+};
+
+const writeJSON = (file, data) => {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+};
+
+// ------------------------------
+// Admin Authentication
+// ------------------------------
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '0726019859';
+const RECOVERY_EMAIL = 'victorngetich388@gmail.com';
+let resetCodes = {};
+
+// Email setup
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER || RECOVERY_EMAIL,
+        pass: process.env.EMAIL_PASS,
+    },
 });
 
-app.get('/', (req, res) => {
-    res.json({ status: 'running', service: 'SchemeVault Backend' });
+// Admin login
+app.post('/api/admin/login', (req, res) => {
+    const { password } = req.body;
+    if (password === ADMIN_PASSWORD) {
+        const token = Buffer.from(Date.now().toString()).toString('base64');
+        res.json({ success: true, token });
+    } else {
+        res.status(401).json({ success: false, error: 'Wrong password' });
+    }
 });
 
-// Initiate M-Pesa STK Push via Paynecta
+// Middleware to protect admin routes
+function isAdmin(req, res, next) {
+    const token = req.headers['x-admin-token'];
+    if (token) return next();
+    res.status(401).json({ error: 'Unauthorized' });
+}
+
+// Forgot password - send reset code
+app.post('/api/admin/forgot-password', async (req, res) => {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    resetCodes[code] = Date.now() + 3600000;
+    try {
+        await transporter.sendMail({
+            from: `"SchemeVault Admin" <${RECOVERY_EMAIL}>`,
+            to: RECOVERY_EMAIL,
+            subject: 'Admin Password Reset Code',
+            text: `Your reset code is: ${code}\nIt expires in 1 hour.`,
+        });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to send email' });
+    }
+});
+
+// Reset password with code
+app.post('/api/admin/reset-password', (req, res) => {
+    const { code, newPassword } = req.body;
+    if (!resetCodes[code] || resetCodes[code] < Date.now()) {
+        return res.status(400).json({ error: 'Invalid or expired code' });
+    }
+    delete resetCodes[code];
+    res.json({ success: true, message: 'Password reset. Update Render environment variable manually.' });
+});
+
+// Change password
+app.post('/api/admin/change-password', isAdmin, (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    if (currentPassword !== ADMIN_PASSWORD) {
+        return res.status(401).json({ error: 'Current password incorrect' });
+    }
+    res.json({ success: true, message: 'Password change requested. Please update Render environment variable.' });
+});
+
+// ------------------------------
+// Product Management
+// ------------------------------
+app.get('/api/admin/products', isAdmin, (req, res) => {
+    res.json(readJSON(PRODUCTS_FILE, []));
+});
+
+app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile' }, { name: 'coverImage' }]), (req, res) => {
+    try {
+        const { title, grade, term, subject, price, pages, visible } = req.body;
+        
+        if (!title || !grade || !term || !subject || !price) {
+            return res.status(400).json({ error: 'All fields required' });
+        }
+        
+        const pdfFile = req.files['pdfFile'] ? req.files['pdfFile'][0] : null;
+        const coverFile = req.files['coverImage'] ? req.files['coverImage'][0] : null;
+        
+        if (!pdfFile) {
+            return res.status(400).json({ error: 'PDF file required' });
+        }
+        
+        const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${pdfFile.filename}`;
+        const coverUrl = coverFile ? `${req.protocol}://${req.get('host')}/covers/${coverFile.filename}` : null;
+        
+        const products = readJSON(PRODUCTS_FILE, []);
+        const newId = products.length > 0 ? Math.max(...products.map(p => p.id)) + 1 : 1;
+        
+        const newProduct = {
+            id: newId,
+            title,
+            grade,
+            term: parseInt(term),
+            subject,
+            price: parseInt(price),
+            pages: pages ? parseInt(pages) : null,
+            fileUrl,
+            coverUrl,
+            visible: visible === 'true' || visible === true,
+            createdAt: new Date().toISOString(),
+        };
+        
+        products.push(newProduct);
+        writeJSON(PRODUCTS_FILE, products);
+        res.json({ success: true, product: newProduct });
+        
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+app.put('/api/admin/products/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const updates = req.body;
+    let products = readJSON(PRODUCTS_FILE, []);
+    const index = products.findIndex(p => p.id === id);
+    
+    if (index === -1) {
+        return res.status(404).json({ error: 'Product not found' });
+    }
+    
+    products[index] = { ...products[index], ...updates };
+    writeJSON(PRODUCTS_FILE, products);
+    res.json({ success: true });
+});
+
+app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let products = readJSON(PRODUCTS_FILE, []);
+    const product = products.find(p => p.id === id);
+    
+    if (product) {
+        // Delete PDF file
+        if (product.fileUrl) {
+            const filename = product.fileUrl.split('/').pop();
+            const filePath = path.join(UPLOAD_DIR, filename);
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        }
+        // Delete cover image
+        if (product.coverUrl) {
+            const filename = product.coverUrl.split('/').pop();
+            const filePath = path.join(COVERS_DIR, filename);
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        }
+    }
+    
+    products = products.filter(p => p.id !== id);
+    writeJSON(PRODUCTS_FILE, products);
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Secure Download (hide real file URL)
+// ------------------------------
+const downloadTokens = {};
+
+app.post('/api/request-download', (req, res) => {
+    const { productId, paymentRef } = req.body;
+    if (!productId || !paymentRef) {
+        return res.status(400).json({ error: 'Missing productId or paymentRef' });
+    }
+    const token = Math.random().toString(36).substring(2, 15);
+    downloadTokens[token] = { productId, expires: Date.now() + 60000 };
+    res.json({ token });
+});
+
+app.get('/api/download/:token', async (req, res) => {
+    const { token } = req.params;
+    const record = downloadTokens[token];
+    
+    if (!record || record.expires < Date.now()) {
+        return res.status(404).send('Download link expired or invalid');
+    }
+    
+    const products = readJSON(PRODUCTS_FILE, []);
+    const product = products.find(p => p.id === record.productId);
+    
+    if (!product || !product.fileUrl) {
+        return res.status(404).send('File not found');
+    }
+    
+    try {
+        const response = await axios({
+            method: 'GET',
+            url: product.fileUrl,
+            responseType: 'stream'
+        });
+        res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
+        response.data.pipe(res);
+        delete downloadTokens[token];
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Error downloading file');
+    }
+});
+
+// ------------------------------
+// Public Endpoints (Customer Frontend)
+// ------------------------------
+app.get('/api/products', (req, res) => {
+    const products = readJSON(PRODUCTS_FILE, []);
+    res.json(products.filter(p => p.visible !== false));
+});
+
+app.get('/api/messages', (req, res) => {
+    const messages = readJSON(MESSAGES_FILE, []);
+    const now = new Date();
+    const active = messages.filter(m => m.active && new Date(m.startDate) <= now && (!m.endDate || new Date(m.endDate) >= now));
+    res.json(active);
+});
+
+app.post('/api/track-visit', (req, res) => {
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    stats.visits.push({ date: new Date().toISOString(), ip: req.ip });
+    writeJSON(STATS_FILE, stats);
+    
+    const activity = readJSON(ACTIVITY_FILE, []);
+    activity.push({ id: Date.now(), type: 'visit', data: { ip: req.ip }, timestamp: new Date().toISOString() });
+    writeJSON(ACTIVITY_FILE, activity.slice(-1000));
+    res.json({ success: true });
+});
+
+app.post('/api/track-download', (req, res) => {
+    const { productId, productName, price } = req.body;
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    stats.downloads.push({ date: new Date().toISOString(), productId, productName, price });
+    writeJSON(STATS_FILE, stats);
+    
+    const activity = readJSON(ACTIVITY_FILE, []);
+    activity.push({ id: Date.now(), type: 'download', data: { productName, price }, timestamp: new Date().toISOString() });
+    writeJSON(ACTIVITY_FILE, activity.slice(-1000));
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Admin Analytics Endpoints
+// ------------------------------
+app.get('/api/admin/stats', isAdmin, (req, res) => {
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    const activity = readJSON(ACTIVITY_FILE, []);
+    
+    const totalVisits = stats.visits.length;
+    const totalDownloads = stats.downloads.length;
+    const successfulPayments = stats.payments?.filter(p => p.status === 'success').length || 0;
+    const cancelledPayments = stats.payments?.filter(p => p.status === 'failed' || p.status === 'cancelled').length || 0;
+    
+    const productCount = {};
+    stats.downloads.forEach(d => {
+        productCount[d.productName] = (productCount[d.productName] || 0) + 1;
+    });
+    
+    const topProducts = Object.entries(productCount)
+        .map(([name, count]) => ({ name, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 5);
+    
+    res.json({
+        summary: {
+            totalVisits,
+            totalDownloads,
+            successfulPayments,
+            cancelledPayments,
+            conversionRate: totalVisits ? ((successfulPayments / totalVisits) * 100).toFixed(1) : 0,
+        },
+        topProducts,
+        recentActivity: activity.slice(-20).reverse(),
+    });
+});
+
+app.get('/api/admin/activity', isAdmin, (req, res) => {
+    const activity = readJSON(ACTIVITY_FILE, []);
+    const { type } = req.query;
+    let filtered = activity;
+    if (type) filtered = activity.filter(a => a.type === type);
+    res.json(filtered.slice(-100).reverse());
+});
+
+// ------------------------------
+// Scheduled Messages Endpoints
+// ------------------------------
+app.get('/api/admin/messages', isAdmin, (req, res) => {
+    res.json(readJSON(MESSAGES_FILE, []));
+});
+
+app.post('/api/admin/messages', isAdmin, (req, res) => {
+    const { title, content, type, startDate, endDate, isActive } = req.body;
+    const messages = readJSON(MESSAGES_FILE, []);
+    const newMsg = {
+        id: Date.now(),
+        title,
+        content,
+        type: type || 'banner',
+        startDate: new Date(startDate).toISOString(),
+        endDate: endDate ? new Date(endDate).toISOString() : null,
+        active: isActive === true || isActive === 'true',
+        createdAt: new Date().toISOString(),
+    };
+    messages.push(newMsg);
+    writeJSON(MESSAGES_FILE, messages);
+    res.json({ success: true, message: newMsg });
+});
+
+app.put('/api/admin/messages/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const { active } = req.body;
+    let messages = readJSON(MESSAGES_FILE, []);
+    const idx = messages.findIndex(m => m.id === id);
+    if (idx === -1) return res.status(404).json({ error: 'Not found' });
+    messages[idx].active = active;
+    writeJSON(MESSAGES_FILE, messages);
+    res.json({ success: true });
+});
+
+app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let messages = readJSON(MESSAGES_FILE, []);
+    messages = messages.filter(m => m.id !== id);
+    writeJSON(MESSAGES_FILE, messages);
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Payment Endpoint (Placeholder - Replace with Paynecta)
+// ------------------------------
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount } = req.body;
-
-    // Validate
-    if (!phone || !amount || amount <= 0) {
-        return res.status(400).json({ success: false, error: 'Phone number and valid amount required' });
-    }
-
-    // Clean phone number to 254 format (Paynecta requires 2547XXXXXXXX)
-    let cleanPhone = phone.replace(/\s/g, '');
-    if (cleanPhone.startsWith('0')) {
-        cleanPhone = '254' + cleanPhone.substring(1);
-    } else if (cleanPhone.startsWith('+')) {
-        cleanPhone = cleanPhone.substring(1);
-    }
-
-    try {
-        // Read environment variables
-        const apiKey = process.env.PAYNECTA_API_KEY;
-        const userEmail = process.env.PAYNECTA_EMAIL;
-        const paymentCode = process.env.PAYNECTA_PAYMENT_CODE;
-        const apiUrl = process.env.PAYNECTA_API_URL;
-
-        // Check if all required variables are present
-        if (!apiKey || !userEmail || !paymentCode || !apiUrl) {
-            console.error('Missing Paynecta credentials in environment variables');
-            return res.status(500).json({ 
-                success: false, 
-                error: 'Server payment configuration error. Missing credentials.' 
-            });
-        }
-
-        const payload = {
-            code: paymentCode,
-            mobile_number: cleanPhone,
-            amount: amount
-        };
-
-        console.log('Initiating Paynecta payment to:', apiUrl);
-        console.log('Payload:', payload);
-
-        const response = await axios.post(`${apiUrl}/api/v1/payment/initialize`, payload, {
-            headers: {
-                'X-API-Key': apiKey,
-                'X-User-Email': userEmail,
-                'Content-Type': 'application/json'
-            }
-        });
-
-        console.log('Paynecta response:', response.data);
-
-        if (response.data.success) {
-            const transactionId = response.data.data?.transaction_id || response.data.data?.id || Date.now().toString();
-            res.json({ success: true, checkoutRequestId: transactionId });
-        } else {
-            res.status(400).json({ success: false, error: response.data.message || 'Payment initiation failed' });
-        }
-
-    } catch (error) {
-        console.error('Paynecta error details:', error.response?.data || error.message);
-        const errorMsg = error.response?.data?.message || error.message || 'Payment initiation failed';
-        res.status(500).json({ success: false, error: errorMsg });
-    }
+    console.log(`Payment request: ${phone}, KES ${amount}`);
+    
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    if (!stats.payments) stats.payments = [];
+    stats.payments.push({
+        date: new Date().toISOString(),
+        status: 'success',
+        amount,
+        phone
+    });
+    writeJSON(STATS_FILE, stats);
+    
+    res.json({ success: true, checkoutRequestId: 'demo_' + Date.now() });
 });
 
-// Webhook for Paynecta to confirm payment
 app.post('/api/payment-webhook', (req, res) => {
     console.log('Webhook received:', req.body);
     res.sendStatus(200);
 });
 
+// ------------------------------
+// Start Server
+// ------------------------------
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+    console.log(`Admin password: ${ADMIN_PASSWORD}`);
+    console.log(`Uploads folder: ${UPLOAD_DIR}`);
+    console.log(`Covers folder: ${COVERS_DIR}`);
 });
