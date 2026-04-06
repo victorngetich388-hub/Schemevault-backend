@@ -1,8 +1,512 @@
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const nodemailer = require('nodemailer');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ------------------------------
+// Local Storage for Uploads
+// ------------------------------
+const UPLOAD_DIR = 'uploads';
+const COVERS_DIR = 'covers';
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR);
+app.use('/uploads', express.static(UPLOAD_DIR));
+app.use('/covers', express.static(COVERS_DIR));
+
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        if (file.fieldname === 'coverImage') cb(null, COVERS_DIR);
+        else cb(null, UPLOAD_DIR);
+    },
+    filename: (req, file, cb) => {
+        const uniqueName = Date.now() + '-' + file.originalname.replace(/\s/g, '_');
+        cb(null, uniqueName);
+    }
+});
+const upload = multer({ storage });
+
+// ------------------------------
+// Data Files (JSON)
+// ------------------------------
+const PRODUCTS_FILE = 'products.json';
+const STATS_FILE = 'stats.json';
+const MESSAGES_FILE = 'messages.json';
+const ACTIVITY_FILE = 'activity.json';
+const CLIENTS_FILE = 'clients.json';
+const FEEDBACK_FILE = 'feedback.json';
+const TERM_SETTINGS_FILE = 'term_settings.json';
+const BANNER_FILE = 'banner.json';
+const WHATSAPP_FILE = 'whatsapp.json';
+const POPUPS_FILE = 'popups.json';
+
+const readJSON = (file, defaultVal = []) => {
+    if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(defaultVal));
+    return JSON.parse(fs.readFileSync(file));
+};
+const writeJSON = (file, data) => fs.writeFileSync(file, JSON.stringify(data, null, 2));
+
+function getClientIp(req) {
+    return req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+}
+
+function getStorageUsage() {
+    const getSize = (dir) => {
+        let size = 0;
+        if (fs.existsSync(dir)) {
+            const files = fs.readdirSync(dir);
+            for (const file of files) {
+                const filePath = path.join(dir, file);
+                const stat = fs.statSync(filePath);
+                if (stat.isFile()) size += stat.size;
+                else if (stat.isDirectory()) size += getSize(filePath);
+            }
+        }
+        return size;
+    };
+    const uploadsSize = getSize(UPLOAD_DIR);
+    const coversSize = getSize(COVERS_DIR);
+    const totalMB = ((uploadsSize + coversSize) / (1024 * 1024)).toFixed(2);
+    return { usedMB: totalMB, usedBytes: uploadsSize + coversSize };
+}
+
+// ------------------------------
+// Admin Authentication
+// ------------------------------
+const ADMIN_PASSWORD = '0726019859';
+const RECOVERY_EMAIL = 'victorngetich388@gmail.com';
+let resetCodes = {};
+
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER || RECOVERY_EMAIL,
+        pass: process.env.EMAIL_PASS,
+    },
+});
+
+app.post('/api/admin/login', (req, res) => {
+    const { password } = req.body;
+    if (password === ADMIN_PASSWORD) {
+        const token = Buffer.from(Date.now().toString()).toString('base64');
+        res.json({ success: true, token });
+    } else {
+        res.status(401).json({ success: false, error: 'Wrong password' });
+    }
+});
+
+function isAdmin(req, res, next) {
+    const token = req.headers['x-admin-token'];
+    if (token) return next();
+    res.status(401).json({ error: 'Unauthorized' });
+}
+
+app.post('/api/admin/forgot-password', async (req, res) => {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    resetCodes[code] = Date.now() + 3600000;
+    try {
+        await transporter.sendMail({
+            from: `"SchemeVault Admin" <${RECOVERY_EMAIL}>`,
+            to: RECOVERY_EMAIL,
+            subject: 'Admin Password Reset Code',
+            text: `Your reset code is: ${code}\nIt expires in 1 hour.`,
+        });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to send email' });
+    }
+});
+
+app.post('/api/admin/reset-password', (req, res) => {
+    const { code, newPassword } = req.body;
+    if (!resetCodes[code] || resetCodes[code] < Date.now()) {
+        return res.status(400).json({ error: 'Invalid code' });
+    }
+    delete resetCodes[code];
+    res.json({ success: true, message: 'Password reset. Update your code manually.' });
+});
+
+app.post('/api/admin/change-password', isAdmin, (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    if (currentPassword !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Current password incorrect' });
+    res.json({ success: true, message: 'Change requested. Update Render environment variable.' });
+});
+
+// ------------------------------
+// Term Settings
+// ------------------------------
+app.get('/api/admin/term-settings', isAdmin, (req, res) => {
+    res.json(readJSON(TERM_SETTINGS_FILE, { term1: true, term2: true, term3: true }));
+});
+
+app.put('/api/admin/term-settings', isAdmin, (req, res) => {
+    const settings = req.body;
+    writeJSON(TERM_SETTINGS_FILE, settings);
+    res.json({ success: true });
+});
+
+app.get('/api/term-settings', (req, res) => {
+    res.json(readJSON(TERM_SETTINGS_FILE, { term1: true, term2: true, term3: true }));
+});
+
+// ------------------------------
+// Product Management
+// ------------------------------
+app.get('/api/admin/products', isAdmin, (req, res) => {
+    res.json(readJSON(PRODUCTS_FILE, []));
+});
+
+app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile' }, { name: 'coverImage' }]), (req, res) => {
+    try {
+        const { title, grade, term, subject, price, pages, visible } = req.body;
+        if (!title || !grade || !term || !subject || !price) return res.status(400).json({ error: 'All fields required' });
+        const pdfFile = req.files['pdfFile'] ? req.files['pdfFile'][0] : null;
+        const coverFile = req.files['coverImage'] ? req.files['coverImage'][0] : null;
+        if (!pdfFile) return res.status(400).json({ error: 'PDF required' });
+
+        const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${pdfFile.filename}`;
+        const coverUrl = coverFile ? `${req.protocol}://${req.get('host')}/covers/${coverFile.filename}` : null;
+
+        const products = readJSON(PRODUCTS_FILE, []);
+        const newId = products.length ? Math.max(...products.map(p => p.id)) + 1 : 1;
+        const newProduct = {
+            id: newId, title, grade, term: parseInt(term), subject,
+            price: parseInt(price), pages: pages ? parseInt(pages) : null,
+            fileUrl, coverUrl, visible: visible === 'true' || visible === true,
+            createdAt: new Date().toISOString(),
+        };
+        products.push(newProduct);
+        writeJSON(PRODUCTS_FILE, products);
+        res.json({ success: true, product: newProduct });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+app.put('/api/admin/products/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const updates = req.body;
+    let products = readJSON(PRODUCTS_FILE, []);
+    const index = products.findIndex(p => p.id === id);
+    if (index === -1) return res.status(404).json({ error: 'Not found' });
+    products[index] = { ...products[index], ...updates };
+    writeJSON(PRODUCTS_FILE, products);
+    res.json({ success: true });
+});
+
+app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let products = readJSON(PRODUCTS_FILE, []);
+    const product = products.find(p => p.id === id);
+    if (product) {
+        if (product.fileUrl) {
+            const filename = product.fileUrl.split('/').pop();
+            const fpath = path.join(UPLOAD_DIR, filename);
+            if (fs.existsSync(fpath)) fs.unlinkSync(fpath);
+        }
+        if (product.coverUrl) {
+            const filename = product.coverUrl.split('/').pop();
+            const fpath = path.join(COVERS_DIR, filename);
+            if (fs.existsSync(fpath)) fs.unlinkSync(fpath);
+        }
+    }
+    products = products.filter(p => p.id !== id);
+    writeJSON(PRODUCTS_FILE, products);
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Secure Download Tokens
+// ------------------------------
+const downloadTokens = {};
+
+app.post('/api/request-download', (req, res) => {
+    const { productId, paymentRef } = req.body;
+    if (!productId || !paymentRef) return res.status(400).json({ error: 'Missing data' });
+    const token = Math.random().toString(36).substring(2, 15);
+    downloadTokens[token] = { productId, expires: Date.now() + 60000 };
+    res.json({ token });
+});
+
+app.get('/api/download/:token', async (req, res) => {
+    const { token } = req.params;
+    const record = downloadTokens[token];
+    if (!record || record.expires < Date.now()) return res.status(404).send('Link expired');
+    const products = readJSON(PRODUCTS_FILE, []);
+    const product = products.find(p => p.id === record.productId);
+    if (!product || !product.fileUrl) return res.status(404).send('File not found');
+    try {
+        const response = await axios({ method: 'GET', url: product.fileUrl, responseType: 'stream' });
+        res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
+        response.data.pipe(res);
+        delete downloadTokens[token];
+    } catch (err) {
+        res.status(500).send('Download error');
+    }
+});
+
+// ------------------------------
+// Public Endpoints (with Analytics)
+// ------------------------------
+app.get('/api/products', (req, res) => {
+    const products = readJSON(PRODUCTS_FILE, []);
+    res.json(products.filter(p => p.visible !== false));
+});
+
+app.get('/api/messages', (req, res) => {
+    const messages = readJSON(MESSAGES_FILE, []);
+    const now = new Date();
+    const active = messages.filter(m => m.active && new Date(m.startDate) <= now && (!m.endDate || new Date(m.endDate) >= now));
+    res.json(active);
+});
+
+app.get('/api/popups', (req, res) => {
+    const popups = readJSON(POPUPS_FILE, []);
+    const now = new Date();
+    const active = popups.filter(p => p.active && new Date(p.startDate) <= now && (!p.endDate || new Date(p.endDate) >= now));
+    res.json(active);
+});
+
+app.post('/api/submit-feedback', (req, res) => {
+    const { message, whatsapp, productId, page } = req.body;
+    const feedback = readJSON(FEEDBACK_FILE, []);
+    feedback.push({
+        id: Date.now(),
+        message,
+        whatsapp,
+        productId,
+        page,
+        ip: getClientIp(req),
+        timestamp: new Date().toISOString(),
+        read: false
+    });
+    writeJSON(FEEDBACK_FILE, feedback);
+    res.json({ success: true });
+});
+
+app.post('/api/track-visit', (req, res) => {
+    const ip = getClientIp(req);
+    const userAgent = req.headers['user-agent'];
+    const timestamp = new Date().toISOString();
+
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    stats.visits.push({ date: timestamp, ip, userAgent });
+    writeJSON(STATS_FILE, stats);
+
+    let clients = readJSON(CLIENTS_FILE, []);
+    let client = clients.find(c => c.ip === ip);
+    if (client) {
+        client.lastSeen = timestamp;
+        client.visitCount++;
+    } else {
+        clients.push({ ip, userAgent, firstSeen: timestamp, lastSeen: timestamp, visitCount: 1 });
+    }
+    writeJSON(CLIENTS_FILE, clients);
+
+    const activity = readJSON(ACTIVITY_FILE, []);
+    activity.push({ id: Date.now(), type: 'visit', data: { ip, userAgent }, timestamp });
+    writeJSON(ACTIVITY_FILE, activity.slice(-1000));
+
+    res.json({ success: true });
+});
+
+app.post('/api/track-download', (req, res) => {
+    const { productId, productName, price } = req.body;
+    const ip = getClientIp(req);
+    const timestamp = new Date().toISOString();
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    stats.downloads.push({ date: timestamp, productId, productName, price, ip });
+    writeJSON(STATS_FILE, stats);
+    const activity = readJSON(ACTIVITY_FILE, []);
+    activity.push({ id: Date.now(), type: 'download', data: { productName, price, ip }, timestamp });
+    writeJSON(ACTIVITY_FILE, activity.slice(-1000));
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Admin Analytics Endpoints
+// ------------------------------
+app.get('/api/admin/stats', isAdmin, (req, res) => {
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    const activity = readJSON(ACTIVITY_FILE, []);
+    const clients = readJSON(CLIENTS_FILE, []);
+    const storage = getStorageUsage();
+    const totalVisits = stats.visits.length;
+    const totalDownloads = stats.downloads.length;
+    const successfulPayments = stats.payments?.filter(p => p.status === 'success').length || 0;
+    const cancelledPayments = stats.payments?.filter(p => p.status === 'failed' || p.status === 'cancelled').length || 0;
+
+    const productCount = {};
+    stats.downloads.forEach(d => { productCount[d.productName] = (productCount[d.productName] || 0) + 1; });
+    const topProducts = Object.entries(productCount).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count).slice(0,5);
+
+    const visitsByDay = {};
+    stats.visits.forEach(v => {
+        const day = v.date.split('T')[0];
+        visitsByDay[day] = (visitsByDay[day] || 0) + 1;
+    });
+    const last7Days = [];
+    for (let i = 6; i >= 0; i--) {
+        const d = new Date(); d.setDate(d.getDate() - i);
+        const dayStr = d.toISOString().split('T')[0];
+        last7Days.push({ date: dayStr, visits: visitsByDay[dayStr] || 0 });
+    }
+
+    const repeatClients = clients.filter(c => c.visitCount > 1).length;
+
+    res.json({
+        summary: { totalVisits, totalDownloads, successfulPayments, cancelledPayments,
+                   conversionRate: totalVisits ? ((successfulPayments / totalVisits) * 100).toFixed(1) : 0,
+                   repeatClients, totalClients: clients.length, storageUsed: storage.usedMB },
+        topProducts,
+        visitsByDay: last7Days,
+        recentActivity: activity.slice(-20).reverse(),
+        recentVisits: stats.visits.slice(-10).reverse()
+    });
+});
+
+app.get('/api/admin/activity', isAdmin, (req, res) => {
+    const activity = readJSON(ACTIVITY_FILE, []);
+    const { type } = req.query;
+    let filtered = activity;
+    if (type) filtered = activity.filter(a => a.type === type);
+    res.json(filtered.slice(-100).reverse());
+});
+
+app.get('/api/admin/clients', isAdmin, (req, res) => {
+    const clients = readJSON(CLIENTS_FILE, []);
+    res.json(clients.sort((a,b) => b.visitCount - a.visitCount));
+});
+
+app.get('/api/admin/feedback', isAdmin, (req, res) => {
+    const feedback = readJSON(FEEDBACK_FILE, []);
+    res.json(feedback.reverse());
+});
+
+app.put('/api/admin/feedback/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let feedback = readJSON(FEEDBACK_FILE, []);
+    const index = feedback.findIndex(f => f.id === id);
+    if (index !== -1) {
+        feedback[index].read = true;
+        writeJSON(FEEDBACK_FILE, feedback);
+    }
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Scheduled & Instant Messages
+// ------------------------------
+app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
+app.post('/api/admin/messages', isAdmin, (req, res) => {
+    const { title, content, type, startDate, endDate, isActive } = req.body;
+    const messages = readJSON(MESSAGES_FILE, []);
+    const newMsg = {
+        id: Date.now(), title, content, type: type || 'banner',
+        startDate: new Date(startDate).toISOString(),
+        endDate: endDate ? new Date(endDate).toISOString() : null,
+        active: isActive === true || isActive === 'true',
+        createdAt: new Date().toISOString(),
+    };
+    messages.push(newMsg);
+    writeJSON(MESSAGES_FILE, messages);
+    res.json({ success: true, message: newMsg });
+});
+app.put('/api/admin/messages/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const { active } = req.body;
+    let messages = readJSON(MESSAGES_FILE, []);
+    const idx = messages.findIndex(m => m.id === id);
+    if (idx === -1) return res.status(404).json({ error: 'Not found' });
+    messages[idx].active = active;
+    writeJSON(MESSAGES_FILE, messages);
+    res.json({ success: true });
+});
+app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let messages = readJSON(MESSAGES_FILE, []);
+    messages = messages.filter(m => m.id !== id);
+    writeJSON(MESSAGES_FILE, messages);
+    res.json({ success: true });
+});
+
+// Instant message
+app.post('/api/admin/instant-message', isAdmin, (req, res) => {
+    const { content, type } = req.body;
+    const instantMsg = {
+        id: Date.now(),
+        title: 'Instant Announcement',
+        content,
+        type: type || 'banner',
+        startDate: new Date().toISOString(),
+        endDate: new Date(Date.now() + 86400000).toISOString(),
+        active: true,
+        isInstant: true,
+        createdAt: new Date().toISOString()
+    };
+    const messages = readJSON(MESSAGES_FILE, []);
+    messages.push(instantMsg);
+    writeJSON(MESSAGES_FILE, messages);
+    res.json({ success: true, message: instantMsg });
+});
+
+// Popup messages
+app.post('/api/admin/popups', isAdmin, (req, res) => {
+    const { question, options, triggerType, delaySeconds, whatsappCollect } = req.body;
+    const popups = readJSON(POPUPS_FILE, []);
+    const newPopup = {
+        id: Date.now(),
+        question,
+        options: options || [],
+        triggerType: triggerType || 'onload',
+        delaySeconds: delaySeconds || 0,
+        whatsappCollect: whatsappCollect || false,
+        active: true,
+        startDate: new Date().toISOString(),
+        endDate: null,
+        createdAt: new Date().toISOString()
+    };
+    popups.push(newPopup);
+    writeJSON(POPUPS_FILE, popups);
+    res.json({ success: true, popup: newPopup });
+});
+
+app.get('/api/admin/popups', isAdmin, (req, res) => {
+    res.json(readJSON(POPUPS_FILE, []));
+});
+
+app.put('/api/admin/popups/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const updates = req.body;
+    let popups = readJSON(POPUPS_FILE, []);
+    const idx = popups.findIndex(p => p.id === id);
+    if (idx === -1) return res.status(404).json({ error: 'Not found' });
+    popups[idx] = { ...popups[idx], ...updates };
+    writeJSON(POPUPS_FILE, popups);
+    res.json({ success: true });
+});
+
+app.delete('/api/admin/popups/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let popups = readJSON(POPUPS_FILE, []);
+    popups = popups.filter(p => p.id !== id);
+    writeJSON(POPUPS_FILE, popups);
+    res.json({ success: true });
+});
+
 // ------------------------------
 // Promotional Banner Settings
 // ------------------------------
-const BANNER_FILE = 'banner.json';
-
 app.get('/api/banner', (req, res) => {
     const banner = readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null });
     res.json(banner);
@@ -22,8 +526,6 @@ app.post('/api/admin/banner', isAdmin, (req, res) => {
 // ------------------------------
 // WhatsApp Button Settings
 // ------------------------------
-const WHATSAPP_FILE = 'whatsapp.json';
-
 app.get('/api/admin/whatsapp', isAdmin, (req, res) => {
     res.json(readJSON(WHATSAPP_FILE, { enabled: false, phone: '', message: '' }));
 });
@@ -33,3 +535,36 @@ app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
     writeJSON(WHATSAPP_FILE, { enabled, phone, message });
     res.json({ success: true });
 });
+
+// ------------------------------
+// Keep-Alive Ping Endpoint
+// ------------------------------
+app.get('/ping', (req, res) => {
+    res.send('OK');
+});
+
+// ------------------------------
+// Payment Endpoint (Placeholder)
+// ------------------------------
+app.post('/api/initiate-payment', async (req, res) => {
+    const { phone, amount, productId } = req.body;
+    console.log(`Payment request: ${phone}, KES ${amount}`);
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    if (!stats.payments) stats.payments = [];
+    stats.payments.push({ date: new Date().toISOString(), status: 'success', amount, phone, ip: getClientIp(req) });
+    writeJSON(STATS_FILE, stats);
+    const activity = readJSON(ACTIVITY_FILE, []);
+    activity.push({ id: Date.now(), type: 'payment', data: { amount, phone }, timestamp: new Date().toISOString() });
+    writeJSON(ACTIVITY_FILE, activity.slice(-1000));
+    res.json({ success: true, checkoutRequestId: 'demo_' + Date.now() });
+});
+
+app.post('/api/payment-webhook', (req, res) => {
+    console.log('Webhook received:', req.body);
+    res.sendStatus(200);
+});
+
+// Health check
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
