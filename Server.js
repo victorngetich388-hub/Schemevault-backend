@@ -27,11 +27,8 @@ app.use('/covers', express.static(COVERS_DIR));
 
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
-        if (file.fieldname === 'coverImage') {
-            cb(null, COVERS_DIR);
-        } else {
-            cb(null, UPLOAD_DIR);
-        }
+        if (file.fieldname === 'coverImage') cb(null, COVERS_DIR);
+        else cb(null, UPLOAD_DIR);
     },
     filename: (req, file, cb) => {
         const uniqueName = Date.now() + '-' + file.originalname.replace(/\s/g, '_');
@@ -61,12 +58,13 @@ const writeJSON = (file, data) => {
 };
 
 // ------------------------------
-// Admin Authentication - HARDCODED PASSWORD
+// Admin Authentication
 // ------------------------------
-const ADMIN_PASSWORD = '0726019859';  // <-- CHANGE THIS TO YOUR PASSWORD
+const ADMIN_PASSWORD = '0726019859'; // Hardcoded for reliability
 const RECOVERY_EMAIL = 'victorngetich388@gmail.com';
 let resetCodes = {};
 
+// Email setup (optional – for password reset)
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
@@ -103,7 +101,7 @@ app.post('/api/admin/forgot-password', async (req, res) => {
         });
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to send email' });
+        res.status(500).json({ error: 'Email not configured. Use password: 0726019859' });
     }
 });
 
@@ -120,30 +118,25 @@ app.post('/api/admin/reset-password', (req, res) => {
 // Product Management
 // ------------------------------
 app.get('/api/admin/products', isAdmin, (req, res) => {
-    res.json(readJSON(PRODUCTS_FILE, []));
+    const products = readJSON(PRODUCTS_FILE, []);
+    res.json(products);
 });
 
 app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile' }, { name: 'coverImage' }]), (req, res) => {
     try {
         const { title, grade, term, subject, price, pages, visible } = req.body;
-        
         if (!title || !grade || !term || !subject || !price) {
             return res.status(400).json({ error: 'All fields required' });
         }
-        
         const pdfFile = req.files['pdfFile'] ? req.files['pdfFile'][0] : null;
         const coverFile = req.files['coverImage'] ? req.files['coverImage'][0] : null;
-        
-        if (!pdfFile) {
-            return res.status(400).json({ error: 'PDF file required' });
-        }
-        
+        if (!pdfFile) return res.status(400).json({ error: 'PDF file required' });
+
         const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${pdfFile.filename}`;
         const coverUrl = coverFile ? `${req.protocol}://${req.get('host')}/covers/${coverFile.filename}` : null;
-        
+
         const products = readJSON(PRODUCTS_FILE, []);
         const newId = products.length > 0 ? Math.max(...products.map(p => p.id)) + 1 : 1;
-        
         const newProduct = {
             id: newId,
             title,
@@ -157,11 +150,10 @@ app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile' }, { n
             visible: visible === 'true' || visible === true,
             createdAt: new Date().toISOString(),
         };
-        
         products.push(newProduct);
         writeJSON(PRODUCTS_FILE, products);
+        console.log(`Product added: ${newProduct.title} (ID: ${newId})`);
         res.json({ success: true, product: newProduct });
-        
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Upload failed' });
@@ -173,11 +165,7 @@ app.put('/api/admin/products/:id', isAdmin, (req, res) => {
     const updates = req.body;
     let products = readJSON(PRODUCTS_FILE, []);
     const index = products.findIndex(p => p.id === id);
-    
-    if (index === -1) {
-        return res.status(404).json({ error: 'Product not found' });
-    }
-    
+    if (index === -1) return res.status(404).json({ error: 'Not found' });
     products[index] = { ...products[index], ...updates };
     writeJSON(PRODUCTS_FILE, products);
     res.json({ success: true });
@@ -187,7 +175,6 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     let products = readJSON(PRODUCTS_FILE, []);
     const product = products.find(p => p.id === id);
-    
     if (product) {
         if (product.fileUrl) {
             const filename = product.fileUrl.split('/').pop();
@@ -200,14 +187,13 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
             if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
         }
     }
-    
     products = products.filter(p => p.id !== id);
     writeJSON(PRODUCTS_FILE, products);
     res.json({ success: true });
 });
 
 // ------------------------------
-// Secure Download Tokens
+// Secure Download (hide real URL)
 // ------------------------------
 const downloadTokens = {};
 
@@ -224,24 +210,16 @@ app.post('/api/request-download', (req, res) => {
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
     const record = downloadTokens[token];
-    
     if (!record || record.expires < Date.now()) {
-        return res.status(404).send('Download link expired or invalid');
+        return res.status(404).send('Download link expired');
     }
-    
     const products = readJSON(PRODUCTS_FILE, []);
     const product = products.find(p => p.id === record.productId);
-    
     if (!product || !product.fileUrl) {
         return res.status(404).send('File not found');
     }
-    
     try {
-        const response = await axios({
-            method: 'GET',
-            url: product.fileUrl,
-            responseType: 'stream'
-        });
+        const response = await axios({ method: 'GET', url: product.fileUrl, responseType: 'stream' });
         res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
         response.data.pipe(res);
         delete downloadTokens[token];
@@ -252,11 +230,12 @@ app.get('/api/download/:token', async (req, res) => {
 });
 
 // ------------------------------
-// Public Endpoints
+// Analytics & Public Endpoints
 // ------------------------------
 app.get('/api/products', (req, res) => {
     const products = readJSON(PRODUCTS_FILE, []);
-    res.json(products.filter(p => p.visible !== false));
+    const visible = products.filter(p => p.visible !== false);
+    res.json(visible);
 });
 
 app.get('/api/messages', (req, res) => {
@@ -266,13 +245,24 @@ app.get('/api/messages', (req, res) => {
     res.json(active);
 });
 
+// Track visit with IP and timestamp
 app.post('/api/track-visit', (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    stats.visits.push({ date: new Date().toISOString(), ip: req.ip });
+    const visit = {
+        date: new Date().toISOString(),
+        ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress || req.ip,
+        userAgent: req.headers['user-agent']
+    };
+    stats.visits.push(visit);
     writeJSON(STATS_FILE, stats);
-    
+
     const activity = readJSON(ACTIVITY_FILE, []);
-    activity.push({ id: Date.now(), type: 'visit', data: { ip: req.ip }, timestamp: new Date().toISOString() });
+    activity.push({
+        id: Date.now(),
+        type: 'visit',
+        data: { ip: visit.ip, userAgent: visit.userAgent },
+        timestamp: visit.date
+    });
     writeJSON(ACTIVITY_FILE, activity.slice(-1000));
     res.json({ success: true });
 });
@@ -280,11 +270,20 @@ app.post('/api/track-visit', (req, res) => {
 app.post('/api/track-download', (req, res) => {
     const { productId, productName, price } = req.body;
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    stats.downloads.push({ date: new Date().toISOString(), productId, productName, price });
+    stats.downloads.push({
+        date: new Date().toISOString(),
+        productId, productName, price,
+        ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress
+    });
     writeJSON(STATS_FILE, stats);
-    
+
     const activity = readJSON(ACTIVITY_FILE, []);
-    activity.push({ id: Date.now(), type: 'download', data: { productName, price }, timestamp: new Date().toISOString() });
+    activity.push({
+        id: Date.now(),
+        type: 'download',
+        data: { productName, price },
+        timestamp: new Date().toISOString()
+    });
     writeJSON(ACTIVITY_FILE, activity.slice(-1000));
     res.json({ success: true });
 });
@@ -295,22 +294,34 @@ app.post('/api/track-download', (req, res) => {
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     const activity = readJSON(ACTIVITY_FILE, []);
-    
     const totalVisits = stats.visits.length;
     const totalDownloads = stats.downloads.length;
     const successfulPayments = stats.payments?.filter(p => p.status === 'success').length || 0;
     const cancelledPayments = stats.payments?.filter(p => p.status === 'failed' || p.status === 'cancelled').length || 0;
-    
+
     const productCount = {};
     stats.downloads.forEach(d => {
         productCount[d.productName] = (productCount[d.productName] || 0) + 1;
     });
-    
     const topProducts = Object.entries(productCount)
         .map(([name, count]) => ({ name, count }))
         .sort((a, b) => b.count - a.count)
         .slice(0, 5);
-    
+
+    // Group visits by date (last 7 days)
+    const visitsByDay = {};
+    stats.visits.forEach(v => {
+        const date = v.date.split('T')[0];
+        visitsByDay[date] = (visitsByDay[date] || 0) + 1;
+    });
+    const last7Days = [];
+    for (let i = 6; i >= 0; i--) {
+        const date = new Date();
+        date.setDate(date.getDate() - i);
+        const dateStr = date.toISOString().split('T')[0];
+        last7Days.push({ date: dateStr, visits: visitsByDay[dateStr] || 0 });
+    }
+
     res.json({
         summary: {
             totalVisits,
@@ -320,7 +331,9 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
             conversionRate: totalVisits ? ((successfulPayments / totalVisits) * 100).toFixed(1) : 0,
         },
         topProducts,
+        visitsByDay: last7Days,
         recentActivity: activity.slice(-20).reverse(),
+        recentVisits: stats.visits.slice(-10).reverse()
     });
 });
 
@@ -344,9 +357,7 @@ app.post('/api/admin/messages', isAdmin, (req, res) => {
     const messages = readJSON(MESSAGES_FILE, []);
     const newMsg = {
         id: Date.now(),
-        title,
-        content,
-        type: type || 'banner',
+        title, content, type: type || 'banner',
         startDate: new Date(startDate).toISOString(),
         endDate: endDate ? new Date(endDate).toISOString() : null,
         active: isActive === true || isActive === 'true',
@@ -382,17 +393,16 @@ app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount } = req.body;
     console.log(`Payment request: ${phone}, KES ${amount}`);
-    
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     if (!stats.payments) stats.payments = [];
     stats.payments.push({
         date: new Date().toISOString(),
         status: 'success',
         amount,
-        phone
+        phone,
+        ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress
     });
     writeJSON(STATS_FILE, stats);
-    
     res.json({ success: true, checkoutRequestId: 'demo_' + Date.now() });
 });
 
@@ -401,12 +411,10 @@ app.post('/api/payment-webhook', (req, res) => {
     res.sendStatus(200);
 });
 
-// ------------------------------
-// Start Server
-// ------------------------------
+// Health check
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`Admin password: ${ADMIN_PASSWORD}`);
-    console.log(`Uploads folder: ${UPLOAD_DIR}`);
-    console.log(`Covers folder: ${COVERS_DIR}`);
 });
