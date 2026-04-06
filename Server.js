@@ -49,6 +49,7 @@ const BANNER_FILE = 'banner.json';
 const WHATSAPP_FILE = 'whatsapp.json';
 const POPUPS_FILE = 'popups.json';
 const LEARNING_AREAS_FILE = 'learning_areas.json';
+const GRADES_FILE = 'grades.json';
 
 const readJSON = (file, defaultVal = []) => {
     if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(defaultVal));
@@ -81,7 +82,7 @@ function getStorageUsage() {
 }
 
 // ------------------------------
-// Default Learning Areas (CBC Curriculum)
+// Default Data
 // ------------------------------
 const defaultLearningAreas = [
     { id: 1, name: "Mathematics", active: true, order: 1 },
@@ -92,6 +93,18 @@ const defaultLearningAreas = [
     { id: 6, name: "Integrated Science", active: true, order: 6 },
     { id: 7, name: "Pre-technical Studies", active: true, order: 7 },
     { id: 8, name: "Agriculture", active: true, order: 8 }
+];
+
+const defaultGrades = [
+    { id: 1, name: "Grade 1", active: true, order: 1 },
+    { id: 2, name: "Grade 2", active: true, order: 2 },
+    { id: 3, name: "Grade 3", active: true, order: 3 },
+    { id: 4, name: "Grade 4", active: true, order: 4 },
+    { id: 5, name: "Grade 5", active: true, order: 5 },
+    { id: 6, name: "Grade 6", active: true, order: 6 },
+    { id: 7, name: "Grade 7", active: true, order: 7 },
+    { id: 8, name: "Grade 8", active: true, order: 8 },
+    { id: 9, name: "Grade 9", active: true, order: 9 }
 ];
 
 // ------------------------------
@@ -284,6 +297,64 @@ app.delete('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
+// Grades Management
+// ------------------------------
+app.get('/api/admin/grades', isAdmin, (req, res) => {
+    let grades = readJSON(GRADES_FILE, []);
+    if (grades.length === 0) {
+        grades = defaultGrades;
+        writeJSON(GRADES_FILE, grades);
+    }
+    res.json(grades);
+});
+
+app.get('/api/grades', (req, res) => {
+    let grades = readJSON(GRADES_FILE, []);
+    if (grades.length === 0) {
+        grades = defaultGrades;
+        writeJSON(GRADES_FILE, grades);
+    }
+    const activeGrades = grades.filter(grade => grade.active === true);
+    res.json(activeGrades);
+});
+
+app.post('/api/admin/grades', isAdmin, (req, res) => {
+    const { name, active } = req.body;
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    let grades = readJSON(GRADES_FILE, []);
+    const newId = grades.length ? Math.max(...grades.map(g => g.id)) + 1 : 1;
+    const newGrade = {
+        id: newId,
+        name: name,
+        active: active === true || active === 'true',
+        order: grades.length + 1
+    };
+    grades.push(newGrade);
+    writeJSON(GRADES_FILE, grades);
+    res.json({ success: true, grade: newGrade });
+});
+
+app.put('/api/admin/grades/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const { name, active } = req.body;
+    let grades = readJSON(GRADES_FILE, []);
+    const index = grades.findIndex(g => g.id === id);
+    if (index === -1) return res.status(404).json({ error: 'Not found' });
+    if (name !== undefined) grades[index].name = name;
+    if (active !== undefined) grades[index].active = active === true || active === 'true';
+    writeJSON(GRADES_FILE, grades);
+    res.json({ success: true });
+});
+
+app.delete('/api/admin/grades/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let grades = readJSON(GRADES_FILE, []);
+    grades = grades.filter(g => g.id !== id);
+    writeJSON(GRADES_FILE, grades);
+    res.json({ success: true });
+});
+
+// ------------------------------
 // IP Geolocation
 // ------------------------------
 app.get('/api/geo/:ip', async (req, res) => {
@@ -390,6 +461,7 @@ app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile' }, { n
     }
 });
 
+// EDIT PRODUCT - Update price, visibility, title, etc.
 app.put('/api/admin/products/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     const updates = req.body;
@@ -398,7 +470,7 @@ app.put('/api/admin/products/:id', isAdmin, (req, res) => {
     if (index === -1) return res.status(404).json({ error: 'Not found' });
     products[index] = { ...products[index], ...updates };
     writeJSON(PRODUCTS_FILE, products);
-    res.json({ success: true });
+    res.json({ success: true, product: products[index] });
 });
 
 app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
@@ -423,22 +495,47 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Secure Download Tokens
+// Secure Download Tokens (Only after successful payment)
 // ------------------------------
-const downloadTokens = {};
+const downloadTokens = new Map();
+const verifiedPayments = new Map();
+
+app.post('/api/verify-payment', (req, res) => {
+    const { transactionId, productId, amount, phone } = req.body;
+    // In production, verify with Paynecta here
+    // For demo, we mark as verified
+    const token = Math.random().toString(36).substring(2, 15);
+    verifiedPayments.set(token, { productId, expires: Date.now() + 60000 });
+    res.json({ success: true, token });
+});
 
 app.post('/api/request-download', (req, res) => {
     const { productId, paymentRef } = req.body;
     if (!productId || !paymentRef) return res.status(400).json({ error: 'Missing data' });
-    const token = Math.random().toString(36).substring(2, 15);
-    downloadTokens[token] = { productId, expires: Date.now() + 60000 };
-    res.json({ token });
+    
+    // Check if payment was verified
+    let validToken = null;
+    for (const [token, data] of verifiedPayments.entries()) {
+        if (data.productId === productId && data.expires > Date.now()) {
+            validToken = token;
+            break;
+        }
+    }
+    
+    if (!validToken) {
+        return res.status(403).json({ error: 'Payment not verified. Complete payment first.' });
+    }
+    
+    const downloadToken = Math.random().toString(36).substring(2, 15);
+    downloadTokens.set(downloadToken, { productId, expires: Date.now() + 60000 });
+    verifiedPayments.delete(validToken);
+    res.json({ token: downloadToken });
 });
 
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
-    const record = downloadTokens[token];
-    if (!record || record.expires < Date.now()) return res.status(404).send('Link expired');
+    const record = downloadTokens.get(token);
+    if (!record || record.expires < Date.now()) return res.status(404).send('Download link expired or invalid');
     const products = readJSON(PRODUCTS_FILE, []);
     const product = products.find(p => p.id === record.productId);
     if (!product || !product.fileUrl) return res.status(404).send('File not found');
@@ -446,7 +543,7 @@ app.get('/api/download/:token', async (req, res) => {
         const response = await axios({ method: 'GET', url: product.fileUrl, responseType: 'stream' });
         res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
         response.data.pipe(res);
-        delete downloadTokens[token];
+        downloadTokens.delete(token);
     } catch (err) {
         res.status(500).send('Download error');
     }
@@ -708,62 +805,4 @@ app.post('/api/admin/banner', isAdmin, (req, res) => {
 });
 
 app.get('/api/admin/whatsapp', isAdmin, (req, res) => {
-    res.json(readJSON(WHATSAPP_FILE, { enabled: false, phone: '', message: '' }));
-});
-
-app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
-    const { enabled, phone, message } = req.body;
-    writeJSON(WHATSAPP_FILE, { enabled, phone, message });
-    res.json({ success: true });
-});
-
-// ------------------------------
-// Clear Logs Endpoint
-// ------------------------------
-app.post('/api/admin/clear-logs', isAdmin, (req, res) => {
-    const { period } = req.body;
-    let activity = readJSON(ACTIVITY_FILE, []);
-    const now = new Date();
-    if (period === 'now') {
-        activity = [];
-    } else if (period === 'year') {
-        const oneYearAgo = new Date(now.setFullYear(now.getFullYear() - 1));
-        activity = activity.filter(a => new Date(a.timestamp) > oneYearAgo);
-    } else if (period === 'all') {
-        activity = [];
-    }
-    writeJSON(ACTIVITY_FILE, activity);
-    res.json({ success: true });
-});
-
-// ------------------------------
-// Keep-Alive Ping
-// ------------------------------
-app.get('/ping', (req, res) => {
-    res.send('OK');
-});
-
-// ------------------------------
-// Payment Endpoint (Placeholder - Replace with Paynecta)
-// ------------------------------
-app.post('/api/initiate-payment', async (req, res) => {
-    const { phone, amount, productId } = req.body;
-    console.log(`Payment request: ${phone}, KES ${amount}`);
-    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    if (!stats.payments) stats.payments = [];
-    stats.payments.push({ date: new Date().toISOString(), status: 'success', amount, phone, ip: getClientIp(req) });
-    writeJSON(STATS_FILE, stats);
-    const activity = readJSON(ACTIVITY_FILE, []);
-    activity.push({ id: Date.now(), type: 'payment', data: { amount, phone }, timestamp: new Date().toISOString() });
-    writeJSON(ACTIVITY_FILE, activity.slice(-1000));
-    res.json({ success: true, checkoutRequestId: 'demo_' + Date.now() });
-});
-
-app.post('/api/payment-webhook', (req, res) => {
-    console.log('Webhook received:', req.body);
-    res.sendStatus(200);
-});
-
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+    res.json(readJSON(WHATSAPP_FILE
