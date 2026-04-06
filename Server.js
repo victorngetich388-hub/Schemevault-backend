@@ -48,6 +48,7 @@ const TERM_SETTINGS_FILE = 'term_settings.json';
 const BANNER_FILE = 'banner.json';
 const WHATSAPP_FILE = 'whatsapp.json';
 const POPUPS_FILE = 'popups.json';
+const LEARNING_AREAS_FILE = 'learning_areas.json';
 
 const readJSON = (file, defaultVal = []) => {
     if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(defaultVal));
@@ -78,6 +79,34 @@ function getStorageUsage() {
     const totalMB = ((uploadsSize + coversSize) / (1024 * 1024)).toFixed(2);
     return { usedMB: totalMB, usedBytes: uploadsSize + coversSize };
 }
+
+// ------------------------------
+// Default Learning Areas (CBC Curriculum)
+// ------------------------------
+const defaultLearningAreas = [
+    { id: 1, name: "Mathematics", active: true, order: 1 },
+    { id: 2, name: "English", active: true, order: 2 },
+    { id: 3, name: "Kiswahili", active: true, order: 3 },
+    { id: 4, name: "Creative Arts", active: true, order: 4 },
+    { id: 5, name: "Social Studies", active: true, order: 5 },
+    { id: 6, name: "Integrated Science", active: true, order: 6 },
+    { id: 7, name: "Pre-technical Studies", active: true, order: 7 },
+    { id: 8, name: "Agriculture", active: true, order: 8 }
+];
+
+// ------------------------------
+// Active Users Tracking (Real-time)
+// ------------------------------
+const activeSessions = new Map();
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [sessionId, data] of activeSessions.entries()) {
+        if (now - data.lastSeen > 60000) {
+            activeSessions.delete(sessionId);
+        }
+    }
+}, 30000);
 
 // ------------------------------
 // Admin Authentication
@@ -139,6 +168,174 @@ app.post('/api/admin/change-password', isAdmin, (req, res) => {
     const { currentPassword, newPassword } = req.body;
     if (currentPassword !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Current password incorrect' });
     res.json({ success: true, message: 'Change requested. Update Render environment variable.' });
+});
+
+// ------------------------------
+// Active Users Endpoints
+// ------------------------------
+app.post('/api/heartbeat', (req, res) => {
+    const { sessionId } = req.body;
+    const ip = getClientIp(req);
+    const userAgent = req.headers['user-agent'];
+    
+    if (!sessionId) {
+        return res.status(400).json({ error: 'sessionId required' });
+    }
+    
+    activeSessions.set(sessionId, {
+        ip: ip,
+        userAgent: userAgent,
+        lastSeen: Date.now(),
+        firstSeen: activeSessions.has(sessionId) ? activeSessions.get(sessionId).firstSeen : Date.now()
+    });
+    
+    res.json({ success: true, activeCount: activeSessions.size });
+});
+
+app.get('/api/admin/active-users', isAdmin, (req, res) => {
+    const now = Date.now();
+    let active = 0;
+    const activeList = [];
+    
+    for (const [sessionId, data] of activeSessions.entries()) {
+        if (now - data.lastSeen <= 60000) {
+            active++;
+            activeList.push({
+                sessionId: sessionId.substring(0, 8),
+                ip: data.ip,
+                lastSeen: data.lastSeen,
+                activeSeconds: Math.floor((now - data.lastSeen) / 1000),
+                duration: Math.floor((now - data.firstSeen) / 1000)
+            });
+        }
+    }
+    
+    res.json({ 
+        activeCount: active,
+        activeUsers: activeList,
+        lastUpdated: new Date().toISOString()
+    });
+});
+
+app.post('/api/leave', (req, res) => {
+    const { sessionId } = req.body;
+    if (sessionId && activeSessions.has(sessionId)) {
+        activeSessions.delete(sessionId);
+    }
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Learning Areas Management
+// ------------------------------
+app.get('/api/admin/learning-areas', isAdmin, (req, res) => {
+    let areas = readJSON(LEARNING_AREAS_FILE, []);
+    if (areas.length === 0) {
+        areas = defaultLearningAreas;
+        writeJSON(LEARNING_AREAS_FILE, areas);
+    }
+    res.json(areas);
+});
+
+app.get('/api/learning-areas', (req, res) => {
+    let areas = readJSON(LEARNING_AREAS_FILE, []);
+    if (areas.length === 0) {
+        areas = defaultLearningAreas;
+        writeJSON(LEARNING_AREAS_FILE, areas);
+    }
+    const activeAreas = areas.filter(area => area.active === true);
+    res.json(activeAreas);
+});
+
+app.post('/api/admin/learning-areas', isAdmin, (req, res) => {
+    const { name, active } = req.body;
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    let areas = readJSON(LEARNING_AREAS_FILE, []);
+    const newId = areas.length ? Math.max(...areas.map(a => a.id)) + 1 : 1;
+    const newArea = {
+        id: newId,
+        name: name,
+        active: active === true || active === 'true',
+        order: areas.length + 1
+    };
+    areas.push(newArea);
+    writeJSON(LEARNING_AREAS_FILE, areas);
+    res.json({ success: true, area: newArea });
+});
+
+app.put('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const { name, active } = req.body;
+    let areas = readJSON(LEARNING_AREAS_FILE, []);
+    const index = areas.findIndex(a => a.id === id);
+    if (index === -1) return res.status(404).json({ error: 'Not found' });
+    if (name !== undefined) areas[index].name = name;
+    if (active !== undefined) areas[index].active = active === true || active === 'true';
+    writeJSON(LEARNING_AREAS_FILE, areas);
+    res.json({ success: true });
+});
+
+app.delete('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let areas = readJSON(LEARNING_AREAS_FILE, []);
+    areas = areas.filter(a => a.id !== id);
+    writeJSON(LEARNING_AREAS_FILE, areas);
+    res.json({ success: true });
+});
+
+// ------------------------------
+// IP Geolocation
+// ------------------------------
+app.get('/api/geo/:ip', async (req, res) => {
+    const ip = req.params.ip;
+    if (ip === '::1' || ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
+        return res.json({ ip: ip, city: 'Local', region: 'Local', country: 'Local' });
+    }
+    try {
+        const response = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,lat,lon,timezone`);
+        if (response.data.status === 'success') {
+            res.json({
+                ip: ip,
+                city: response.data.city,
+                region: response.data.regionName,
+                country: response.data.country,
+                isp: response.data.isp,
+                latitude: response.data.lat,
+                longitude: response.data.lon,
+                timezone: response.data.timezone
+            });
+        } else {
+            res.json({ ip: ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
+        }
+    } catch (error) {
+        res.json({ ip: ip, city: 'Error', region: 'Error', country: 'Error' });
+    }
+});
+
+app.get('/api/admin/visitors-with-location', isAdmin, async (req, res) => {
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    const recentIPs = [...new Set(stats.visits.slice(-50).map(v => v.ip))];
+    const locations = [];
+    for (const ip of recentIPs) {
+        try {
+            const geoRes = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp`);
+            if (geoRes.data.status === 'success') {
+                locations.push({
+                    ip: ip,
+                    city: geoRes.data.city,
+                    region: geoRes.data.regionName,
+                    country: geoRes.data.country,
+                    isp: geoRes.data.isp
+                });
+            } else {
+                locations.push({ ip: ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
+            }
+            await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (err) {
+            locations.push({ ip: ip, city: 'Error', region: 'Error', country: 'Error' });
+        }
+    }
+    res.json(locations);
 });
 
 // ------------------------------
@@ -256,7 +453,7 @@ app.get('/api/download/:token', async (req, res) => {
 });
 
 // ------------------------------
-// Public Endpoints (with Analytics)
+// Public Endpoints
 // ------------------------------
 app.get('/api/products', (req, res) => {
     const products = readJSON(PRODUCTS_FILE, []);
@@ -298,11 +495,9 @@ app.post('/api/track-visit', (req, res) => {
     const ip = getClientIp(req);
     const userAgent = req.headers['user-agent'];
     const timestamp = new Date().toISOString();
-
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     stats.visits.push({ date: timestamp, ip, userAgent });
     writeJSON(STATS_FILE, stats);
-
     let clients = readJSON(CLIENTS_FILE, []);
     let client = clients.find(c => c.ip === ip);
     if (client) {
@@ -312,11 +507,9 @@ app.post('/api/track-visit', (req, res) => {
         clients.push({ ip, userAgent, firstSeen: timestamp, lastSeen: timestamp, visitCount: 1 });
     }
     writeJSON(CLIENTS_FILE, clients);
-
     const activity = readJSON(ACTIVITY_FILE, []);
     activity.push({ id: Date.now(), type: 'visit', data: { ip, userAgent }, timestamp });
     writeJSON(ACTIVITY_FILE, activity.slice(-1000));
-
     res.json({ success: true });
 });
 
@@ -334,7 +527,7 @@ app.post('/api/track-download', (req, res) => {
 });
 
 // ------------------------------
-// Admin Analytics Endpoints
+// Admin Analytics
 // ------------------------------
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -345,25 +538,18 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
     const totalDownloads = stats.downloads.length;
     const successfulPayments = stats.payments?.filter(p => p.status === 'success').length || 0;
     const cancelledPayments = stats.payments?.filter(p => p.status === 'failed' || p.status === 'cancelled').length || 0;
-
     const productCount = {};
     stats.downloads.forEach(d => { productCount[d.productName] = (productCount[d.productName] || 0) + 1; });
     const topProducts = Object.entries(productCount).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count).slice(0,5);
-
     const visitsByDay = {};
-    stats.visits.forEach(v => {
-        const day = v.date.split('T')[0];
-        visitsByDay[day] = (visitsByDay[day] || 0) + 1;
-    });
+    stats.visits.forEach(v => { const day = v.date.split('T')[0]; visitsByDay[day] = (visitsByDay[day] || 0) + 1; });
     const last7Days = [];
     for (let i = 6; i >= 0; i--) {
         const d = new Date(); d.setDate(d.getDate() - i);
         const dayStr = d.toISOString().split('T')[0];
         last7Days.push({ date: dayStr, visits: visitsByDay[dayStr] || 0 });
     }
-
     const repeatClients = clients.filter(c => c.visitCount > 1).length;
-
     res.json({
         summary: { totalVisits, totalDownloads, successfulPayments, cancelledPayments,
                    conversionRate: totalVisits ? ((successfulPayments / totalVisits) * 100).toFixed(1) : 0,
@@ -405,7 +591,7 @@ app.put('/api/admin/feedback/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Scheduled & Instant Messages
+// Messages & Popups
 // ------------------------------
 app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
 app.post('/api/admin/messages', isAdmin, (req, res) => {
@@ -440,7 +626,6 @@ app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
     res.json({ success: true });
 });
 
-// Instant message
 app.post('/api/admin/instant-message', isAdmin, (req, res) => {
     const { content, type } = req.body;
     const instantMsg = {
@@ -460,7 +645,6 @@ app.post('/api/admin/instant-message', isAdmin, (req, res) => {
     res.json({ success: true, message: instantMsg });
 });
 
-// Popup messages
 app.post('/api/admin/popups', isAdmin, (req, res) => {
     const { question, options, triggerType, delaySeconds, whatsappCollect } = req.body;
     const popups = readJSON(POPUPS_FILE, []);
@@ -505,7 +689,7 @@ app.delete('/api/admin/popups/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Promotional Banner Settings
+// Banner & WhatsApp Settings
 // ------------------------------
 app.get('/api/banner', (req, res) => {
     const banner = readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null });
@@ -523,9 +707,6 @@ app.post('/api/admin/banner', isAdmin, (req, res) => {
     res.json({ success: true });
 });
 
-// ------------------------------
-// WhatsApp Button Settings
-// ------------------------------
 app.get('/api/admin/whatsapp', isAdmin, (req, res) => {
     res.json(readJSON(WHATSAPP_FILE, { enabled: false, phone: '', message: '' }));
 });
@@ -537,14 +718,33 @@ app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Keep-Alive Ping Endpoint
+// Clear Logs Endpoint
+// ------------------------------
+app.post('/api/admin/clear-logs', isAdmin, (req, res) => {
+    const { period } = req.body;
+    let activity = readJSON(ACTIVITY_FILE, []);
+    const now = new Date();
+    if (period === 'now') {
+        activity = [];
+    } else if (period === 'year') {
+        const oneYearAgo = new Date(now.setFullYear(now.getFullYear() - 1));
+        activity = activity.filter(a => new Date(a.timestamp) > oneYearAgo);
+    } else if (period === 'all') {
+        activity = [];
+    }
+    writeJSON(ACTIVITY_FILE, activity);
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Keep-Alive Ping
 // ------------------------------
 app.get('/ping', (req, res) => {
     res.send('OK');
 });
 
 // ------------------------------
-// Payment Endpoint (Placeholder)
+// Payment Endpoint (Placeholder - Replace with Paynecta)
 // ------------------------------
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
