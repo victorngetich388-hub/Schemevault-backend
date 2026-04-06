@@ -42,7 +42,7 @@ const PRODUCTS_FILE = 'products.json';
 const STATS_FILE = 'stats.json';
 const MESSAGES_FILE = 'messages.json';
 const ACTIVITY_FILE = 'activity.json';
-const CLIENTS_FILE = 'clients.json';   // tracks repeat visitors
+const CLIENTS_FILE = 'clients.json';
 
 const readJSON = (file, defaultVal = []) => {
     if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(defaultVal));
@@ -50,7 +50,6 @@ const readJSON = (file, defaultVal = []) => {
 };
 const writeJSON = (file, data) => fs.writeFileSync(file, JSON.stringify(data, null, 2));
 
-// Helper to get client IP (works behind Render proxy)
 function getClientIp(req) {
     return req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
 }
@@ -58,7 +57,7 @@ function getClientIp(req) {
 // ------------------------------
 // Admin Authentication
 // ------------------------------
-const ADMIN_PASSWORD = '0726019859';  // hardcoded for reliability
+const ADMIN_PASSWORD = '0726019859';
 const RECOVERY_EMAIL = 'victorngetich388@gmail.com';
 let resetCodes = {};
 
@@ -145,7 +144,6 @@ app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile' }, { n
         };
         products.push(newProduct);
         writeJSON(PRODUCTS_FILE, products);
-        console.log(`Product added: ${title}`);
         res.json({ success: true, product: newProduct });
     } catch (err) {
         console.error(err);
@@ -230,18 +228,15 @@ app.get('/api/messages', (req, res) => {
     res.json(active);
 });
 
-// Track visit – records IP, user agent, timestamp, and identifies repeat clients
 app.post('/api/track-visit', (req, res) => {
     const ip = getClientIp(req);
     const userAgent = req.headers['user-agent'];
     const timestamp = new Date().toISOString();
 
-    // Update stats
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     stats.visits.push({ date: timestamp, ip, userAgent });
     writeJSON(STATS_FILE, stats);
 
-    // Update clients file (for repeat client tracking)
     let clients = readJSON(CLIENTS_FILE, []);
     let client = clients.find(c => c.ip === ip);
     if (client) {
@@ -252,7 +247,6 @@ app.post('/api/track-visit', (req, res) => {
     }
     writeJSON(CLIENTS_FILE, clients);
 
-    // Activity log
     const activity = readJSON(ACTIVITY_FILE, []);
     activity.push({ id: Date.now(), type: 'visit', data: { ip, userAgent }, timestamp });
     writeJSON(ACTIVITY_FILE, activity.slice(-1000));
@@ -260,7 +254,6 @@ app.post('/api/track-visit', (req, res) => {
     res.json({ success: true });
 });
 
-// Track download – records which product, IP, timestamp
 app.post('/api/track-download', (req, res) => {
     const { productId, productName, price } = req.body;
     const ip = getClientIp(req);
@@ -286,12 +279,10 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
     const successfulPayments = stats.payments?.filter(p => p.status === 'success').length || 0;
     const cancelledPayments = stats.payments?.filter(p => p.status === 'failed' || p.status === 'cancelled').length || 0;
 
-    // Top products
     const productCount = {};
     stats.downloads.forEach(d => { productCount[d.productName] = (productCount[d.productName] || 0) + 1; });
     const topProducts = Object.entries(productCount).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count).slice(0,5);
 
-    // Visits per day (last 7 days)
     const visitsByDay = {};
     stats.visits.forEach(v => {
         const day = v.date.split('T')[0];
@@ -304,7 +295,6 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
         last7Days.push({ date: dayStr, visits: visitsByDay[dayStr] || 0 });
     }
 
-    // Repeat clients
     const repeatClients = clients.filter(c => c.visitCount > 1).length;
 
     res.json({
@@ -332,7 +322,7 @@ app.get('/api/admin/clients', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Scheduled Messages (unchanged)
+// Scheduled Messages
 // ------------------------------
 app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
 app.post('/api/admin/messages', isAdmin, (req, res) => {
@@ -368,7 +358,7 @@ app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Payment Endpoint (Placeholder – replace with Paynecta)
+// Payment Endpoint (Placeholder – replace with your Paynecta code)
 // ------------------------------
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
@@ -387,5 +377,8 @@ app.post('/api/payment-webhook', (req, res) => {
     console.log('Webhook received:', req.body);
     res.sendStatus(200);
 });
+
+// Health check
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
