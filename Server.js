@@ -319,46 +319,6 @@ app.delete('/api/admin/grades/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// IP Geolocation (optional)
-// ------------------------------
-app.get('/api/geo/:ip', async (req, res) => {
-    const ip = req.params.ip;
-    if (ip === '::1' || ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
-        return res.json({ ip, city: 'Local', region: 'Local', country: 'Local' });
-    }
-    try {
-        const response = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp`);
-        if (response.data.status === 'success') {
-            res.json({ ip, city: response.data.city, region: response.data.regionName, country: response.data.country, isp: response.data.isp });
-        } else {
-            res.json({ ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
-        }
-    } catch (error) {
-        res.json({ ip, city: 'Error', region: 'Error', country: 'Error' });
-    }
-});
-
-app.get('/api/admin/visitors-with-location', isAdmin, async (req, res) => {
-    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    const recentIPs = [...new Set(stats.visits.slice(-50).map(v => v.ip))];
-    const locations = [];
-    for (const ip of recentIPs) {
-        try {
-            const geoRes = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp`);
-            if (geoRes.data.status === 'success') {
-                locations.push({ ip, city: geoRes.data.city, region: geoRes.data.regionName, country: geoRes.data.country, isp: geoRes.data.isp });
-            } else {
-                locations.push({ ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
-            }
-            await new Promise(resolve => setTimeout(resolve, 100));
-        } catch (err) {
-            locations.push({ ip, city: 'Error', region: 'Error', country: 'Error' });
-        }
-    }
-    res.json(locations);
-});
-
-// ------------------------------
 // Term Settings
 // ------------------------------
 app.get('/api/admin/term-settings', isAdmin, (req, res) => {
@@ -445,7 +405,7 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// BACKUP & RESTORE (No external cloud)
+// BACKUP & RESTORE
 // ------------------------------
 app.get('/api/admin/backup', isAdmin, (req, res) => {
     const archive = archiver('zip', { zlib: { level: 9 } });
@@ -473,7 +433,6 @@ app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req,
 
     try {
         await extract(zipFile.path, { dir: extractPath });
-        // Restore JSON files
         const dataDir = path.join(extractPath, 'data');
         if (fs.existsSync(dataDir)) {
             const files = fs.readdirSync(dataDir);
@@ -483,7 +442,6 @@ app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req,
                 fs.copyFileSync(src, dest);
             }
         }
-        // Restore uploads
         const uploadsBackup = path.join(extractPath, 'uploads');
         if (fs.existsSync(uploadsBackup)) {
             const files = fs.readdirSync(uploadsBackup);
@@ -532,7 +490,6 @@ app.post('/api/initiate-payment', async (req, res) => {
         const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE;
 
         if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
-            // Demo mode: auto-confirm after 2 seconds
             setTimeout(() => {
                 const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
                 const pIndex = stats.payments.findIndex(p => p.transactionId === transactionId);
@@ -702,7 +659,7 @@ app.post('/api/track-download', (req, res) => {
 });
 
 // ------------------------------
-// Admin Analytics (shortened)
+// Admin Analytics
 // ------------------------------
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -726,7 +683,7 @@ app.put('/api/admin/feedback/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Messages & Popups (shortened)
+// Messages & Popups
 // ------------------------------
 app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
 app.post('/api/admin/messages', isAdmin, (req, res) => {
