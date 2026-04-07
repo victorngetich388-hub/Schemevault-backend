@@ -38,24 +38,25 @@ const FILES = { PRODUCTS: 'products.json', STATS: 'stats.json', MESSAGES: 'messa
 
 const readJSON = (file, def = []) => {
     try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : (fs.writeFileSync(file, JSON.stringify(def, null, 2)), def); }
-    catch { return def; }
+    catch (e) { console.error(`Read error ${file}:`, e); return def; }
 };
-const writeJSON = (file, data) => { try { fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8'); return true; } catch { return false; } };
-
+const writeJSON = (file, data) => { try { fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8'); return true; } catch (e) { console.error(`Write error ${file}:`, e); return false; } };
 const getClientIp = (req) => req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
 
 // ------------------------------
 // Memory State (INSTANT ACCESS)
 // ------------------------------
-const activePayments = new Map(); // txId -> { status, productId, amount, phone }const verifiedPayments = new Map(); // token -> { productId, transactionId, amount, expires }
-const downloadTokens = new Map();   // token -> { productId, expires }
+const activePayments = new Map(); // Stores our internal TXN ID -> Status
+const verifiedPayments = new Map(); // Stores verification tokensconst downloadTokens = new Map();
 const activeSessions = new Map();
 let cacheVersion = Date.now();
 
+// Cleanup old data every 30s
 setInterval(() => {
     const now = Date.now();
     for (const [id, d] of activeSessions.entries()) if (now - d.lastSeen > 60000) activeSessions.delete(id);
-    for (const [id, d] of activePayments.entries()) if (d.status !== 'pending' && now - d.created > 300000) activePayments.delete(id); // Clean old
+    // Keep pending/active payments for 10 mins, then delete
+    for (const [id, d] of activePayments.entries()) if (now - d.created > 600000) activePayments.delete(id);
 }, 30000);
 
 const defaultLearningAreas = [{ id: 1, name: "Mathematics", active: true }, { id: 2, name: "English", active: true }, { id: 3, name: "Kiswahili", active: true }, { id: 4, name: "Creative Arts", active: true }, { id: 5, name: "Social Studies", active: true }, { id: 6, name: "Integrated Science", active: true }, { id: 7, name: "Pre-technical Studies", active: true }, { id: 8, name: "Agriculture", active: true }];
@@ -74,12 +75,6 @@ app.post('/api/admin/login', (req, res) => {
     else res.status(401).json({ success: false, error: 'Wrong password' });
 });
 const isAdmin = (req, res, next) => req.headers['x-admin-token'] ? next() : res.status(401).json({ error: 'Unauthorized' });
-
-app.post('/api/admin/forgot-password', async (req, res) => {
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    resetCodes[code] = Date.now() + 3600000;
-    try { await transporter.sendMail({ from: `"SchemeVault" <${RECOVERY_EMAIL}>`, to: RECOVERY_EMAIL, subject: 'Reset Code', text: `Code: ${code}` }); res.json({ success: true }); } catch { res.status(500).json({ error: 'Failed' }); }
-});
 app.get('/api/cache-version', (req, res) => res.json({ version: cacheVersion }));
 app.post('/api/admin/clear-cache', isAdmin, (req, res) => { cacheVersion = Date.now(); res.json({ success: true, version: cacheVersion }); });
 
@@ -96,12 +91,12 @@ app.get('/api/admin/active-users', isAdmin, (req, res) => {
 });
 app.post('/api/leave', (req, res) => { if (req.body.sessionId) activeSessions.delete(req.body.sessionId); res.json({ success: true }); });
 
-// 📚 CRUD Generatorsconst setupCRUD = (file, defs, ep) => {
+// 📚 CRUD Generators
+const setupCRUD = (file, defs, ep) => {
     app.get(`/api/${ep}`, (req, res) => { let i = readJSON(file, []); if (!i.length) { i = defs; writeJSON(file, i); } res.json(i.filter(x => x.active !== false)); });
     app.get(`/api/admin/${ep}`, isAdmin, (req, res) => { let i = readJSON(file, []); if (!i.length) { i = defs; writeJSON(file, i); } res.json(i); });
     app.post(`/api/admin/${ep}`, isAdmin, (req, res) => {
-        if (!req.body.name) return res.status(400).json({ error: 'Name required' });
-        let items = readJSON(file, []); items.push({ id: items.length ? Math.max(...items.map(x => x.id)) + 1 : 1, name: req.body.name, active: req.body.active !== false }); writeJSON(file, items); cacheVersion = Date.now(); res.json({ success: true, item: items[items.length - 1] });
+        if (!req.body.name) return res.status(400).json({ error: 'Name required' });        let items = readJSON(file, []); items.push({ id: items.length ? Math.max(...items.map(x => x.id)) + 1 : 1, name: req.body.name, active: req.body.active !== false }); writeJSON(file, items); cacheVersion = Date.now(); res.json({ success: true, item: items[items.length - 1] });
     });
     app.put(`/api/admin/${ep}/:id`, isAdmin, (req, res) => {
         const id = parseInt(req.params.id); let items = readJSON(file, []); const idx = items.findIndex(x => x.id === id); if (idx === -1) return res.status(404).json({ error: 'Not found' });
@@ -144,106 +139,176 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// 💳 PAYMENT & DOWNLOAD (MEMORY-BASED, NO TIMEOUTS)
-// ------------------------------app.post('/api/initiate-payment', async (req, res) => {
-    const { phone, amount, productId } = req.body;
-    if (!phone || !amount || !productId) return res.status(400).json({ success: false, error: 'Missing fields' });
-    let cleanPhone = phone.replace(/\s/g, ''); if (cleanPhone.startsWith('0')) cleanPhone = '254' + cleanPhone.slice(1); else if (cleanPhone.startsWith('+')) cleanPhone = cleanPhone.slice(1);
-    const txId = `TXN_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-    // ✅ INSTANT MEMORY REGISTRATION
-    activePayments.set(txId, { status: 'pending', productId: parseInt(productId), amount: parseInt(amount), phone: cleanPhone, created: Date.now() });
-
-    const cfg = process.env.PAYNECTA_API_KEY && process.env.PAYNECTA_EMAIL && process.env.PAYNECTA_PAYMENT_CODE;
-    if (!cfg) {
-        console.log(`🧪 Demo Mode: Auto-confirming ${txId} in 1s`);
-        setTimeout(() => {
-            const p = activePayments.get(txId);
-            if (p && p.status === 'pending') {
-                p.status = 'success';
-                const vtok = `DEMO_${Date.now()}`;
-                verifiedPayments.set(vtok, { productId: p.productId, transactionId: txId, amount: p.amount, expires: Date.now() + 300000 });
-                console.log(`✅ Demo Success: ${txId}`);
-                // Save to disk for persistence
-                const stats = readJSON(FILES.STATS, { payments: [] });
-                if (!stats.payments) stats.payments = [];
-                stats.payments.push({ transactionId: txId, date: new Date().toISOString(), status: 'success', amount: p.amount, phone: p.phone, productId: p.productId, ip: getClientIp(req) });
-                writeJSON(FILES.STATS, stats);
-            }
-        }, 1000);
-        return res.json({ success: true, transactionId: txId, demo: true });
-    }
-
+// 💳 PAYMENT & DOWNLOAD (FIXED ID MISMATCH)
+// ------------------------------
+app.post('/api/initiate-payment', async (req, res) => {
     try {
-        const r = await axios.post(`${process.env.PAYNECTA_API_URL}/api/v1/payment/initialize`, { code: process.env.PAYNECTA_PAYMENT_CODE, mobile_number: cleanPhone, amount: parseInt(amount) }, { headers: { 'X-API-Key': process.env.PAYNECTA_API_KEY, 'X-User-Email': process.env.PAYNECTA_EMAIL }, timeout: 30000 });
-        if (r.data?.success) { res.json({ success: true, transactionId: txId }); console.log(`🌐 STK Sent: ${txId}`); }
-        else { activePayments.get(txId).status = 'failed'; res.status(400).json({ success: false, error: r.data?.message || 'Failed' }); }
-    } catch (e) { activePayments.get(txId).status = 'failed'; res.status(500).json({ success: false, error: e.message }); }
+        const { phone, amount, productId } = req.body;
+        if (!phone || !amount || !productId) return res.status(400).json({ success: false, error: 'Missing fields' });
+        let cleanPhone = phone.replace(/\s/g, ''); if (cleanPhone.startsWith('0')) cleanPhone = '254' + cleanPhone.slice(1); else if (cleanPhone.startsWith('+')) cleanPhone = cleanPhone.slice(1);        
+        // Generate our own transaction ID
+        const txId = `TXN_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const clientIp = getClientIp(req);
+
+        // Register in memory as pending
+        activePayments.set(txId, { status: 'pending', productId: parseInt(productId) || 0, amount: parseInt(amount) || 0, phone: cleanPhone, created: Date.now() });
+
+        // Check if Paynecta is configured
+        const cfg = process.env.PAYNECTA_API_KEY && process.env.PAYNECTA_EMAIL && process.env.PAYNECTA_PAYMENT_CODE;
+        
+        if (!cfg) {
+            // 🔹 DEMO MODE: Auto-confirm in 2 seconds
+            console.log(`🧪 Demo Mode: Auto-confirming ${txId} in 2s`);
+            setTimeout(() => {
+                const p = activePayments.get(txId);
+                if (p && p.status === 'pending') {
+                    p.status = 'success';
+                    const vtok = `DEMO_${Date.now()}`;
+                    verifiedPayments.set(vtok, { productId: p.productId, transactionId: txId, amount: p.amount, expires: Date.now() + 300000 });
+                    console.log(`✅ Demo Success: ${txId}`);
+                    const stats = readJSON(FILES.STATS, { payments: [] });
+                    if (!stats.payments) stats.payments = [];
+                    stats.payments.push({ transactionId: txId, date: new Date().toISOString(), status: 'success', amount: p.amount, phone: p.phone, productId: p.productId, ip: clientIp });
+                    writeJSON(FILES.STATS, stats);
+                }
+            }, 2000);
+            return res.json({ success: true, transactionId: txId, demo: true });
+        }
+
+        // 🔹 PRODUCTION: Call Paynecta API
+        // ✅ FIX: Send our txId as 'reference' so Webhook can match it
+        const payload = {
+            code: process.env.PAYNECTA_PAYMENT_CODE,
+            mobile_number: cleanPhone,
+            amount: parseInt(amount),
+            reference: txId // <--- CRITICAL FIX
+        };
+
+        console.log(`🌐 Paynecta Request: ${txId}`);
+        const r = await axios.post(`${process.env.PAYNECTA_API_URL}/api/v1/payment/initialize`, payload, {
+            headers: { 'X-API-Key': process.env.PAYNECTA_API_KEY, 'X-User-Email': process.env.PAYNECTA_EMAIL },
+            timeout: 30000
+        });
+
+        if (r.data?.success) {
+            console.log(`🌐 Paynecta Accepted: ${txId}`);
+            // Status remains 'pending' until Webhook confirms
+            res.json({ success: true, transactionId: txId });
+        } else {            activePayments.get(txId).status = 'failed';
+            console.log(`❌ Paynecta Failed: ${r.data?.message || 'Unknown'}`);
+            res.status(400).json({ success: false, error: r.data?.message || 'Failed' });
+        }
+    } catch (err) {
+        console.error('💥 Initiate Payment Error:', err.response?.data || err.message);
+        if (req.body.phone) {
+            const p = activePayments.get(req.body.phone); // Best effort fallback
+            if (p) p.status = 'failed';
+        }
+        res.status(500).json({ success: false, error: 'Payment service unavailable' });
+    }
 });
 
 app.get('/api/payment-status/:transactionId', (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-    const { transactionId } = req.params;
-    
-    // ✅ CHECK MEMORY FIRST (INSTANT)
-    let pay = activePayments.get(transactionId);
-    
-    // Fallback to disk if not in memory
-    if (!pay) {
-        const stats = readJSON(FILES.STATS, { payments: [] });
-        pay = stats.payments?.find(x => x.transactionId === transactionId);
-    }
-
-    if (!pay) return res.json({ status: 'not_found', verified: false });    
-    if (pay.status === 'success') {
-        let verifyToken = null;
-        for (const [t, d] of verifiedPayments.entries()) if (d.transactionId === pay.transactionId && d.expires > Date.now()) { verifyToken = t; break; }
-        if (!verifyToken) {
-            verifyToken = `VER_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
-            verifiedPayments.set(verifyToken, { productId: pay.productId, transactionId: pay.transactionId, amount: pay.amount, expires: Date.now() + 300000 });
+    try {
+        const { transactionId } = req.params;
+        
+        // 1. Check Memory (Fastest)
+        let pay = activePayments.get(transactionId);
+        
+        // 2. Fallback to Disk (If memory cleared/restart)
+        if (!pay) {
+            const stats = readJSON(FILES.STATS, { payments: [] });
+            pay = stats.payments?.find(x => x.transactionId === transactionId);
         }
-        return res.json({ status: 'success', verified: true, token: verifyToken });
+
+        if (!pay) return res.json({ status: 'not_found', verified: false });
+        
+        if (pay.status === 'success') {
+            let verifyToken = null;
+            for (const [t, d] of verifiedPayments.entries()) if (d.transactionId === pay.transactionId && d.expires > Date.now()) { verifyToken = t; break; }
+            
+            if (!verifyToken) {
+                verifyToken = `VER_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
+                verifiedPayments.set(verifyToken, { productId: pay.productId, transactionId: pay.transactionId, amount: pay.amount, expires: Date.now() + 300000 });
+                console.log(`🔑 Generated Token for ${pay.transactionId}`);
+            }
+            return res.json({ status: 'success', verified: true, token: verifyToken });
+        }
+        
+        res.json({ status: pay.status, verified: false });
+    } catch (err) {
+        console.error('Status Check Error:', err);
+        res.status(500).json({ error: err.message });
     }
-    res.json({ status: pay.status, verified: false });
 });
 
-app.post('/api/payment-webhook', (req, res) => {
-    console.log('📡 Webhook:', req.body);
-    if (req.body.ResultCode === 0 && req.body.reference) {
-        const p = activePayments.get(req.body.reference);
-        if (p) p.status = 'success';
-        verifiedPayments.set(`WEB_${Date.now()}`, { productId: p?.productId || 0, transactionId: req.body.reference, amount: p?.amount || 0, expires: Date.now() + 300000 });
+app.post('/api/payment-webhook', (req, res) => {    try {
+        console.log('📡 Webhook Received:', req.body);
+        const { ResultCode, reference } = req.body;
+        
+        // ✅ FIX: Use 'reference' to find our internal TXN ID
+        if (ResultCode === 0 && reference) {
+            const p = activePayments.get(reference);
+            if (p) {
+                p.status = 'success';
+                console.log(`✅ Webhook Success: ${reference}`);
+                
+                // Create verification token
+                const vtok = `WEB_${Date.now()}`;
+                verifiedPayments.set(vtok, { productId: p.productId, transactionId: reference, amount: p.amount, expires: Date.now() + 300000 });
+            } else {
+                console.warn(`⚠️ Webhook Ref ${reference} not found in memory`);
+            }
+        } else {
+            console.warn(`⚠️ Webhook failed or missing ref: ResultCode=${ResultCode}`);
+        }
+        res.sendStatus(200);
+    } catch (err) {
+        console.error('Webhook Error:', err);
+        res.sendStatus(200);
     }
-    res.sendStatus(200);
 });
 
 app.post('/api/request-download', (req, res) => {
-    const { verificationToken, productId } = req.body;
-    if (!verificationToken || productId === undefined) return res.status(400).json({ error: 'Missing data' });
-    const v = verifiedPayments.get(verificationToken);
-    if (!v || v.expires < Date.now()) return res.status(403).json({ error: 'Expired' });
-    if (Number(v.productId) !== Number(productId)) return res.status(403).json({ error: 'Mismatch' });
-    const dtoken = `DL_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    downloadTokens.set(dtoken, { productId: Number(productId), expires: Date.now() + 60000 });
-    verifiedPayments.delete(verificationToken);
-    res.json({ success: true, token: dtoken });
+    try {
+        const { verificationToken, productId } = req.body;
+        if (!verificationToken || productId === undefined) return res.status(400).json({ error: 'Missing data' });
+        const v = verifiedPayments.get(verificationToken);
+        if (!v || v.expires < Date.now()) return res.status(403).json({ error: 'Expired' });
+        if (Number(v.productId) !== Number(productId)) return res.status(403).json({ error: 'Mismatch' });
+        const dtoken = `DL_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        downloadTokens.set(dtoken, { productId: Number(productId), expires: Date.now() + 60000 });
+        verifiedPayments.delete(verificationToken);
+        res.json({ success: true, token: dtoken });
+    } catch (err) {
+        console.error('Download Request Error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.get('/api/download/:token', (req, res) => {
-    const rec = downloadTokens.get(req.params.token); if (!rec || rec.expires < Date.now()) return res.status(403).send('Expired');
-    const p = readJSON(FILES.PRODUCTS, []).find(x => x.id === rec.productId); if (!p?.fileUrl) return res.status(404).send('File missing');
-    const fp = path.join(__dirname, p.fileUrl); if (!fs.existsSync(fp)) return res.status(404).send('Missing on server');
-    res.setHeader('Content-Type', 'application/pdf'); res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(p.title)}.pdf"`);
-    fs.createReadStream(fp).pipe(res); downloadTokens.delete(req.params.token);
-    const s = readJSON(FILES.STATS, { downloads: [] }); s.downloads.push({ date: new Date().toISOString(), productId: p.id, productName: p.title, price: p.price, ip: getClientIp(req) }); writeJSON(FILES.STATS, s);
+    try {
+        const rec = downloadTokens.get(req.params.token); if (!rec || rec.expires < Date.now()) return res.status(403).send('Expired');
+        const p = readJSON(FILES.PRODUCTS, []).find(x => x.id === rec.productId); if (!p?.fileUrl) return res.status(404).send('File missing');
+        const fp = path.join(__dirname, p.fileUrl); if (!fs.existsSync(fp)) return res.status(404).send('Missing on server');
+        res.setHeader('Content-Type', 'application/pdf'); res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(p.title)}.pdf"`);        fs.createReadStream(fp).pipe(res); downloadTokens.delete(req.params.token);
+        const s = readJSON(FILES.STATS, { downloads: [] }); s.downloads.push({ date: new Date().toISOString(), productId: p.id, productName: p.title, price: p.price, ip: getClientIp(req) }); writeJSON(FILES.STATS, s);
+    } catch (err) {
+        console.error('Download Stream Error:', err);
+        res.status(500).send('Download failed');
+    }
 });
 
 app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
-    const s = readJSON(FILES.STATS, { payments: [] }); const p = s.payments?.find(x => x.transactionId === req.body.transactionId);
-    if (!p) return res.status(404).json({ error: 'Not found' }); p.status = 'success'; writeJSON(FILES.STATS, s); const t = `ADM_${Date.now()}`; verifiedPayments.set(t, { productId: parseInt(req.body.productId), transactionId: p.transactionId, amount: p.amount, expires: Date.now() + 300000 }); res.json({ success: true, token: t });
+    try {
+        const s = readJSON(FILES.STATS, { payments: [] }); const p = s.payments?.find(x => x.transactionId === req.body.transactionId);
+        if (!p) return res.status(404).json({ error: 'Not found' }); p.status = 'success'; writeJSON(FILES.STATS, s); const t = `ADM_${Date.now()}`; verifiedPayments.set(t, { productId: parseInt(req.body.productId), transactionId: p.transactionId, amount: p.amount, expires: Date.now() + 300000 }); res.json({ success: true, token: t });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 🌐 Public & Admin Utilsapp.get('/api/messages', (req, res) => { const now = new Date(); res.json(readJSON(FILES.MESSAGES, []).filter(m => m.active && (!m.startDate || new Date(m.startDate) <= now) && (!m.endDate || new Date(m.endDate) >= now))); });
+// 🌐 Public & Admin Utils
+app.get('/api/messages', (req, res) => { const now = new Date(); res.json(readJSON(FILES.MESSAGES, []).filter(m => m.active && (!m.startDate || new Date(m.startDate) <= now) && (!m.endDate || new Date(m.endDate) >= now))); });
 app.get('/api/popups', (req, res) => { const now = new Date(); res.json(readJSON(FILES.POPUPS, []).filter(p => p.active && (!p.startDate || new Date(p.startDate) <= now) && (!p.endDate || new Date(p.endDate) >= now))); });
 app.post('/api/submit-feedback', (req, res) => { if (!req.body.message) return res.status(400).json({ error: 'Message required' }); const f = readJSON(FILES.FEEDBACK, []); f.push({ id: Date.now(), message: req.body.message.trim(), whatsapp: req.body.whatsapp?.trim() || '', ip: getClientIp(req), ts: new Date().toISOString(), read: false }); writeJSON(FILES.FEEDBACK, f); res.json({ success: true }); });
 app.post('/api/track-visit', (req, res) => { const s = readJSON(FILES.STATS, { visits: [] }); s.visits.push({ date: new Date().toISOString(), ip: getClientIp(req) }); writeJSON(FILES.STATS, s); res.json({ success: true }); });
@@ -258,6 +323,6 @@ app.post('/api/admin/whatsapp', isAdmin, (req, res) => { writeJSON(FILES.WHATSAP
 app.post('/api/admin/clear-logs', isAdmin, (req, res) => { writeJSON(FILES.STATS, {}); res.json({ success: true }); });
 app.get('/ping', (req, res) => res.send('OK'));
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
-app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Internal error' }); });
+app.use((err, req, res, next) => { console.error('💥 GLOBAL ERROR:', err); res.status(500).json({ error: err.message }); });
 
 app.listen(PORT, () => console.log(`🚀 Running on :${PORT} | Memory Mode Active`));
