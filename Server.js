@@ -516,17 +516,17 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// PAYNECTA STK PUSH INTEGRATION
+// PAYMENT SYSTEM (REAL MPESA STK PUSH)
 // ------------------------------
 const verifiedPayments = new Map();
 const downloadTokens = new Map();
 
-// Paynecta STK Push endpoint
+// Initiate M-Pesa STK Push
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
     
     if (!phone || !amount || !productId) {
-        return res.status(400).json({ success: false, error: 'Phone, amount and product ID required' });
+        return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
     
     // Clean phone number to 254 format
@@ -546,10 +546,13 @@ app.post('/api/initiate-payment', async (req, res) => {
         const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE;
         const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
         
+        // Check if Paynecta credentials are configured
         if (!PAYNECTA_API_KEY || !PAYNECTA_PAYMENT_CODE) {
-            console.error('Paynecta credentials missing');
-            // For demo/testing without Paynecta credentials
-            return simulatePayment(res, phone, amount, productId, transactionId);
+            console.error('Paynecta credentials missing. Please add them to Render environment variables.');
+            return res.status(500).json({ 
+                success: false, 
+                error: 'Payment system not configured. Please contact support.' 
+            });
         }
         
         // Call Paynecta STK Push API
@@ -566,7 +569,8 @@ app.post('/api/initiate-payment', async (req, res) => {
                 headers: {
                     'Authorization': `Bearer ${PAYNECTA_API_KEY}`,
                     'Content-Type': 'application/json'
-                }
+                },
+                timeout: 30000
             }
         );
         
@@ -598,83 +602,14 @@ app.post('/api/initiate-payment', async (req, res) => {
         }
     } catch (error) {
         console.error('Paynecta error:', error.response?.data || error.message);
-        
-        // Fallback to simulation for testing
-        return simulatePayment(res, phone, amount, productId, transactionId);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Payment service error. Please try again later.' 
+        });
     }
 });
 
-// Simulate payment for testing (when Paynecta credentials not set)
-function simulatePayment(res, phone, amount, productId, transactionId) {
-    console.log('Using simulated payment (no Paynecta credentials)');
-    
-    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    if (!stats.payments) stats.payments = [];
-    stats.payments.push({ 
-        date: new Date().toISOString(), 
-        status: 'pending', 
-        amount, 
-        phone, 
-        productId,
-        transactionId,
-        ip: getClientIp(req) 
-    });
-    writeJSON(STATS_FILE, stats);
-    
-    // Simulate successful payment after 5 seconds
-    setTimeout(() => {
-        const updatedStats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-        const paymentIndex = updatedStats.payments.findIndex(p => p.transactionId === transactionId);
-        if (paymentIndex !== -1) {
-            updatedStats.payments[paymentIndex].status = 'success';
-            writeJSON(STATS_FILE, updatedStats);
-            
-            const verifyToken = 'VERIFIED_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
-            verifiedPayments.set(verifyToken, { 
-                productId: productId, 
-                transactionId: transactionId,
-                amount: amount,
-                expires: Date.now() + 300000
-            });
-            console.log(`Simulated payment verified for transaction ${transactionId}`);
-        }
-    }, 5000);
-    
-    res.json({ 
-        success: true, 
-        transactionId: transactionId,
-        message: 'Simulated payment - STK Push would be sent'
-    });
-}
-
-// Webhook endpoint for Paynecta to confirm payment
-app.post('/api/payment-webhook', (req, res) => {
-    console.log('Paynecta webhook received:', req.body);
-    
-    const { CheckoutRequestID, ResultCode, amount, phoneNumber, reference } = req.body;
-    
-    if (ResultCode === 0) {
-        // Payment successful
-        const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-        const paymentIndex = stats.payments.findIndex(p => p.transactionId === reference);
-        if (paymentIndex !== -1) {
-            stats.payments[paymentIndex].status = 'success';
-            writeJSON(STATS_FILE, stats);
-            
-            const verifyToken = 'VERIFIED_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
-            verifiedPayments.set(verifyToken, { 
-                productId: stats.payments[paymentIndex].productId, 
-                transactionId: reference,
-                amount: amount,
-                expires: Date.now() + 300000
-            });
-        }
-    }
-    
-    res.sendStatus(200);
-});
-
-// Check payment status
+// Check payment status (polled by frontend)
 app.get('/api/payment-status/:transactionId', (req, res) => {
     const { transactionId } = req.params;
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -685,6 +620,7 @@ app.get('/api/payment-status/:transactionId', (req, res) => {
     }
     
     if (payment.status === 'success') {
+        // Find or create verification token
         let verifyToken = null;
         for (const [token, data] of verifiedPayments.entries()) {
             if (data.transactionId === transactionId && data.expires > Date.now()) {
@@ -693,7 +629,7 @@ app.get('/api/payment-status/:transactionId', (req, res) => {
             }
         }
         if (!verifyToken) {
-            verifyToken = 'VERIFIED_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+            verifyToken = 'VER_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
             verifiedPayments.set(verifyToken, { 
                 productId: payment.productId, 
                 transactionId: transactionId,
@@ -709,7 +645,33 @@ app.get('/api/payment-status/:transactionId', (req, res) => {
     }
 });
 
-// Request download token (only after payment)
+// Webhook for Paynecta to confirm payment
+app.post('/api/payment-webhook', (req, res) => {
+    console.log('Paynecta webhook received:', req.body);
+    
+    const { CheckoutRequestID, ResultCode, amount, phoneNumber, reference } = req.body;
+    
+    if (ResultCode === 0) {
+        const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+        const paymentIndex = stats.payments.findIndex(p => p.transactionId === reference);
+        if (paymentIndex !== -1) {
+            stats.payments[paymentIndex].status = 'success';
+            writeJSON(STATS_FILE, stats);
+            
+            const verifyToken = 'WEB_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+            verifiedPayments.set(verifyToken, { 
+                productId: stats.payments[paymentIndex].productId, 
+                transactionId: reference,
+                amount: amount,
+                expires: Date.now() + 300000
+            });
+            console.log(`Webhook: Payment verified for ${reference}`);
+        }
+    }
+    res.sendStatus(200);
+});
+
+// Request download token (only after payment verification)
 app.post('/api/request-download', (req, res) => {
     const { verificationToken, productId } = req.body;
     
@@ -737,7 +699,7 @@ app.post('/api/request-download', (req, res) => {
     res.json({ success: true, token: downloadToken });
 });
 
-// Download file
+// Download file using token
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
     const record = downloadTokens.get(token);
@@ -759,6 +721,7 @@ app.get('/api/download/:token', async (req, res) => {
         response.data.pipe(res);
         downloadTokens.delete(token);
         
+        // Track download
         const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
         stats.downloads.push({ 
             date: new Date().toISOString(), 
@@ -850,7 +813,7 @@ app.post('/api/track-download', (req, res) => {
 });
 
 // ------------------------------
-// Admin Analytics (short version - same as before)
+// Admin Analytics (simplified)
 // ------------------------------
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -914,7 +877,7 @@ app.put('/api/admin/feedback/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Messages & Popups (simplified)
+// Messages & Popups
 // ------------------------------
 app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
 app.post('/api/admin/messages', isAdmin, (req, res) => {
