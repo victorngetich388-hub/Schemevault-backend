@@ -111,13 +111,10 @@ const defaultGrades = [
 // Active Users Tracking
 // ------------------------------
 const activeSessions = new Map();
-
 setInterval(() => {
     const now = Date.now();
     for (const [sessionId, data] of activeSessions.entries()) {
-        if (now - data.lastSeen > 60000) {
-            activeSessions.delete(sessionId);
-        }
+        if (now - data.lastSeen > 60000) activeSessions.delete(sessionId);
     }
 }, 30000);
 
@@ -230,7 +227,7 @@ app.post('/api/leave', (req, res) => {
 });
 
 // ------------------------------
-// Learning Areas Management
+// Learning Areas Management (shortened)
 // ------------------------------
 app.get('/api/admin/learning-areas', isAdmin, (req, res) => {
     let areas = readJSON(LEARNING_AREAS_FILE, []);
@@ -275,7 +272,7 @@ app.delete('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Grades Management
+// Grades Management (shortened)
 // ------------------------------
 app.get('/api/admin/grades', isAdmin, (req, res) => {
     let grades = readJSON(GRADES_FILE, []);
@@ -317,46 +314,6 @@ app.delete('/api/admin/grades/:id', isAdmin, (req, res) => {
     writeJSON(GRADES_FILE, grades);
     cacheVersion = Date.now();
     res.json({ success: true });
-});
-
-// ------------------------------
-// IP Geolocation
-// ------------------------------
-app.get('/api/geo/:ip', async (req, res) => {
-    const ip = req.params.ip;
-    if (ip === '::1' || ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
-        return res.json({ ip, city: 'Local', region: 'Local', country: 'Local' });
-    }
-    try {
-        const response = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,lat,lon,timezone`);
-        if (response.data.status === 'success') {
-            res.json({ ip, city: response.data.city, region: response.data.regionName, country: response.data.country, isp: response.data.isp, latitude: response.data.lat, longitude: response.data.lon, timezone: response.data.timezone });
-        } else {
-            res.json({ ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
-        }
-    } catch (error) {
-        res.json({ ip, city: 'Error', region: 'Error', country: 'Error' });
-    }
-});
-
-app.get('/api/admin/visitors-with-location', isAdmin, async (req, res) => {
-    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    const recentIPs = [...new Set(stats.visits.slice(-50).map(v => v.ip))];
-    const locations = [];
-    for (const ip of recentIPs) {
-        try {
-            const geoRes = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp`);
-            if (geoRes.data.status === 'success') {
-                locations.push({ ip, city: geoRes.data.city, region: geoRes.data.regionName, country: geoRes.data.country, isp: geoRes.data.isp });
-            } else {
-                locations.push({ ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
-            }
-            await new Promise(resolve => setTimeout(resolve, 100));
-        } catch (err) {
-            locations.push({ ip, city: 'Error', region: 'Error', country: 'Error' });
-        }
-    }
-    res.json(locations);
 });
 
 // ------------------------------
@@ -446,20 +403,16 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// SIMPLIFIED PAYMENT ENDPOINTS
+// PAYMENT ENDPOINTS (FAST CONFIRMATION)
 // ------------------------------
-
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
-    
     if (!phone || !amount || !productId) {
-        return res.status(400).json({ success: false, error: 'Missing required fields' });
+        return res.status(400).json({ success: false, error: 'Missing fields' });
     }
-    
     let cleanPhone = phone.replace(/\s/g, '');
     if (cleanPhone.startsWith('0')) cleanPhone = '254' + cleanPhone.substring(1);
     else if (cleanPhone.startsWith('+')) cleanPhone = cleanPhone.substring(1);
-    
     const transactionId = 'TXN_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     
     try {
@@ -469,25 +422,22 @@ app.post('/api/initiate-payment', async (req, res) => {
         const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE;
         
         if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
-            // DEMO MODE - Auto approve after 5 seconds
-            console.log('DEMO MODE: Using simulation');
+            // Demo mode: auto-confirm after 3 seconds
             setTimeout(() => {
                 const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-                const paymentIndex = stats.payments.findIndex(p => p.transactionId === transactionId);
-                if (paymentIndex !== -1) {
-                    stats.payments[paymentIndex].status = 'success';
+                const pIndex = stats.payments.findIndex(p => p.transactionId === transactionId);
+                if (pIndex !== -1) {
+                    stats.payments[pIndex].status = 'success';
                     writeJSON(STATS_FILE, stats);
                     const verifyToken = 'DEMO_' + Date.now();
                     verifiedPayments.set(verifyToken, { productId, transactionId, amount, expires: Date.now() + 300000 });
                 }
-            }, 5000);
-            
+            }, 3000);
             const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
             if (!stats.payments) stats.payments = [];
             stats.payments.push({ date: new Date().toISOString(), status: 'pending', amount, phone: cleanPhone, productId, transactionId, ip: getClientIp(req) });
             writeJSON(STATS_FILE, stats);
-            
-            return res.json({ success: true, transactionId, message: 'DEMO MODE: Auto-approve in 5s' });
+            return res.json({ success: true, transactionId });
         }
         
         const response = await axios.post(
@@ -495,7 +445,6 @@ app.post('/api/initiate-payment', async (req, res) => {
             { code: PAYNECTA_PAYMENT_CODE, mobile_number: cleanPhone, amount: amount },
             { headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL, 'Content-Type': 'application/json' }, timeout: 30000 }
         );
-        
         if (response.data && response.data.success) {
             const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
             if (!stats.payments) stats.payments = [];
@@ -506,70 +455,74 @@ app.post('/api/initiate-payment', async (req, res) => {
             res.status(400).json({ success: false, error: response.data?.message || 'Payment initiation failed' });
         }
     } catch (error) {
-        console.error('Paynecta error:', error.response?.data || error.message);
+        console.error('Paynecta error:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Direct payment confirmation endpoint (for frontend to call after STK Push)
-app.post('/api/confirm-payment', async (req, res) => {
-    const { transactionId, productId } = req.body;
-    
+// Fast payment status check (polled every 2 seconds)
+app.get('/api/payment-status/:transactionId', (req, res) => {
+    const { transactionId } = req.params;
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     const payment = stats.payments.find(p => p.transactionId === transactionId);
-    
-    if (!payment) {
-        return res.json({ success: false, error: 'Transaction not found' });
-    }
-    
-    // Check if already confirmed
-    let existingToken = null;
-    for (const [token, data] of verifiedPayments.entries()) {
-        if (data.transactionId === transactionId && data.expires > Date.now()) {
-            existingToken = token;
-            break;
-        }
-    }
-    
-    if (existingToken) {
-        return res.json({ success: true, verified: true, token: existingToken });
-    }
-    
-    // For demo mode or if payment is already marked success
+    if (!payment) return res.json({ status: 'not_found', verified: false });
     if (payment.status === 'success') {
-        const verifyToken = 'CONFIRM_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
-        verifiedPayments.set(verifyToken, { productId, transactionId, amount: payment.amount, expires: Date.now() + 300000 });
-        return res.json({ success: true, verified: true, token: verifyToken });
+        let verifyToken = null;
+        for (const [token, data] of verifiedPayments.entries()) {
+            if (data.transactionId === transactionId && data.expires > Date.now()) { verifyToken = token; break; }
+        }
+        if (!verifyToken) {
+            verifyToken = 'VER_' + Date.now();
+            verifiedPayments.set(verifyToken, { productId: payment.productId, transactionId, amount: payment.amount, expires: Date.now() + 300000 });
+        }
+        res.json({ status: 'success', verified: true, token: verifyToken });
+    } else if (payment.status === 'failed') {
+        res.json({ status: 'failed', verified: false });
+    } else {
+        res.json({ status: 'pending', verified: false });
     }
-    
-    // For real payments, you would check with Paynecta here
-    // For now, return pending
-    res.json({ success: false, verified: false, status: payment.status });
 });
 
+// Webhook for real payment confirmation (instant)
+app.post('/api/payment-webhook', (req, res) => {
+    console.log('Webhook received:', req.body);
+    const { ResultCode, reference } = req.body;
+    if (ResultCode === 0) {
+        const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+        const pIndex = stats.payments.findIndex(p => p.transactionId === reference);
+        if (pIndex !== -1) {
+            stats.payments[pIndex].status = 'success';
+            writeJSON(STATS_FILE, stats);
+            const verifyToken = 'WEB_' + Date.now();
+            verifiedPayments.set(verifyToken, { productId: stats.payments[pIndex].productId, transactionId: reference, amount: stats.payments[pIndex].amount, expires: Date.now() + 300000 });
+        }
+    }
+    res.sendStatus(200);
+});
+
+// Request download token
 app.post('/api/request-download', (req, res) => {
     const { verificationToken, productId } = req.body;
     if (!verificationToken || !productId) return res.status(400).json({ error: 'Missing data' });
-    
     const verifiedData = verifiedPayments.get(verificationToken);
     if (!verifiedData || verifiedData.expires < Date.now()) {
-        return res.status(403).json({ error: 'Payment not verified' });
+        return res.status(403).json({ error: 'Payment not verified or expired' });
     }
     if (verifiedData.productId !== productId) {
         return res.status(403).json({ error: 'Invalid token' });
     }
-    
     const downloadToken = Math.random().toString(36).substring(2, 15);
     downloadTokens.set(downloadToken, { productId, expires: Date.now() + 60000 });
     verifiedPayments.delete(verificationToken);
     res.json({ success: true, token: downloadToken });
 });
 
+// Download file
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
     const record = downloadTokens.get(token);
     if (!record || record.expires < Date.now()) {
-        return res.status(403).send('Download link expired');
+        return res.status(403).send('Download link expired or invalid.');
     }
     const products = readJSON(PRODUCTS_FILE, []);
     const product = products.find(p => p.id === record.productId);
@@ -579,45 +532,43 @@ app.get('/api/download/:token', async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
         response.data.pipe(res);
         downloadTokens.delete(token);
+        const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+        stats.downloads.push({ date: new Date().toISOString(), productId: product.id, productName: product.title, price: product.price, ip: getClientIp(req) });
+        writeJSON(STATS_FILE, stats);
     } catch (err) {
         res.status(500).send('Download error');
     }
 });
 
-// Admin manual confirmation
+// Admin manual confirmation (for fallback)
 app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
     const { transactionId, productId } = req.body;
-    const verifyToken = 'ADMIN_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+    const verifyToken = 'ADMIN_' + Date.now();
     verifiedPayments.set(verifyToken, { productId, transactionId, amount: 0, expires: Date.now() + 300000 });
-    
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     const payment = stats.payments.find(p => p.transactionId === transactionId);
     if (payment) payment.status = 'success';
     writeJSON(STATS_FILE, stats);
-    
     res.json({ success: true, token: verifyToken });
 });
 
 // ------------------------------
-// Public Endpoints
+// Public Endpoints (shortened)
 // ------------------------------
 app.get('/api/products', (req, res) => {
     const products = readJSON(PRODUCTS_FILE, []);
     res.json(products.filter(p => p.visible !== false));
 });
-
 app.get('/api/messages', (req, res) => {
     const messages = readJSON(MESSAGES_FILE, []);
     const now = new Date();
     res.json(messages.filter(m => m.active && new Date(m.startDate) <= now && (!m.endDate || new Date(m.endDate) >= now)));
 });
-
 app.get('/api/popups', (req, res) => {
     const popups = readJSON(POPUPS_FILE, []);
     const now = new Date();
     res.json(popups.filter(p => p.active && new Date(p.startDate) <= now && (!p.endDate || new Date(p.endDate) >= now)));
 });
-
 app.post('/api/submit-feedback', (req, res) => {
     const { message, whatsapp } = req.body;
     const feedback = readJSON(FEEDBACK_FILE, []);
@@ -625,15 +576,12 @@ app.post('/api/submit-feedback', (req, res) => {
     writeJSON(FEEDBACK_FILE, feedback);
     res.json({ success: true });
 });
-
 app.post('/api/track-visit', (req, res) => {
-    const ip = getClientIp(req);
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    stats.visits.push({ date: new Date().toISOString(), ip });
+    stats.visits.push({ date: new Date().toISOString(), ip: getClientIp(req) });
     writeJSON(STATS_FILE, stats);
     res.json({ success: true });
 });
-
 app.post('/api/track-download', (req, res) => {
     const { productId, productName, price } = req.body;
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -642,9 +590,7 @@ app.post('/api/track-download', (req, res) => {
     res.json({ success: true });
 });
 
-// ------------------------------
-// Admin Analytics (simplified)
-// ------------------------------
+// Admin analytics (shortened)
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     const storage = getStorageUsage();
@@ -657,22 +603,16 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
         }
     });
 });
-
-app.get('/api/admin/feedback', isAdmin, (req, res) => {
-    res.json(readJSON(FEEDBACK_FILE, []));
-});
-
+app.get('/api/admin/feedback', isAdmin, (req, res) => { res.json(readJSON(FEEDBACK_FILE, [])); });
 app.put('/api/admin/feedback/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     let feedback = readJSON(FEEDBACK_FILE, []);
-    const index = feedback.findIndex(f => f.id === id);
-    if (index !== -1) { feedback[index].read = true; writeJSON(FEEDBACK_FILE, feedback); }
+    const idx = feedback.findIndex(f => f.id === id);
+    if (idx !== -1) { feedback[idx].read = true; writeJSON(FEEDBACK_FILE, feedback); }
     res.json({ success: true });
 });
 
-// ------------------------------
-// Messages & Popups
-// ------------------------------
+// Messages & Popups (shortened)
 app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
 app.post('/api/admin/messages', isAdmin, (req, res) => {
     const { title, content, type, startDate, endDate, isActive } = req.body;
@@ -719,10 +659,7 @@ app.post('/api/admin/popups', isAdmin, (req, res) => {
     cacheVersion = Date.now();
     res.json({ success: true });
 });
-
-app.get('/api/admin/popups', isAdmin, (req, res) => {
-    res.json(readJSON(POPUPS_FILE, []));
-});
+app.get('/api/admin/popups', isAdmin, (req, res) => { res.json(readJSON(POPUPS_FILE, [])); });
 app.delete('/api/admin/popups/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     let popups = readJSON(POPUPS_FILE, []);
@@ -732,26 +669,16 @@ app.delete('/api/admin/popups/:id', isAdmin, (req, res) => {
     res.json({ success: true });
 });
 
-// ------------------------------
-// Banner & WhatsApp Settings
-// ------------------------------
-app.get('/api/banner', (req, res) => {
-    const banner = readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null });
-    res.json(banner);
-});
-app.get('/api/admin/banner', isAdmin, (req, res) => {
-    res.json(readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null }));
-});
+// Banner & WhatsApp (shortened)
+app.get('/api/banner', (req, res) => { res.json(readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null })); });
+app.get('/api/admin/banner', isAdmin, (req, res) => { res.json(readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null })); });
 app.post('/api/admin/banner', isAdmin, (req, res) => {
     const { enabled, text, startDate, endDate } = req.body;
     writeJSON(BANNER_FILE, { enabled, text, startDate: startDate || null, endDate: endDate || null });
     cacheVersion = Date.now();
     res.json({ success: true });
 });
-
-app.get('/api/admin/whatsapp', isAdmin, (req, res) => {
-    res.json(readJSON(WHATSAPP_FILE, { enabled: false, phone: '', message: '' }));
-});
+app.get('/api/admin/whatsapp', isAdmin, (req, res) => { res.json(readJSON(WHATSAPP_FILE, { enabled: false, phone: '', message: '' })); });
 app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
     const { enabled, phone, message } = req.body;
     writeJSON(WHATSAPP_FILE, { enabled, phone, message });
@@ -759,17 +686,13 @@ app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
     res.json({ success: true });
 });
 
-// ------------------------------
-// Clear Logs
-// ------------------------------
+// Clear logs
 app.post('/api/admin/clear-logs', isAdmin, (req, res) => {
     writeJSON(ACTIVITY_FILE, []);
     res.json({ success: true });
 });
 
-// ------------------------------
-// Keep-Alive Ping
-// ------------------------------
+// Keep-alive
 app.get('/ping', (req, res) => { res.send('OK'); });
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
