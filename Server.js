@@ -14,8 +14,13 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ------------------------------
-// Local Storage for Uploads
+// Local Storage for Uploads (Persistent Disk Recommended)
 // ------------------------------
+// To prevent files from disappearing:
+// 1. Go to Render Dashboard → your service → Disks
+// 2. Create a disk (e.g., 10GB) and mount to /data
+// 3. Then change these paths to /data/uploads and /data/covers
+// For now, using local folders (files will disappear on redeploy)
 const UPLOAD_DIR = 'uploads';
 const COVERS_DIR = 'covers';
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
@@ -121,7 +126,6 @@ setInterval(() => {
     }
 }, 30000);
 
-// Cache version for real-time updates
 let cacheVersion = Date.now();
 
 // Payment storage
@@ -206,18 +210,8 @@ app.post('/api/heartbeat', (req, res) => {
     const { sessionId } = req.body;
     const ip = getClientIp(req);
     const userAgent = req.headers['user-agent'];
-    
-    if (!sessionId) {
-        return res.status(400).json({ error: 'sessionId required' });
-    }
-    
-    activeSessions.set(sessionId, {
-        ip: ip,
-        userAgent: userAgent,
-        lastSeen: Date.now(),
-        firstSeen: activeSessions.has(sessionId) ? activeSessions.get(sessionId).firstSeen : Date.now()
-    });
-    
+    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    activeSessions.set(sessionId, { ip, userAgent, lastSeen: Date.now(), firstSeen: activeSessions.has(sessionId) ? activeSessions.get(sessionId).firstSeen : Date.now() });
     res.json({ success: true, activeCount: activeSessions.size });
 });
 
@@ -225,32 +219,18 @@ app.get('/api/admin/active-users', isAdmin, (req, res) => {
     const now = Date.now();
     let active = 0;
     const activeList = [];
-    
     for (const [sessionId, data] of activeSessions.entries()) {
         if (now - data.lastSeen <= 60000) {
             active++;
-            activeList.push({
-                sessionId: sessionId.substring(0, 8),
-                ip: data.ip,
-                lastSeen: data.lastSeen,
-                activeSeconds: Math.floor((now - data.lastSeen) / 1000),
-                duration: Math.floor((now - data.firstSeen) / 1000)
-            });
+            activeList.push({ sessionId: sessionId.substring(0, 8), ip: data.ip, lastSeen: data.lastSeen, activeSeconds: Math.floor((now - data.lastSeen) / 1000), duration: Math.floor((now - data.firstSeen) / 1000) });
         }
     }
-    
-    res.json({ 
-        activeCount: active,
-        activeUsers: activeList,
-        lastUpdated: new Date().toISOString()
-    });
+    res.json({ activeCount: active, activeUsers: activeList, lastUpdated: new Date().toISOString() });
 });
 
 app.post('/api/leave', (req, res) => {
     const { sessionId } = req.body;
-    if (sessionId && activeSessions.has(sessionId)) {
-        activeSessions.delete(sessionId);
-    }
+    if (sessionId && activeSessions.has(sessionId)) activeSessions.delete(sessionId);
     res.json({ success: true });
 });
 
@@ -259,40 +239,25 @@ app.post('/api/leave', (req, res) => {
 // ------------------------------
 app.get('/api/admin/learning-areas', isAdmin, (req, res) => {
     let areas = readJSON(LEARNING_AREAS_FILE, []);
-    if (areas.length === 0) {
-        areas = defaultLearningAreas;
-        writeJSON(LEARNING_AREAS_FILE, areas);
-    }
+    if (areas.length === 0) { areas = defaultLearningAreas; writeJSON(LEARNING_AREAS_FILE, areas); }
     res.json(areas);
 });
-
 app.get('/api/learning-areas', (req, res) => {
     let areas = readJSON(LEARNING_AREAS_FILE, []);
-    if (areas.length === 0) {
-        areas = defaultLearningAreas;
-        writeJSON(LEARNING_AREAS_FILE, areas);
-    }
-    const activeAreas = areas.filter(area => area.active === true);
-    res.json(activeAreas);
+    if (areas.length === 0) { areas = defaultLearningAreas; writeJSON(LEARNING_AREAS_FILE, areas); }
+    res.json(areas.filter(area => area.active === true));
 });
-
 app.post('/api/admin/learning-areas', isAdmin, (req, res) => {
     const { name, active } = req.body;
     if (!name) return res.status(400).json({ error: 'Name required' });
     let areas = readJSON(LEARNING_AREAS_FILE, []);
     const newId = areas.length ? Math.max(...areas.map(a => a.id)) + 1 : 1;
-    const newArea = {
-        id: newId,
-        name: name,
-        active: active === true || active === 'true',
-        order: areas.length + 1
-    };
+    const newArea = { id: newId, name, active: active === true || active === 'true', order: areas.length + 1 };
     areas.push(newArea);
     writeJSON(LEARNING_AREAS_FILE, areas);
     cacheVersion = Date.now();
     res.json({ success: true, area: newArea });
 });
-
 app.put('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     const { name, active } = req.body;
@@ -305,7 +270,6 @@ app.put('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
     cacheVersion = Date.now();
     res.json({ success: true });
 });
-
 app.delete('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     let areas = readJSON(LEARNING_AREAS_FILE, []);
@@ -320,40 +284,25 @@ app.delete('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
 // ------------------------------
 app.get('/api/admin/grades', isAdmin, (req, res) => {
     let grades = readJSON(GRADES_FILE, []);
-    if (grades.length === 0) {
-        grades = defaultGrades;
-        writeJSON(GRADES_FILE, grades);
-    }
+    if (grades.length === 0) { grades = defaultGrades; writeJSON(GRADES_FILE, grades); }
     res.json(grades);
 });
-
 app.get('/api/grades', (req, res) => {
     let grades = readJSON(GRADES_FILE, []);
-    if (grades.length === 0) {
-        grades = defaultGrades;
-        writeJSON(GRADES_FILE, grades);
-    }
-    const activeGrades = grades.filter(grade => grade.active === true);
-    res.json(activeGrades);
+    if (grades.length === 0) { grades = defaultGrades; writeJSON(GRADES_FILE, grades); }
+    res.json(grades.filter(grade => grade.active === true));
 });
-
 app.post('/api/admin/grades', isAdmin, (req, res) => {
     const { name, active } = req.body;
     if (!name) return res.status(400).json({ error: 'Name required' });
     let grades = readJSON(GRADES_FILE, []);
     const newId = grades.length ? Math.max(...grades.map(g => g.id)) + 1 : 1;
-    const newGrade = {
-        id: newId,
-        name: name,
-        active: active === true || active === 'true',
-        order: grades.length + 1
-    };
+    const newGrade = { id: newId, name, active: active === true || active === 'true', order: grades.length + 1 };
     grades.push(newGrade);
     writeJSON(GRADES_FILE, grades);
     cacheVersion = Date.now();
     res.json({ success: true, grade: newGrade });
 });
-
 app.put('/api/admin/grades/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     const { name, active } = req.body;
@@ -366,7 +315,6 @@ app.put('/api/admin/grades/:id', isAdmin, (req, res) => {
     cacheVersion = Date.now();
     res.json({ success: true });
 });
-
 app.delete('/api/admin/grades/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     let grades = readJSON(GRADES_FILE, []);
@@ -382,26 +330,17 @@ app.delete('/api/admin/grades/:id', isAdmin, (req, res) => {
 app.get('/api/geo/:ip', async (req, res) => {
     const ip = req.params.ip;
     if (ip === '::1' || ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
-        return res.json({ ip: ip, city: 'Local', region: 'Local', country: 'Local' });
+        return res.json({ ip, city: 'Local', region: 'Local', country: 'Local' });
     }
     try {
         const response = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,lat,lon,timezone`);
         if (response.data.status === 'success') {
-            res.json({
-                ip: ip,
-                city: response.data.city,
-                region: response.data.regionName,
-                country: response.data.country,
-                isp: response.data.isp,
-                latitude: response.data.lat,
-                longitude: response.data.lon,
-                timezone: response.data.timezone
-            });
+            res.json({ ip, city: response.data.city, region: response.data.regionName, country: response.data.country, isp: response.data.isp, latitude: response.data.lat, longitude: response.data.lon, timezone: response.data.timezone });
         } else {
-            res.json({ ip: ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
+            res.json({ ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
         }
     } catch (error) {
-        res.json({ ip: ip, city: 'Error', region: 'Error', country: 'Error' });
+        res.json({ ip, city: 'Error', region: 'Error', country: 'Error' });
     }
 });
 
@@ -413,19 +352,13 @@ app.get('/api/admin/visitors-with-location', isAdmin, async (req, res) => {
         try {
             const geoRes = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp`);
             if (geoRes.data.status === 'success') {
-                locations.push({
-                    ip: ip,
-                    city: geoRes.data.city,
-                    region: geoRes.data.regionName,
-                    country: geoRes.data.country,
-                    isp: geoRes.data.isp
-                });
+                locations.push({ ip, city: geoRes.data.city, region: geoRes.data.regionName, country: geoRes.data.country, isp: geoRes.data.isp });
             } else {
-                locations.push({ ip: ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
+                locations.push({ ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
             }
             await new Promise(resolve => setTimeout(resolve, 100));
         } catch (err) {
-            locations.push({ ip: ip, city: 'Error', region: 'Error', country: 'Error' });
+            locations.push({ ip, city: 'Error', region: 'Error', country: 'Error' });
         }
     }
     res.json(locations);
@@ -437,14 +370,12 @@ app.get('/api/admin/visitors-with-location', isAdmin, async (req, res) => {
 app.get('/api/admin/term-settings', isAdmin, (req, res) => {
     res.json(readJSON(TERM_SETTINGS_FILE, { term1: true, term2: true, term3: true }));
 });
-
 app.put('/api/admin/term-settings', isAdmin, (req, res) => {
     const settings = req.body;
     writeJSON(TERM_SETTINGS_FILE, settings);
     cacheVersion = Date.now();
     res.json({ success: true });
 });
-
 app.get('/api/term-settings', (req, res) => {
     res.json(readJSON(TERM_SETTINGS_FILE, { term1: true, term2: true, term3: true }));
 });
@@ -520,24 +451,18 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// PAYMENT ENDPOINTS (FIXED FOR PAYNECTA)
+// PAYMENT ENDPOINTS (CORRECTED - ANIMATION ONLY AFTER CONFIRMATION)
 // ------------------------------
 
-// Initiate M-Pesa STK Push - CORRECTED
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
-    
     if (!phone || !amount || !productId) {
         return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
     
-    // Clean phone number to 254 format (required by Paynecta)
     let cleanPhone = phone.replace(/\s/g, '');
-    if (cleanPhone.startsWith('0')) {
-        cleanPhone = '254' + cleanPhone.substring(1);
-    } else if (cleanPhone.startsWith('+')) {
-        cleanPhone = cleanPhone.substring(1);
-    }
+    if (cleanPhone.startsWith('0')) cleanPhone = '254' + cleanPhone.substring(1);
+    else if (cleanPhone.startsWith('+')) cleanPhone = cleanPhone.substring(1);
     
     const transactionId = 'TXN_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     
@@ -547,104 +472,44 @@ app.post('/api/initiate-payment', async (req, res) => {
         const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
         const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE;
         
-        // Validate credentials
         if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
-            console.error('Missing Paynecta credentials');
             return res.status(500).json({ success: false, error: 'Payment configuration error' });
         }
         
-        console.log('Initiating Paynecta payment:', {
-            url: `${PAYNECTA_API_URL}/api/v1/payment/initialize`,
-            phone: cleanPhone,
-            amount: amount,
-            code: PAYNECTA_PAYMENT_CODE
-        });
-        
-        // CORRECT HEADERS: X-API-Key and X-User-Email (NOT Bearer)
         const response = await axios.post(
             `${PAYNECTA_API_URL}/api/v1/payment/initialize`,
-            {
-                code: PAYNECTA_PAYMENT_CODE,
-                mobile_number: cleanPhone,
-                amount: amount
-            },
-            {
-                headers: {
-                    'X-API-Key': PAYNECTA_API_KEY,
-                    'X-User-Email': PAYNECTA_EMAIL,
-                    'Content-Type': 'application/json'
-                },
-                timeout: 30000
-            }
+            { code: PAYNECTA_PAYMENT_CODE, mobile_number: cleanPhone, amount: amount },
+            { headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL, 'Content-Type': 'application/json' }, timeout: 30000 }
         );
         
-        console.log('Paynecta response:', response.data);
-        
         if (response.data && response.data.success) {
-            // Record payment attempt
             const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
             if (!stats.payments) stats.payments = [];
-            stats.payments.push({ 
-                date: new Date().toISOString(), 
-                status: 'pending', 
-                amount, 
-                phone: cleanPhone, 
-                productId,
-                transactionId,
-                ip: getClientIp(req) 
-            });
+            stats.payments.push({ date: new Date().toISOString(), status: 'pending', amount, phone: cleanPhone, productId, transactionId, ip: getClientIp(req) });
             writeJSON(STATS_FILE, stats);
-            
-            res.json({ 
-                success: true, 
-                transactionId: transactionId,
-                checkoutRequestID: response.data.data?.transaction_id || transactionId
-            });
+            res.json({ success: true, transactionId: transactionId, checkoutRequestID: response.data.data?.transaction_id || transactionId });
         } else {
-            res.status(400).json({ 
-                success: false, 
-                error: response.data?.message || 'Payment initiation failed' 
-            });
+            res.status(400).json({ success: false, error: response.data?.message || 'Payment initiation failed' });
         }
     } catch (error) {
-        console.error('Paynecta error details:', {
-            message: error.message,
-            response: error.response?.data,
-            status: error.response?.status
-        });
-        
-        const errorMsg = error.response?.data?.message || error.message || 'Payment service error';
-        res.status(500).json({ success: false, error: errorMsg });
+        console.error('Paynecta error:', error.response?.data || error.message);
+        res.status(500).json({ success: false, error: error.response?.data?.message || error.message || 'Payment service error' });
     }
 });
 
-// Check payment status - polled by frontend
 app.get('/api/payment-status/:transactionId', (req, res) => {
     const { transactionId } = req.params;
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     const payment = stats.payments.find(p => p.transactionId === transactionId);
-    
-    if (!payment) {
-        return res.json({ status: 'not_found', verified: false });
-    }
-    
+    if (!payment) return res.json({ status: 'not_found', verified: false });
     if (payment.status === 'success') {
-        // Generate verification token for download
         let verifyToken = null;
         for (const [token, data] of verifiedPayments.entries()) {
-            if (data.transactionId === transactionId && data.expires > Date.now()) {
-                verifyToken = token;
-                break;
-            }
+            if (data.transactionId === transactionId && data.expires > Date.now()) { verifyToken = token; break; }
         }
         if (!verifyToken) {
             verifyToken = 'VER_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
-            verifiedPayments.set(verifyToken, { 
-                productId: payment.productId, 
-                transactionId: transactionId,
-                amount: payment.amount,
-                expires: Date.now() + 300000
-            });
+            verifiedPayments.set(verifyToken, { productId: payment.productId, transactionId, amount: payment.amount, expires: Date.now() + 300000 });
         }
         res.json({ status: 'success', verified: true, token: verifyToken });
     } else if (payment.status === 'failed') {
@@ -654,93 +519,49 @@ app.get('/api/payment-status/:transactionId', (req, res) => {
     }
 });
 
-// Paynecta webhook - receives payment confirmation
 app.post('/api/payment-webhook', (req, res) => {
     console.log('Webhook received:', req.body);
-    
-    const { CheckoutRequestID, ResultCode, amount, phoneNumber, reference } = req.body;
-    
+    const { ResultCode, amount, reference } = req.body;
     if (ResultCode === 0) {
         const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
         const paymentIndex = stats.payments.findIndex(p => p.transactionId === reference);
         if (paymentIndex !== -1) {
             stats.payments[paymentIndex].status = 'success';
             writeJSON(STATS_FILE, stats);
-            
             const verifyToken = 'WEB_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
-            verifiedPayments.set(verifyToken, { 
-                productId: stats.payments[paymentIndex].productId, 
-                transactionId: reference,
-                amount: amount,
-                expires: Date.now() + 300000
-            });
-            console.log(`Webhook: Payment verified for ${reference}`);
+            verifiedPayments.set(verifyToken, { productId: stats.payments[paymentIndex].productId, transactionId: reference, amount, expires: Date.now() + 300000 });
         }
     }
     res.sendStatus(200);
 });
 
-// Request download token (only after payment verification)
 app.post('/api/request-download', (req, res) => {
     const { verificationToken, productId } = req.body;
-    
-    if (!verificationToken || !productId) {
-        return res.status(400).json({ error: 'Verification token and product ID required' });
-    }
-    
+    if (!verificationToken || !productId) return res.status(400).json({ error: 'Verification token and product ID required' });
     const verifiedData = verifiedPayments.get(verificationToken);
-    if (!verifiedData || verifiedData.expires < Date.now()) {
-        return res.status(403).json({ error: 'Payment not verified or verification expired. Complete payment first.' });
-    }
-    
-    if (verifiedData.productId !== productId) {
-        return res.status(403).json({ error: 'Invalid verification token for this product' });
-    }
-    
+    if (!verifiedData || verifiedData.expires < Date.now()) return res.status(403).json({ error: 'Payment not verified or verification expired. Complete payment first.' });
+    if (verifiedData.productId !== productId) return res.status(403).json({ error: 'Invalid verification token for this product' });
     const downloadToken = Math.random().toString(36).substring(2, 15);
-    downloadTokens.set(downloadToken, { 
-        productId: productId, 
-        expires: Date.now() + 60000
-    });
-    
+    downloadTokens.set(downloadToken, { productId, expires: Date.now() + 60000 });
     verifiedPayments.delete(verificationToken);
-    
     res.json({ success: true, token: downloadToken });
 });
 
-// Download file using one-time token
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
     const record = downloadTokens.get(token);
-    
-    if (!record || record.expires < Date.now()) {
-        return res.status(403).send('Download link expired or invalid. Complete payment first.');
-    }
-    
+    if (!record || record.expires < Date.now()) return res.status(403).send('Download link expired or invalid. Complete payment first.');
     const products = readJSON(PRODUCTS_FILE, []);
     const product = products.find(p => p.id === record.productId);
-    
-    if (!product || !product.fileUrl) {
-        return res.status(404).send('File not found');
-    }
-    
+    if (!product || !product.fileUrl) return res.status(404).send('File not found');
     try {
         const response = await axios({ method: 'GET', url: product.fileUrl, responseType: 'stream' });
         res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
         response.data.pipe(res);
         downloadTokens.delete(token);
-        
-        // Track download
         const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-        stats.downloads.push({ 
-            date: new Date().toISOString(), 
-            productId: product.id, 
-            productName: product.title, 
-            price: product.price,
-            ip: getClientIp(req) 
-        });
+        stats.downloads.push({ date: new Date().toISOString(), productId: product.id, productName: product.title, price: product.price, ip: getClientIp(req) });
         writeJSON(STATS_FILE, stats);
-        
     } catch (err) {
         console.error('Download error:', err);
         res.status(500).send('Download error. Please contact support.');
@@ -758,30 +579,19 @@ app.get('/api/products', (req, res) => {
 app.get('/api/messages', (req, res) => {
     const messages = readJSON(MESSAGES_FILE, []);
     const now = new Date();
-    const active = messages.filter(m => m.active && new Date(m.startDate) <= now && (!m.endDate || new Date(m.endDate) >= now));
-    res.json(active);
+    res.json(messages.filter(m => m.active && new Date(m.startDate) <= now && (!m.endDate || new Date(m.endDate) >= now)));
 });
 
 app.get('/api/popups', (req, res) => {
     const popups = readJSON(POPUPS_FILE, []);
     const now = new Date();
-    const active = popups.filter(p => p.active && new Date(p.startDate) <= now && (!p.endDate || new Date(p.endDate) >= now));
-    res.json(active);
+    res.json(popups.filter(p => p.active && new Date(p.startDate) <= now && (!p.endDate || new Date(p.endDate) >= now)));
 });
 
 app.post('/api/submit-feedback', (req, res) => {
     const { message, whatsapp, productId, page } = req.body;
     const feedback = readJSON(FEEDBACK_FILE, []);
-    feedback.push({
-        id: Date.now(),
-        message,
-        whatsapp,
-        productId,
-        page,
-        ip: getClientIp(req),
-        timestamp: new Date().toISOString(),
-        read: false
-    });
+    feedback.push({ id: Date.now(), message, whatsapp, productId, page, ip: getClientIp(req), timestamp: new Date().toISOString(), read: false });
     writeJSON(FEEDBACK_FILE, feedback);
     res.json({ success: true });
 });
@@ -795,12 +605,8 @@ app.post('/api/track-visit', (req, res) => {
     writeJSON(STATS_FILE, stats);
     let clients = readJSON(CLIENTS_FILE, []);
     let client = clients.find(c => c.ip === ip);
-    if (client) {
-        client.lastSeen = timestamp;
-        client.visitCount++;
-    } else {
-        clients.push({ ip, userAgent, firstSeen: timestamp, lastSeen: timestamp, visitCount: 1 });
-    }
+    if (client) { client.lastSeen = timestamp; client.visitCount++; } 
+    else { clients.push({ ip, userAgent, firstSeen: timestamp, lastSeen: timestamp, visitCount: 1 }); }
     writeJSON(CLIENTS_FILE, clients);
     const activity = readJSON(ACTIVITY_FILE, []);
     activity.push({ id: Date.now(), type: 'visit', data: { ip, userAgent }, timestamp });
@@ -822,7 +628,7 @@ app.post('/api/track-download', (req, res) => {
 });
 
 // ------------------------------
-// Admin Analytics (simplified)
+// Admin Analytics
 // ------------------------------
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -846,13 +652,8 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
     }
     const repeatClients = clients.filter(c => c.visitCount > 1).length;
     res.json({
-        summary: { totalVisits, totalDownloads, successfulPayments, cancelledPayments,
-                   conversionRate: totalVisits ? ((successfulPayments / totalVisits) * 100).toFixed(1) : 0,
-                   repeatClients, totalClients: clients.length, storageUsed: storage.usedMB },
-        topProducts,
-        visitsByDay: last7Days,
-        recentActivity: activity.slice(-20).reverse(),
-        recentVisits: stats.visits.slice(-10).reverse()
+        summary: { totalVisits, totalDownloads, successfulPayments, cancelledPayments, conversionRate: totalVisits ? ((successfulPayments / totalVisits) * 100).toFixed(1) : 0, repeatClients, totalClients: clients.length, storageUsed: storage.usedMB },
+        topProducts, visitsByDay: last7Days, recentActivity: activity.slice(-20).reverse(), recentVisits: stats.visits.slice(-10).reverse()
     });
 });
 
@@ -878,10 +679,7 @@ app.put('/api/admin/feedback/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     let feedback = readJSON(FEEDBACK_FILE, []);
     const index = feedback.findIndex(f => f.id === id);
-    if (index !== -1) {
-        feedback[index].read = true;
-        writeJSON(FEEDBACK_FILE, feedback);
-    }
+    if (index !== -1) { feedback[index].read = true; writeJSON(FEEDBACK_FILE, feedback); }
     res.json({ success: true });
 });
 
@@ -892,13 +690,7 @@ app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAG
 app.post('/api/admin/messages', isAdmin, (req, res) => {
     const { title, content, type, startDate, endDate, isActive } = req.body;
     const messages = readJSON(MESSAGES_FILE, []);
-    const newMsg = {
-        id: Date.now(), title, content, type: type || 'banner',
-        startDate: new Date(startDate).toISOString(),
-        endDate: endDate ? new Date(endDate).toISOString() : null,
-        active: isActive === true || isActive === 'true',
-        createdAt: new Date().toISOString(),
-    };
+    const newMsg = { id: Date.now(), title, content, type: type || 'banner', startDate: new Date(startDate).toISOString(), endDate: endDate ? new Date(endDate).toISOString() : null, active: isActive === true || isActive === 'true', createdAt: new Date().toISOString() };
     messages.push(newMsg);
     writeJSON(MESSAGES_FILE, messages);
     cacheVersion = Date.now();
@@ -926,17 +718,7 @@ app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
 
 app.post('/api/admin/instant-message', isAdmin, (req, res) => {
     const { content, type } = req.body;
-    const instantMsg = {
-        id: Date.now(),
-        title: 'Instant Announcement',
-        content,
-        type: type || 'banner',
-        startDate: new Date().toISOString(),
-        endDate: new Date(Date.now() + 86400000).toISOString(),
-        active: true,
-        isInstant: true,
-        createdAt: new Date().toISOString()
-    };
+    const instantMsg = { id: Date.now(), title: 'Instant Announcement', content, type: type || 'banner', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 86400000).toISOString(), active: true, isInstant: true, createdAt: new Date().toISOString() };
     const messages = readJSON(MESSAGES_FILE, []);
     messages.push(instantMsg);
     writeJSON(MESSAGES_FILE, messages);
@@ -947,18 +729,7 @@ app.post('/api/admin/instant-message', isAdmin, (req, res) => {
 app.post('/api/admin/popups', isAdmin, (req, res) => {
     const { question, options, triggerType, delaySeconds, whatsappCollect } = req.body;
     const popups = readJSON(POPUPS_FILE, []);
-    const newPopup = {
-        id: Date.now(),
-        question,
-        options: options || [],
-        triggerType: triggerType || 'onload',
-        delaySeconds: delaySeconds || 0,
-        whatsappCollect: whatsappCollect || false,
-        active: true,
-        startDate: new Date().toISOString(),
-        endDate: null,
-        createdAt: new Date().toISOString()
-    };
+    const newPopup = { id: Date.now(), question, options: options || [], triggerType: triggerType || 'onload', delaySeconds: delaySeconds || 0, whatsappCollect: whatsappCollect || false, active: true, startDate: new Date().toISOString(), endDate: null, createdAt: new Date().toISOString() };
     popups.push(newPopup);
     writeJSON(POPUPS_FILE, popups);
     cacheVersion = Date.now();
@@ -968,7 +739,6 @@ app.post('/api/admin/popups', isAdmin, (req, res) => {
 app.get('/api/admin/popups', isAdmin, (req, res) => {
     res.json(readJSON(POPUPS_FILE, []));
 });
-
 app.put('/api/admin/popups/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     const updates = req.body;
@@ -980,7 +750,6 @@ app.put('/api/admin/popups/:id', isAdmin, (req, res) => {
     cacheVersion = Date.now();
     res.json({ success: true });
 });
-
 app.delete('/api/admin/popups/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     let popups = readJSON(POPUPS_FILE, []);
@@ -997,11 +766,9 @@ app.get('/api/banner', (req, res) => {
     const banner = readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null });
     res.json(banner);
 });
-
 app.get('/api/admin/banner', isAdmin, (req, res) => {
     res.json(readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null }));
 });
-
 app.post('/api/admin/banner', isAdmin, (req, res) => {
     const { enabled, text, startDate, endDate } = req.body;
     const banner = { enabled, text, startDate: startDate || null, endDate: endDate || null };
@@ -1013,7 +780,6 @@ app.post('/api/admin/banner', isAdmin, (req, res) => {
 app.get('/api/admin/whatsapp', isAdmin, (req, res) => {
     res.json(readJSON(WHATSAPP_FILE, { enabled: false, phone: '', message: '' }));
 });
-
 app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
     const { enabled, phone, message } = req.body;
     writeJSON(WHATSAPP_FILE, { enabled, phone, message });
@@ -1028,25 +794,34 @@ app.post('/api/admin/clear-logs', isAdmin, (req, res) => {
     const { period } = req.body;
     let activity = readJSON(ACTIVITY_FILE, []);
     const now = new Date();
-    if (period === 'now') {
-        activity = [];
-    } else if (period === 'year') {
-        const oneYearAgo = new Date(now.setFullYear(now.getFullYear() - 1));
-        activity = activity.filter(a => new Date(a.timestamp) > oneYearAgo);
-    } else if (period === 'all') {
-        activity = [];
-    }
+    if (period === 'now') { activity = []; }
+    else if (period === 'year') { const oneYearAgo = new Date(now.setFullYear(now.getFullYear() - 1)); activity = activity.filter(a => new Date(a.timestamp) > oneYearAgo); }
+    else if (period === 'all') { activity = []; }
     writeJSON(ACTIVITY_FILE, activity);
     res.json({ success: true });
 });
 
 // ------------------------------
-// Keep-Alive Ping
+// Keep-Alive Ping & Backup
 // ------------------------------
-app.get('/ping', (req, res) => {
-    res.send('OK');
+app.get('/ping', (req, res) => { res.send('OK'); });
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+// Backup endpoint (to prevent data loss)
+app.get('/api/admin/backup', isAdmin, (req, res) => {
+    const products = readJSON(PRODUCTS_FILE, []);
+    const learningAreas = readJSON(LEARNING_AREAS_FILE, []);
+    const grades = readJSON(GRADES_FILE, []);
+    res.json({ products, learningAreas, grades, exportedAt: new Date().toISOString() });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.post('/api/admin/restore', isAdmin, (req, res) => {
+    const { products, learningAreas, grades } = req.body;
+    if (products) writeJSON(PRODUCTS_FILE, products);
+    if (learningAreas) writeJSON(LEARNING_AREAS_FILE, learningAreas);
+    if (grades) writeJSON(GRADES_FILE, grades);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
