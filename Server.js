@@ -14,13 +14,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ------------------------------
-// Local Storage for Uploads (Persistent Disk Recommended)
+// Local Storage for Uploads
 // ------------------------------
-// To prevent files from disappearing:
-// 1. Go to Render Dashboard → your service → Disks
-// 2. Create a disk (e.g., 10GB) and mount to /data
-// 3. Then change these paths to /data/uploads and /data/covers
-// For now, using local folders (files will disappear on redeploy)
 const UPLOAD_DIR = 'uploads';
 const COVERS_DIR = 'covers';
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
@@ -451,11 +446,12 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// PAYMENT ENDPOINTS (CORRECTED - ANIMATION ONLY AFTER CONFIRMATION)
+// PAYMENT ENDPOINTS (FULLY CORRECTED)
 // ------------------------------
 
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
+    
     if (!phone || !amount || !productId) {
         return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
@@ -473,6 +469,7 @@ app.post('/api/initiate-payment', async (req, res) => {
         const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE;
         
         if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
+            console.error('Missing Paynecta credentials');
             return res.status(500).json({ success: false, error: 'Payment configuration error' });
         }
         
@@ -487,7 +484,7 @@ app.post('/api/initiate-payment', async (req, res) => {
             if (!stats.payments) stats.payments = [];
             stats.payments.push({ date: new Date().toISOString(), status: 'pending', amount, phone: cleanPhone, productId, transactionId, ip: getClientIp(req) });
             writeJSON(STATS_FILE, stats);
-            res.json({ success: true, transactionId: transactionId, checkoutRequestID: response.data.data?.transaction_id || transactionId });
+            res.json({ success: true, transactionId: transactionId });
         } else {
             res.status(400).json({ success: false, error: response.data?.message || 'Payment initiation failed' });
         }
@@ -501,7 +498,9 @@ app.get('/api/payment-status/:transactionId', (req, res) => {
     const { transactionId } = req.params;
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     const payment = stats.payments.find(p => p.transactionId === transactionId);
+    
     if (!payment) return res.json({ status: 'not_found', verified: false });
+    
     if (payment.status === 'success') {
         let verifyToken = null;
         for (const [token, data] of verifiedPayments.entries()) {
@@ -530,9 +529,29 @@ app.post('/api/payment-webhook', (req, res) => {
             writeJSON(STATS_FILE, stats);
             const verifyToken = 'WEB_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
             verifiedPayments.set(verifyToken, { productId: stats.payments[paymentIndex].productId, transactionId: reference, amount, expires: Date.now() + 300000 });
+            console.log(`Payment verified for ${reference}`);
         }
     }
     res.sendStatus(200);
+});
+
+// Manual payment confirmation (for fixing stuck payments)
+app.post('/api/admin/confirm-payment', isAdmin, (req, res) => {
+    const { transactionId, productId } = req.body;
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    const payment = stats.payments.find(p => p.transactionId === transactionId);
+    
+    if (!payment) {
+        return res.status(404).json({ error: 'Transaction not found' });
+    }
+    
+    payment.status = 'success';
+    writeJSON(STATS_FILE, stats);
+    
+    const verifyToken = 'MANUAL_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+    verifiedPayments.set(verifyToken, { productId: payment.productId, transactionId, amount: payment.amount, expires: Date.now() + 300000 });
+    
+    res.json({ success: true, token: verifyToken });
 });
 
 app.post('/api/request-download', (req, res) => {
@@ -806,22 +825,5 @@ app.post('/api/admin/clear-logs', isAdmin, (req, res) => {
 // ------------------------------
 app.get('/ping', (req, res) => { res.send('OK'); });
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-// Backup endpoint (to prevent data loss)
-app.get('/api/admin/backup', isAdmin, (req, res) => {
-    const products = readJSON(PRODUCTS_FILE, []);
-    const learningAreas = readJSON(LEARNING_AREAS_FILE, []);
-    const grades = readJSON(GRADES_FILE, []);
-    res.json({ products, learningAreas, grades, exportedAt: new Date().toISOString() });
-});
-
-app.post('/api/admin/restore', isAdmin, (req, res) => {
-    const { products, learningAreas, grades } = req.body;
-    if (products) writeJSON(PRODUCTS_FILE, products);
-    if (learningAreas) writeJSON(LEARNING_AREAS_FILE, learningAreas);
-    if (grades) writeJSON(GRADES_FILE, grades);
-    cacheVersion = Date.now();
-    res.json({ success: true });
-});
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
