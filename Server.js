@@ -4,6 +4,8 @@ const cors = require('cors');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const archiver = require('archiver');
+const extract = require('extract-zip');
 const nodemailer = require('nodemailer');
 
 const app = express();
@@ -227,7 +229,7 @@ app.post('/api/leave', (req, res) => {
 });
 
 // ------------------------------
-// Learning Areas Management (shortened)
+// Learning Areas Management
 // ------------------------------
 app.get('/api/admin/learning-areas', isAdmin, (req, res) => {
     let areas = readJSON(LEARNING_AREAS_FILE, []);
@@ -272,7 +274,7 @@ app.delete('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Grades Management (shortened)
+// Grades Management
 // ------------------------------
 app.get('/api/admin/grades', isAdmin, (req, res) => {
     let grades = readJSON(GRADES_FILE, []);
@@ -314,6 +316,46 @@ app.delete('/api/admin/grades/:id', isAdmin, (req, res) => {
     writeJSON(GRADES_FILE, grades);
     cacheVersion = Date.now();
     res.json({ success: true });
+});
+
+// ------------------------------
+// IP Geolocation (optional)
+// ------------------------------
+app.get('/api/geo/:ip', async (req, res) => {
+    const ip = req.params.ip;
+    if (ip === '::1' || ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
+        return res.json({ ip, city: 'Local', region: 'Local', country: 'Local' });
+    }
+    try {
+        const response = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp`);
+        if (response.data.status === 'success') {
+            res.json({ ip, city: response.data.city, region: response.data.regionName, country: response.data.country, isp: response.data.isp });
+        } else {
+            res.json({ ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
+        }
+    } catch (error) {
+        res.json({ ip, city: 'Error', region: 'Error', country: 'Error' });
+    }
+});
+
+app.get('/api/admin/visitors-with-location', isAdmin, async (req, res) => {
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    const recentIPs = [...new Set(stats.visits.slice(-50).map(v => v.ip))];
+    const locations = [];
+    for (const ip of recentIPs) {
+        try {
+            const geoRes = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp`);
+            if (geoRes.data.status === 'success') {
+                locations.push({ ip, city: geoRes.data.city, region: geoRes.data.regionName, country: geoRes.data.country, isp: geoRes.data.isp });
+            } else {
+                locations.push({ ip, city: 'Unknown', region: 'Unknown', country: 'Unknown' });
+            }
+            await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (err) {
+            locations.push({ ip, city: 'Error', region: 'Error', country: 'Error' });
+        }
+    }
+    res.json(locations);
 });
 
 // ------------------------------
@@ -403,6 +445,74 @@ app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
 });
 
 // ------------------------------
+// BACKUP & RESTORE (No external cloud)
+// ------------------------------
+app.get('/api/admin/backup', isAdmin, (req, res) => {
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    res.attachment('schemevault-backup.zip');
+    archive.pipe(res);
+
+    const jsonFiles = [PRODUCTS_FILE, STATS_FILE, MESSAGES_FILE, ACTIVITY_FILE, CLIENTS_FILE, FEEDBACK_FILE, TERM_SETTINGS_FILE, BANNER_FILE, WHATSAPP_FILE, POPUPS_FILE, LEARNING_AREAS_FILE, GRADES_FILE];
+    jsonFiles.forEach(file => {
+        if (fs.existsSync(file)) {
+            archive.file(file, { name: `data/${file}` });
+        }
+    });
+
+    if (fs.existsSync(UPLOAD_DIR)) archive.directory(UPLOAD_DIR, 'uploads');
+    if (fs.existsSync(COVERS_DIR)) archive.directory(COVERS_DIR, 'covers');
+
+    archive.finalize();
+});
+
+app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req, res) => {
+    const zipFile = req.file;
+    if (!zipFile) return res.status(400).json({ error: 'No file uploaded' });
+    const extractPath = path.join(__dirname, 'restore_temp');
+    if (!fs.existsSync(extractPath)) fs.mkdirSync(extractPath);
+
+    try {
+        await extract(zipFile.path, { dir: extractPath });
+        // Restore JSON files
+        const dataDir = path.join(extractPath, 'data');
+        if (fs.existsSync(dataDir)) {
+            const files = fs.readdirSync(dataDir);
+            for (const file of files) {
+                const src = path.join(dataDir, file);
+                const dest = path.join(__dirname, file);
+                fs.copyFileSync(src, dest);
+            }
+        }
+        // Restore uploads
+        const uploadsBackup = path.join(extractPath, 'uploads');
+        if (fs.existsSync(uploadsBackup)) {
+            const files = fs.readdirSync(uploadsBackup);
+            for (const file of files) {
+                const src = path.join(uploadsBackup, file);
+                const dest = path.join(UPLOAD_DIR, file);
+                fs.copyFileSync(src, dest);
+            }
+        }
+        const coversBackup = path.join(extractPath, 'covers');
+        if (fs.existsSync(coversBackup)) {
+            const files = fs.readdirSync(coversBackup);
+            for (const file of files) {
+                const src = path.join(coversBackup, file);
+                const dest = path.join(COVERS_DIR, file);
+                fs.copyFileSync(src, dest);
+            }
+        }
+        fs.rmSync(extractPath, { recursive: true, force: true });
+        fs.unlinkSync(zipFile.path);
+        cacheVersion = Date.now();
+        res.json({ success: true });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Restore failed' });
+    }
+});
+
+// ------------------------------
 // PAYMENT ENDPOINTS (FAST CONFIRMATION)
 // ------------------------------
 app.post('/api/initiate-payment', async (req, res) => {
@@ -414,15 +524,15 @@ app.post('/api/initiate-payment', async (req, res) => {
     if (cleanPhone.startsWith('0')) cleanPhone = '254' + cleanPhone.substring(1);
     else if (cleanPhone.startsWith('+')) cleanPhone = cleanPhone.substring(1);
     const transactionId = 'TXN_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
-    
+
     try {
         const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://api.paynecta.co.ke';
         const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
         const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
         const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE;
-        
+
         if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
-            // Demo mode: auto-confirm after 3 seconds
+            // Demo mode: auto-confirm after 2 seconds
             setTimeout(() => {
                 const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
                 const pIndex = stats.payments.findIndex(p => p.transactionId === transactionId);
@@ -432,14 +542,14 @@ app.post('/api/initiate-payment', async (req, res) => {
                     const verifyToken = 'DEMO_' + Date.now();
                     verifiedPayments.set(verifyToken, { productId, transactionId, amount, expires: Date.now() + 300000 });
                 }
-            }, 3000);
+            }, 2000);
             const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
             if (!stats.payments) stats.payments = [];
             stats.payments.push({ date: new Date().toISOString(), status: 'pending', amount, phone: cleanPhone, productId, transactionId, ip: getClientIp(req) });
             writeJSON(STATS_FILE, stats);
             return res.json({ success: true, transactionId });
         }
-        
+
         const response = await axios.post(
             `${PAYNECTA_API_URL}/api/v1/payment/initialize`,
             { code: PAYNECTA_PAYMENT_CODE, mobile_number: cleanPhone, amount: amount },
@@ -460,7 +570,6 @@ app.post('/api/initiate-payment', async (req, res) => {
     }
 });
 
-// Fast payment status check (polled every 2 seconds)
 app.get('/api/payment-status/:transactionId', (req, res) => {
     const { transactionId } = req.params;
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -483,7 +592,6 @@ app.get('/api/payment-status/:transactionId', (req, res) => {
     }
 });
 
-// Webhook for real payment confirmation (instant)
 app.post('/api/payment-webhook', (req, res) => {
     console.log('Webhook received:', req.body);
     const { ResultCode, reference } = req.body;
@@ -500,7 +608,6 @@ app.post('/api/payment-webhook', (req, res) => {
     res.sendStatus(200);
 });
 
-// Request download token
 app.post('/api/request-download', (req, res) => {
     const { verificationToken, productId } = req.body;
     if (!verificationToken || !productId) return res.status(400).json({ error: 'Missing data' });
@@ -517,7 +624,6 @@ app.post('/api/request-download', (req, res) => {
     res.json({ success: true, token: downloadToken });
 });
 
-// Download file
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
     const record = downloadTokens.get(token);
@@ -540,7 +646,6 @@ app.get('/api/download/:token', async (req, res) => {
     }
 });
 
-// Admin manual confirmation (for fallback)
 app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
     const { transactionId, productId } = req.body;
     const verifyToken = 'ADMIN_' + Date.now();
@@ -553,22 +658,25 @@ app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
 });
 
 // ------------------------------
-// Public Endpoints (shortened)
+// Public Endpoints
 // ------------------------------
 app.get('/api/products', (req, res) => {
     const products = readJSON(PRODUCTS_FILE, []);
     res.json(products.filter(p => p.visible !== false));
 });
+
 app.get('/api/messages', (req, res) => {
     const messages = readJSON(MESSAGES_FILE, []);
     const now = new Date();
     res.json(messages.filter(m => m.active && new Date(m.startDate) <= now && (!m.endDate || new Date(m.endDate) >= now)));
 });
+
 app.get('/api/popups', (req, res) => {
     const popups = readJSON(POPUPS_FILE, []);
     const now = new Date();
     res.json(popups.filter(p => p.active && new Date(p.startDate) <= now && (!p.endDate || new Date(p.endDate) >= now)));
 });
+
 app.post('/api/submit-feedback', (req, res) => {
     const { message, whatsapp } = req.body;
     const feedback = readJSON(FEEDBACK_FILE, []);
@@ -576,12 +684,15 @@ app.post('/api/submit-feedback', (req, res) => {
     writeJSON(FEEDBACK_FILE, feedback);
     res.json({ success: true });
 });
+
 app.post('/api/track-visit', (req, res) => {
+    const ip = getClientIp(req);
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    stats.visits.push({ date: new Date().toISOString(), ip: getClientIp(req) });
+    stats.visits.push({ date: new Date().toISOString(), ip });
     writeJSON(STATS_FILE, stats);
     res.json({ success: true });
 });
+
 app.post('/api/track-download', (req, res) => {
     const { productId, productName, price } = req.body;
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -590,7 +701,9 @@ app.post('/api/track-download', (req, res) => {
     res.json({ success: true });
 });
 
-// Admin analytics (shortened)
+// ------------------------------
+// Admin Analytics (shortened)
+// ------------------------------
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     const storage = getStorageUsage();
@@ -612,7 +725,9 @@ app.put('/api/admin/feedback/:id', isAdmin, (req, res) => {
     res.json({ success: true });
 });
 
+// ------------------------------
 // Messages & Popups (shortened)
+// ------------------------------
 app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
 app.post('/api/admin/messages', isAdmin, (req, res) => {
     const { title, content, type, startDate, endDate, isActive } = req.body;
@@ -669,7 +784,9 @@ app.delete('/api/admin/popups/:id', isAdmin, (req, res) => {
     res.json({ success: true });
 });
 
-// Banner & WhatsApp (shortened)
+// ------------------------------
+// Banner & WhatsApp Settings
+// ------------------------------
 app.get('/api/banner', (req, res) => { res.json(readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null })); });
 app.get('/api/admin/banner', isAdmin, (req, res) => { res.json(readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null })); });
 app.post('/api/admin/banner', isAdmin, (req, res) => {
@@ -686,13 +803,17 @@ app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
     res.json({ success: true });
 });
 
-// Clear logs
+// ------------------------------
+// Clear Logs
+// ------------------------------
 app.post('/api/admin/clear-logs', isAdmin, (req, res) => {
     writeJSON(ACTIVITY_FILE, []);
     res.json({ success: true });
 });
 
-// Keep-alive
+// ------------------------------
+// Keep-Alive Ping
+// ------------------------------
 app.get('/ping', (req, res) => { res.send('OK'); });
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
