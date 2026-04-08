@@ -15,14 +15,20 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// ========== FILE UPLOAD CONFIG ==========
-const UPLOAD_DIR = 'uploads';
-const COVERS_DIR = 'covers';
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR);
+// ========== PERSISTENT STORAGE (Render Disk) ==========
+const DATA_DIR = process.env.DATA_DIR || '/opt/render/project/src/data';
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+const COVERS_DIR = path.join(DATA_DIR, 'covers');
+
+// Ensure directories exist
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR, { recursive: true });
+
 app.use('/uploads', express.static(UPLOAD_DIR));
 app.use('/covers', express.static(COVERS_DIR));
 
+// ========== FILE UPLOAD MULTER CONFIG ==========
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         if (file.fieldname === 'coverImage') cb(null, COVERS_DIR);
@@ -49,19 +55,19 @@ const upload = multer({
     }
 });
 
-// ========== DATA FILES ==========
-const PRODUCTS_FILE = 'products.json';
-const STATS_FILE = 'stats.json';
-const MESSAGES_FILE = 'messages.json';
-const ACTIVITY_FILE = 'activity.json';
-const CLIENTS_FILE = 'clients.json';
-const FEEDBACK_FILE = 'feedback.json';
-const TERM_SETTINGS_FILE = 'term_settings.json';
-const BANNER_FILE = 'banner.json';
-const WHATSAPP_FILE = 'whatsapp.json';
-const POPUPS_FILE = 'popups.json';
-const LEARNING_AREAS_FILE = 'learning_areas.json';
-const GRADES_FILE = 'grades.json';
+// ========== JSON DATA FILES (inside persistent DATA_DIR) ==========
+const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
+const STATS_FILE = path.join(DATA_DIR, 'stats.json');
+const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
+const ACTIVITY_FILE = path.join(DATA_DIR, 'activity.json');
+const CLIENTS_FILE = path.join(DATA_DIR, 'clients.json');
+const FEEDBACK_FILE = path.join(DATA_DIR, 'feedback.json');
+const TERM_SETTINGS_FILE = path.join(DATA_DIR, 'term_settings.json');
+const BANNER_FILE = path.join(DATA_DIR, 'banner.json');
+const WHATSAPP_FILE = path.join(DATA_DIR, 'whatsapp.json');
+const POPUPS_FILE = path.join(DATA_DIR, 'popups.json');
+const LEARNING_AREAS_FILE = path.join(DATA_DIR, 'learning_areas.json');
+const GRADES_FILE = path.join(DATA_DIR, 'grades.json');
 
 const readJSON = (file, defaultVal = []) => {
     if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(defaultVal));
@@ -128,7 +134,7 @@ setInterval(() => {
 
 let cacheVersion = Date.now();
 
-// ========== PAYMENT STORAGE ==========
+// ========== PAYMENT STORAGE (in‑memory only) ==========
 const pendingPayments = new Map();
 const verifiedPayments = new Map();
 const downloadTokens = new Map();
@@ -307,7 +313,7 @@ app.get('/api/products', (req, res) => { const products = readJSON(PRODUCTS_FILE
 
 app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile', maxCount: 1 }, { name: 'coverImage', maxCount: 1 }]), (req, res) => {
     try {
-        const { title, grade, term, subject, price, pages, visible } = req.body;
+        const { title, grade, term, subject, price, pages, weeks, visible } = req.body;
         if (!title || !grade || !term || !subject || !price) return res.status(400).json({ error: 'All fields required' });
         const pdfFile = req.files?.['pdfFile']?.[0];
         if (!pdfFile) return res.status(400).json({ error: 'PDF file required' });
@@ -319,6 +325,7 @@ app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile', maxCo
         const newProduct = {
             id: newId, title, grade, term: parseInt(term), subject,
             price: parseInt(price), pages: pages ? parseInt(pages) : null,
+            weeks: weeks ? parseInt(weeks) : 12,
             fileUrl, coverUrl, visible: visible === 'true' || visible === true,
             createdAt: new Date().toISOString(),
         };
@@ -360,7 +367,7 @@ app.get('/api/admin/backup', isAdmin, (req, res) => {
     res.attachment('schemevault-backup.zip');
     archive.pipe(res);
     const jsonFiles = [PRODUCTS_FILE, STATS_FILE, MESSAGES_FILE, ACTIVITY_FILE, CLIENTS_FILE, FEEDBACK_FILE, TERM_SETTINGS_FILE, BANNER_FILE, WHATSAPP_FILE, POPUPS_FILE, LEARNING_AREAS_FILE, GRADES_FILE];
-    jsonFiles.forEach(file => { if (fs.existsSync(file)) archive.file(file, { name: `data/${file}` }); });
+    jsonFiles.forEach(file => { if (fs.existsSync(file)) archive.file(file, { name: `data/${path.basename(file)}` }); });
     if (fs.existsSync(UPLOAD_DIR)) archive.directory(UPLOAD_DIR, 'uploads');
     if (fs.existsSync(COVERS_DIR)) archive.directory(COVERS_DIR, 'covers');
     archive.finalize();
@@ -369,7 +376,7 @@ app.get('/api/admin/backup', isAdmin, (req, res) => {
 app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req, res) => {
     const zipFile = req.file;
     if (!zipFile) return res.status(400).json({ error: 'No file uploaded' });
-    const extractPath = path.join(__dirname, 'restore_temp');
+    const extractPath = path.join(DATA_DIR, 'restore_temp');
     if (!fs.existsSync(extractPath)) fs.mkdirSync(extractPath);
     try {
         await extract(zipFile.path, { dir: extractPath });
@@ -377,7 +384,7 @@ app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req,
         if (fs.existsSync(dataDir)) {
             const files = fs.readdirSync(dataDir);
             for (const file of files) {
-                fs.copyFileSync(path.join(dataDir, file), path.join(__dirname, file));
+                fs.copyFileSync(path.join(dataDir, file), path.join(DATA_DIR, file));
             }
         }
         const uploadsBackup = path.join(extractPath, 'uploads');
@@ -404,62 +411,43 @@ app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req,
     }
 });
 
-// ========== PAYMENT ENDPOINTS (FIXED FOR DOWNLOAD) ==========
-
-// Helper to query Paynecta status
+// ========== PAYMENT ENDPOINTS ==========
 async function queryPaynectaStatus(transactionReference) {
     if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL) return null;
     try {
         const url = `${PAYNECTA_API_URL}/payment/status?transaction_reference=${encodeURIComponent(transactionReference)}`;
-        console.log(`📡 Querying Paynecta: ${url}`);
         const response = await axios.get(url, {
-            headers: {
-                'X-API-Key': PAYNECTA_API_KEY,
-                'X-User-Email': PAYNECTA_EMAIL
-            },
+            headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL },
             timeout: 10000
         });
-        console.log(`📡 Paynecta response:`, JSON.stringify(response.data, null, 2));
-        if (response.data?.success && response.data?.data) {
-            return response.data.data;
-        }
+        if (response.data?.success && response.data?.data) return response.data.data;
         return null;
     } catch (err) {
-        console.error('❌ Status query error:', err.response?.status, err.response?.data || err.message);
+        console.error('Status query error:', err.message);
         return null;
     }
 }
 
-// Initiate STK Push
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
-    if (!phone || !amount || !productId) {
-        return res.status(400).json({ success: false, error: 'Missing fields' });
-    }
-
+    if (!phone || !amount || !productId) return res.status(400).json({ success: false, error: 'Missing fields' });
     let cleanPhone = phone.replace(/\s/g, '');
     if (cleanPhone.startsWith('0')) cleanPhone = '254' + cleanPhone.substring(1);
     else if (cleanPhone.startsWith('+')) cleanPhone = cleanPhone.substring(1);
-
     const transactionId = 'TXN_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     const products = readJSON(PRODUCTS_FILE, []);
     const product = products.find(p => p.id === parseInt(productId));
     if (!product) return res.status(400).json({ success: false, error: 'Product not found' });
-
     pendingPayments.set(transactionId, {
         productId: parseInt(productId), productTitle: product.title, productGrade: product.grade,
         productTerm: product.term, fileUrl: product.fileUrl, amount: parseInt(amount),
         phone: cleanPhone, status: 'pending', timestamp: Date.now()
     });
-
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     if (!stats.payments) stats.payments = [];
     stats.payments.push({ date: new Date().toISOString(), status: 'pending', amount: parseInt(amount), phone: cleanPhone, productId: parseInt(productId), transactionId });
     writeJSON(STATS_FILE, stats);
-
-    // Demo mode
     if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
-        console.log('🎮 Demo mode: auto-confirming in 10 seconds');
         setTimeout(() => {
             const payment = pendingPayments.get(transactionId);
             if (payment && payment.status === 'pending') {
@@ -471,69 +459,36 @@ app.post('/api/initiate-payment', async (req, res) => {
                     fileUrl: payment.fileUrl, transactionId, amount: payment.amount,
                     expires: Date.now() + 300000
                 });
-                console.log(`✅ Demo payment confirmed for ${transactionId}`);
             }
         }, 10000);
         return res.json({ success: true, transactionId, demoMode: true });
     }
-
-    // Real Paynecta
     try {
         const initUrl = `${PAYNECTA_API_URL}/payment/initialize`;
-        console.log(`💳 Initiating STK Push to: ${initUrl}`);
         const response = await axios.post(initUrl, {
-            code: PAYNECTA_PAYMENT_CODE,
-            mobile_number: cleanPhone,
-            amount: parseInt(amount)
+            code: PAYNECTA_PAYMENT_CODE, mobile_number: cleanPhone, amount: parseInt(amount)
         }, {
-            headers: {
-                'X-API-Key': PAYNECTA_API_KEY,
-                'X-User-Email': PAYNECTA_EMAIL,
-                'Content-Type': 'application/json'
-            },
+            headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL, 'Content-Type': 'application/json' },
             timeout: 30000
         });
-
-        console.log('💳 Paynecta init response:', JSON.stringify(response.data, null, 2));
-
         if (response.data?.success === true) {
-            // Store the transaction reference (critical for status query)
-            const paynectaRef = response.data.data?.transaction_reference || 
-                               response.data.data?.checkout_request_id ||
-                               response.data.data?.reference ||
-                               transactionId;
+            const paynectaRef = response.data.data?.transaction_reference || response.data.data?.checkout_request_id || transactionId;
             const payment = pendingPayments.get(transactionId);
-            if (payment) {
-                payment.paynectaRef = paynectaRef;
-                console.log(`📝 Stored Paynecta reference: ${paynectaRef}`);
-            }
+            if (payment) payment.paynectaRef = paynectaRef;
             res.json({ success: true, transactionId });
         } else {
-            const errorMsg = response.data?.message || 'Payment initiation failed';
-            console.error('❌ Paynecta init error:', errorMsg);
-            res.status(400).json({ success: false, error: errorMsg });
+            res.status(400).json({ success: false, error: response.data?.message || 'Payment initiation failed' });
         }
     } catch (error) {
-        console.error('❌ Paynecta request error:', error.response?.data || error.message);
-        let errorMsg = 'Payment service error. ';
-        if (error.response?.status === 405) errorMsg += 'Wrong endpoint. Check PAYNECTA_API_URL includes /api/v1';
-        else if (error.response?.status === 401) errorMsg += 'Invalid API key or email.';
-        else if (error.response?.status === 404) errorMsg += 'Endpoint not found.';
-        else errorMsg += error.message;
-        res.status(500).json({ success: false, error: errorMsg });
+        console.error('Paynecta error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Payment status endpoint - queries Paynecta directly
 app.get('/api/payment-status/:transactionId', async (req, res) => {
     const { transactionId } = req.params;
-    console.log(`🔍 Checking status for ${transactionId}`);
-
     const pending = pendingPayments.get(transactionId);
-
-    // Already confirmed?
     if (pending && pending.status === 'success') {
-        console.log(`✅ Payment already confirmed in memory for ${transactionId}`);
         const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
         verifiedPayments.set(verifyToken, {
             productId: pending.productId, productTitle: pending.productTitle,
@@ -544,53 +499,30 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
         pendingPayments.delete(transactionId);
         return res.json({ status: 'success', verified: true, token: verifyToken });
     }
-
     if (pending && pending.status === 'failed') {
         pendingPayments.delete(transactionId);
         return res.json({ status: 'failed', verified: false });
     }
-
-    // Query Paynecta
     if (pending) {
-        try {
-            const paynectaRef = pending.paynectaRef || transactionId;
-            console.log(`📡 Querying Paynecta with ref: ${paynectaRef}`);
-            const paynectaData = await queryPaynectaStatus(paynectaRef);
-            
-            if (paynectaData && (paynectaData.status === 'completed' || paynectaData.result_code === 0)) {
-                console.log(`✅✅✅ PAYMENT CONFIRMED! ${transactionId}`);
-                pending.status = 'success';
-                
-                // Update stats
-                const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-                const paymentIndex = stats.payments.findIndex(p => p.transactionId === transactionId);
-                if (paymentIndex !== -1) stats.payments[paymentIndex].status = 'success';
-                writeJSON(STATS_FILE, stats);
-                
-                const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
-                verifiedPayments.set(verifyToken, {
-                    productId: pending.productId, productTitle: pending.productTitle,
-                    productGrade: pending.productGrade, productTerm: pending.productTerm,
-                    fileUrl: pending.fileUrl, transactionId, amount: pending.amount,
-                    expires: Date.now() + 300000
-                });
-                pendingPayments.delete(transactionId);
-                return res.json({ status: 'success', verified: true, token: verifyToken });
-            } else if (paynectaData && (paynectaData.status === 'failed' || paynectaData.status === 'cancelled')) {
-                console.log(`❌ Payment failed for ${transactionId}`);
-                pending.status = 'failed';
-                pendingPayments.delete(transactionId);
-                return res.json({ status: 'failed', verified: false });
-            }
-            console.log(`⏳ Payment still pending for ${transactionId}`);
-            return res.json({ status: 'pending', verified: false });
-        } catch (err) {
-            console.error('❌ Error querying Paynecta:', err);
-            return res.json({ status: 'pending', verified: false });
+        const paynectaData = await queryPaynectaStatus(pending.paynectaRef || transactionId);
+        if (paynectaData && (paynectaData.status === 'completed' || paynectaData.result_code === 0)) {
+            pending.status = 'success';
+            const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
+            verifiedPayments.set(verifyToken, {
+                productId: pending.productId, productTitle: pending.productTitle,
+                productGrade: pending.productGrade, productTerm: pending.productTerm,
+                fileUrl: pending.fileUrl, transactionId, amount: pending.amount,
+                expires: Date.now() + 300000
+            });
+            pendingPayments.delete(transactionId);
+            return res.json({ status: 'success', verified: true, token: verifyToken });
+        } else if (paynectaData && (paynectaData.status === 'failed' || paynectaData.status === 'cancelled')) {
+            pending.status = 'failed';
+            pendingPayments.delete(transactionId);
+            return res.json({ status: 'failed', verified: false });
         }
+        return res.json({ status: 'pending', verified: false });
     }
-
-    // Check already verified
     for (const [token, data] of verifiedPayments.entries()) {
         if (data.transactionId === transactionId && data.expires > Date.now()) {
             return res.json({ status: 'success', verified: true, token });
@@ -599,81 +531,46 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
     res.json({ status: 'not_found', verified: false });
 });
 
-// Webhook endpoint (optional)
-app.post('/api/payment-webhook', (req, res) => {
-    console.log('📞 Webhook received:', JSON.stringify(req.body, null, 2));
-    res.sendStatus(200);
-});
-
-// Request download token
+app.post('/api/payment-webhook', (req, res) => { res.sendStatus(200); });
 app.post('/api/request-download', (req, res) => {
     const { verificationToken, productId } = req.body;
-    console.log(`📥 Download request: token=${verificationToken}, productId=${productId}`);
-    
     const verified = verifiedPayments.get(verificationToken);
-    if (!verified || verified.expires < Date.now()) {
-        console.log(`❌ Invalid or expired verification token: ${verificationToken}`);
-        return res.status(403).json({ error: 'Invalid or expired verification token' });
-    }
-    if (verified.productId !== parseInt(productId)) {
-        console.log(`❌ Product mismatch: expected ${verified.productId}, got ${productId}`);
-        return res.status(403).json({ error: 'Product mismatch' });
-    }
-    
+    if (!verified || verified.expires < Date.now()) return res.status(403).json({ error: 'Invalid or expired verification token' });
+    if (verified.productId !== parseInt(productId)) return res.status(403).json({ error: 'Product mismatch' });
     const downloadToken = Math.random().toString(36).substring(2, 20) + Date.now().toString(36);
     downloadTokens.set(downloadToken, {
-        productId: verified.productId,
-        fileUrl: verified.fileUrl,
+        productId: verified.productId, fileUrl: verified.fileUrl,
         filename: `${verified.productTitle}_${verified.productGrade}_Term${verified.productTerm}.pdf`,
         expires: Date.now() + 120000
     });
     verifiedPayments.delete(verificationToken);
-    
-    console.log(`✅ Download token generated: ${downloadToken}`);
     res.json({ success: true, token: downloadToken });
 });
-
-// Download PDF
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
-    console.log(`📥 Download request for token: ${token}`);
-    
     const record = downloadTokens.get(token);
-    if (!record || record.expires < Date.now()) {
-        console.log(`❌ Invalid or expired download token: ${token}`);
-        return res.status(403).send('Download link expired or invalid.');
-    }
-    
+    if (!record || record.expires < Date.now()) return res.status(403).send('Download link expired or invalid.');
     try {
-        console.log(`📄 Serving file: ${record.filename} from ${record.fileUrl}`);
         res.setHeader('Content-Disposition', `attachment; filename="${record.filename}"`);
         res.setHeader('Content-Type', 'application/pdf');
-        
         if (record.fileUrl.startsWith('http')) {
             const response = await axios({ method: 'GET', url: record.fileUrl, responseType: 'stream' });
             response.data.pipe(res);
         } else {
             const filePath = path.join(__dirname, record.fileUrl);
-            if (fs.existsSync(filePath)) {
-                fs.createReadStream(filePath).pipe(res);
-            } else {
-                console.log(`❌ File not found: ${filePath}`);
-                res.status(404).send('File not found');
-            }
+            if (fs.existsSync(filePath)) fs.createReadStream(filePath).pipe(res);
+            else res.status(404).send('File not found');
         }
-        
         const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
         stats.downloads.push({ date: new Date().toISOString(), productId: record.productId, ip: getClientIp(req) });
         writeJSON(STATS_FILE, stats);
         downloadTokens.delete(token);
-        console.log(`✅ Download successful for ${record.filename}`);
     } catch (err) {
-        console.error('❌ Download error:', err);
+        console.error(err);
         res.status(500).send('Download error');
     }
 });
 
-// Admin force confirm
 app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
     const { transactionId, productId } = req.body;
     const products = readJSON(PRODUCTS_FILE, []);
@@ -688,135 +585,27 @@ app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
     res.json({ success: true, token: verifyToken });
 });
 
-// ========== DEBUG ENDPOINTS ==========
-app.get('/api/debug-paynecta', (req, res) => {
-    res.json({
-        PAYNECTA_API_URL: process.env.PAYNECTA_API_URL,
-        constructed_init_url: `${process.env.PAYNECTA_API_URL}/payment/initialize`,
-        constructed_status_url: `${process.env.PAYNECTA_API_URL}/payment/status`,
-        api_key_set: !!PAYNECTA_API_KEY,
-        email_set: !!PAYNECTA_EMAIL,
-        code_set: !!PAYNECTA_PAYMENT_CODE,
-        pending_payments_count: pendingPayments.size,
-        verified_payments_count: verifiedPayments.size,
-        message: "If the constructed URL contains '/api/v1', the endpoint is correct."
-    });
-});
-
-app.get('/api/debug-pending', isAdmin, (req, res) => {
-    const pending = Array.from(pendingPayments.entries()).map(([id, p]) => ({
-        transactionId: id,
-        productTitle: p.productTitle,
-        amount: p.amount,
-        status: p.status,
-        paynectaRef: p.paynectaRef,
-        timestamp: p.timestamp
-    }));
-    res.json({ pending });
-});
-
-// ========== PUBLIC ENDPOINTS ==========
-app.get('/api/messages', (req, res) => {
-    const messages = readJSON(MESSAGES_FILE, []);
-    const now = new Date();
-    res.json(messages.filter(m => m.active && new Date(m.startDate) <= now && (!m.endDate || new Date(m.endDate) >= now)));
-});
-app.get('/api/popups', (req, res) => {
-    const popups = readJSON(POPUPS_FILE, []);
-    const now = new Date();
-    res.json(popups.filter(p => p.active && new Date(p.startDate) <= now && (!p.endDate || new Date(p.endDate) >= now)));
-});
-app.post('/api/submit-feedback', (req, res) => {
-    const { message, whatsapp } = req.body;
-    const feedback = readJSON(FEEDBACK_FILE, []);
-    feedback.push({ id: Date.now(), message, whatsapp, ip: getClientIp(req), timestamp: new Date().toISOString(), read: false });
-    writeJSON(FEEDBACK_FILE, feedback);
-    res.json({ success: true });
-});
-app.post('/api/track-visit', (req, res) => {
-    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    stats.visits.push({ date: new Date().toISOString(), ip: getClientIp(req) });
-    writeJSON(STATS_FILE, stats);
-    res.json({ success: true });
-});
-app.get('/api/admin/stats', isAdmin, (req, res) => {
-    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-    const storage = getStorageUsage();
-    res.json({ summary: { totalVisits: stats.visits.length, totalDownloads: stats.downloads.length, successfulPayments: stats.payments?.filter(p => p.status === 'success').length || 0, storageUsed: storage.usedMB } });
-});
+// ========== PUBLIC ENDPOINTS (messages, popups, feedback, etc.) ==========
+app.get('/api/messages', (req, res) => { const messages = readJSON(MESSAGES_FILE, []); const now = new Date(); res.json(messages.filter(m => m.active && new Date(m.startDate) <= now && (!m.endDate || new Date(m.endDate) >= now))); });
+app.get('/api/popups', (req, res) => { const popups = readJSON(POPUPS_FILE, []); const now = new Date(); res.json(popups.filter(p => p.active && new Date(p.startDate) <= now && (!p.endDate || new Date(p.endDate) >= now))); });
+app.post('/api/submit-feedback', (req, res) => { const { message, whatsapp } = req.body; const feedback = readJSON(FEEDBACK_FILE, []); feedback.push({ id: Date.now(), message, whatsapp, ip: getClientIp(req), timestamp: new Date().toISOString(), read: false }); writeJSON(FEEDBACK_FILE, feedback); res.json({ success: true }); });
+app.post('/api/track-visit', (req, res) => { const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] }); stats.visits.push({ date: new Date().toISOString(), ip: getClientIp(req) }); writeJSON(STATS_FILE, stats); res.json({ success: true }); });
+app.get('/api/admin/stats', isAdmin, (req, res) => { const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] }); const storage = getStorageUsage(); res.json({ summary: { totalVisits: stats.visits.length, totalDownloads: stats.downloads.length, successfulPayments: stats.payments?.filter(p => p.status === 'success').length || 0, storageUsed: storage.usedMB } }); });
 app.get('/api/admin/feedback', isAdmin, (req, res) => { res.json(readJSON(FEEDBACK_FILE, [])); });
-app.put('/api/admin/feedback/:id', isAdmin, (req, res) => {
-    const id = parseInt(req.params.id);
-    let feedback = readJSON(FEEDBACK_FILE, []);
-    const idx = feedback.findIndex(f => f.id === id);
-    if (idx !== -1) { feedback[idx].read = true; writeJSON(FEEDBACK_FILE, feedback); }
-    res.json({ success: true });
-});
+app.put('/api/admin/feedback/:id', isAdmin, (req, res) => { const id = parseInt(req.params.id); let feedback = readJSON(FEEDBACK_FILE, []); const idx = feedback.findIndex(f => f.id === id); if (idx !== -1) { feedback[idx].read = true; writeJSON(FEEDBACK_FILE, feedback); } res.json({ success: true }); });
 app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
-app.post('/api/admin/messages', isAdmin, (req, res) => {
-    const { title, content, type, startDate, endDate, isActive } = req.body;
-    const messages = readJSON(MESSAGES_FILE, []);
-    messages.push({ id: Date.now(), title, content, type: type || 'banner', startDate: new Date(startDate).toISOString(), endDate: endDate ? new Date(endDate).toISOString() : null, active: isActive === true || isActive === 'true', createdAt: new Date().toISOString() });
-    writeJSON(MESSAGES_FILE, messages);
-    cacheVersion = Date.now();
-    res.json({ success: true });
-});
-app.put('/api/admin/messages/:id', isAdmin, (req, res) => {
-    const id = parseInt(req.params.id);
-    const { active } = req.body;
-    let messages = readJSON(MESSAGES_FILE, []);
-    const idx = messages.findIndex(m => m.id === id);
-    if (idx !== -1) { messages[idx].active = active; writeJSON(MESSAGES_FILE, messages); cacheVersion = Date.now(); }
-    res.json({ success: true });
-});
-app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
-    const id = parseInt(req.params.id);
-    let messages = readJSON(MESSAGES_FILE, []);
-    messages = messages.filter(m => m.id !== id);
-    writeJSON(MESSAGES_FILE, messages);
-    cacheVersion = Date.now();
-    res.json({ success: true });
-});
-app.post('/api/admin/instant-message', isAdmin, (req, res) => {
-    const { content, type } = req.body;
-    const messages = readJSON(MESSAGES_FILE, []);
-    messages.push({ id: Date.now(), title: 'Instant Announcement', content, type: type || 'banner', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 86400000).toISOString(), active: true, isInstant: true, createdAt: new Date().toISOString() });
-    writeJSON(MESSAGES_FILE, messages);
-    cacheVersion = Date.now();
-    res.json({ success: true });
-});
-app.post('/api/admin/popups', isAdmin, (req, res) => {
-    const { question, options, triggerType, delaySeconds, whatsappCollect } = req.body;
-    const popups = readJSON(POPUPS_FILE, []);
-    popups.push({ id: Date.now(), question, options: options || [], triggerType: triggerType || 'onload', delaySeconds: delaySeconds || 0, whatsappCollect: whatsappCollect || false, active: true, startDate: new Date().toISOString(), endDate: null, createdAt: new Date().toISOString() });
-    writeJSON(POPUPS_FILE, popups);
-    cacheVersion = Date.now();
-    res.json({ success: true });
-});
+app.post('/api/admin/messages', isAdmin, (req, res) => { const { title, content, type, startDate, endDate, isActive } = req.body; const messages = readJSON(MESSAGES_FILE, []); messages.push({ id: Date.now(), title, content, type: type || 'banner', startDate: new Date(startDate).toISOString(), endDate: endDate ? new Date(endDate).toISOString() : null, active: isActive === true || isActive === 'true', createdAt: new Date().toISOString() }); writeJSON(MESSAGES_FILE, messages); cacheVersion = Date.now(); res.json({ success: true }); });
+app.put('/api/admin/messages/:id', isAdmin, (req, res) => { const id = parseInt(req.params.id); const { active } = req.body; let messages = readJSON(MESSAGES_FILE, []); const idx = messages.findIndex(m => m.id === id); if (idx !== -1) { messages[idx].active = active; writeJSON(MESSAGES_FILE, messages); cacheVersion = Date.now(); } res.json({ success: true }); });
+app.delete('/api/admin/messages/:id', isAdmin, (req, res) => { const id = parseInt(req.params.id); let messages = readJSON(MESSAGES_FILE, []); messages = messages.filter(m => m.id !== id); writeJSON(MESSAGES_FILE, messages); cacheVersion = Date.now(); res.json({ success: true }); });
+app.post('/api/admin/instant-message', isAdmin, (req, res) => { const { content, type } = req.body; const messages = readJSON(MESSAGES_FILE, []); messages.push({ id: Date.now(), title: 'Instant Announcement', content, type: type || 'banner', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 86400000).toISOString(), active: true, isInstant: true, createdAt: new Date().toISOString() }); writeJSON(MESSAGES_FILE, messages); cacheVersion = Date.now(); res.json({ success: true }); });
+app.post('/api/admin/popups', isAdmin, (req, res) => { const { question, options, triggerType, delaySeconds, whatsappCollect } = req.body; const popups = readJSON(POPUPS_FILE, []); popups.push({ id: Date.now(), question, options: options || [], triggerType: triggerType || 'onload', delaySeconds: delaySeconds || 0, whatsappCollect: whatsappCollect || false, active: true, startDate: new Date().toISOString(), endDate: null, createdAt: new Date().toISOString() }); writeJSON(POPUPS_FILE, popups); cacheVersion = Date.now(); res.json({ success: true }); });
 app.get('/api/admin/popups', isAdmin, (req, res) => { res.json(readJSON(POPUPS_FILE, [])); });
-app.delete('/api/admin/popups/:id', isAdmin, (req, res) => {
-    const id = parseInt(req.params.id);
-    let popups = readJSON(POPUPS_FILE, []);
-    popups = popups.filter(p => p.id !== id);
-    writeJSON(POPUPS_FILE, popups);
-    cacheVersion = Date.now();
-    res.json({ success: true });
-});
+app.delete('/api/admin/popups/:id', isAdmin, (req, res) => { const id = parseInt(req.params.id); let popups = readJSON(POPUPS_FILE, []); popups = popups.filter(p => p.id !== id); writeJSON(POPUPS_FILE, popups); cacheVersion = Date.now(); res.json({ success: true }); });
 app.get('/api/banner', (req, res) => { res.json(readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null })); });
 app.get('/api/admin/banner', isAdmin, (req, res) => { res.json(readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null })); });
-app.post('/api/admin/banner', isAdmin, (req, res) => {
-    const { enabled, text, startDate, endDate } = req.body;
-    writeJSON(BANNER_FILE, { enabled, text, startDate: startDate || null, endDate: endDate || null });
-    cacheVersion = Date.now();
-    res.json({ success: true });
-});
+app.post('/api/admin/banner', isAdmin, (req, res) => { const { enabled, text, startDate, endDate } = req.body; writeJSON(BANNER_FILE, { enabled, text, startDate: startDate || null, endDate: endDate || null }); cacheVersion = Date.now(); res.json({ success: true }); });
 app.get('/api/admin/whatsapp', isAdmin, (req, res) => { res.json(readJSON(WHATSAPP_FILE, { enabled: false, phone: '', message: '' })); });
-app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
-    const { enabled, phone, message } = req.body;
-    writeJSON(WHATSAPP_FILE, { enabled, phone, message });
-    cacheVersion = Date.now();
-    res.json({ success: true });
-});
+app.post('/api/admin/whatsapp', isAdmin, (req, res) => { const { enabled, phone, message } = req.body; writeJSON(WHATSAPP_FILE, { enabled, phone, message }); cacheVersion = Date.now(); res.json({ success: true }); });
 app.post('/api/admin/clear-logs', isAdmin, (req, res) => { writeJSON(ACTIVITY_FILE, []); res.json({ success: true }); });
 
 // ========== HEALTH CHECK ==========
@@ -825,7 +614,6 @@ app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().
 
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📁 Uploads directory: ${path.resolve(UPLOAD_DIR)}`);
+    console.log(`📁 Persistent data directory: ${DATA_DIR}`);
     console.log(`💳 Paynecta configured: ${PAYNECTA_API_KEY ? 'YES' : 'NO'}`);
-    console.log(`🔗 Paynecta API URL: ${PAYNECTA_API_URL}`);
 });
