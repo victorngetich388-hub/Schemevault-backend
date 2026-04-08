@@ -745,7 +745,7 @@ app.post('/api/initiate-payment', async (req, res) => {
     pendingPayments.set(transactionId, {
         productId: parseInt(productId), productTitle: product.title, productGrade: product.grade,
         productTerm: product.term, fileUrl: product.fileUrl, amount: parseInt(amount),
-        phone: cleanPhone, status: 'pending', timestamp: Date.now()
+        phone: cleanPhone, status: 'pending', timestamp: Date.now(), paynectaRef: null
     });
     if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
         setTimeout(() => {
@@ -772,9 +772,9 @@ app.post('/api/initiate-payment', async (req, res) => {
             timeout: 30000
         });
         if (response.data?.success === true) {
-            const paynectaRef = response.data.data?.transaction_reference || transactionId;
+            const paynectaRef = response.data.data?.transaction_reference;
             const payment = pendingPayments.get(transactionId);
-            if (payment) payment.paynectaRef = paynectaRef;
+            if (payment && paynectaRef) payment.paynectaRef = paynectaRef;
             res.json({ success: true, transactionId });
         } else {
             res.status(400).json({ success: false, error: response.data?.message || 'Payment initiation failed' });
@@ -800,7 +800,7 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
     }
     if (pending) {
         const paynectaData = await queryPaynectaStatus(pending.paynectaRef || transactionId);
-        if (paynectaData && (paynectaData.status === 'completed' || paynectaData.result_code === 0)) {
+        if (paynectaData && paynectaData.status === 'completed' && paynectaData.result_code === 0) {
             pending.status = 'success';
             const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
             verifiedPayments.set(verifyToken, { ...pending, transactionId, expires: Date.now() + 300000 });
@@ -832,9 +832,15 @@ app.post('/api/request-download', (req, res) => {
     if (!verified || verified.expires < Date.now()) return res.status(403).json({ error: 'Invalid or expired verification token' });
     if (verified.productId !== parseInt(productId)) return res.status(403).json({ error: 'Product mismatch' });
     const downloadToken = Math.random().toString(36).substring(2, 20) + Date.now().toString(36);
+    const fileExt = path.extname(verified.fileUrl).toLowerCase();
+    let filename = `${verified.productTitle}_${verified.productGrade}_Term${verified.productTerm}`;
+    if (fileExt === '.pdf') filename += '.pdf';
+    else if (fileExt === '.doc') filename += '.doc';
+    else if (fileExt === '.docx') filename += '.docx';
+    else filename += '.pdf';
     downloadTokens.set(downloadToken, {
         productId: verified.productId, fileUrl: verified.fileUrl,
-        filename: `${verified.productTitle}_${verified.productGrade}_Term${verified.productTerm}.pdf`,
+        filename: filename,
         expires: Date.now() + 120000
     });
     verifiedPayments.delete(verificationToken);
@@ -851,10 +857,8 @@ app.get('/api/download/:token', async (req, res) => {
         if (fileExt === '.pdf') contentType = 'application/pdf';
         else if (fileExt === '.doc') contentType = 'application/msword';
         else if (fileExt === '.docx') contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-        
         res.setHeader('Content-Disposition', `attachment; filename="${record.filename}"`);
         res.setHeader('Content-Type', contentType);
-        
         if (record.fileUrl.startsWith('http')) {
             const response = await axios({ method: 'GET', url: record.fileUrl, responseType: 'stream' });
             response.data.pipe(res);
