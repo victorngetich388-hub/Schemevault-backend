@@ -147,6 +147,7 @@ const transporter = nodemailer.createTransport({
 });
 
 // ========== PAYNECTA CONFIG ==========
+// IMPORTANT: No trailing slash in the base URL
 const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
@@ -404,9 +405,9 @@ app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req,
     }
 });
 
-// ========== PAYMENT ENDPOINTS (WITH DIRECT PAYNECTA STATUS API) ==========
+// ========== PAYMENT ENDPOINTS (FIXED) ==========
 
-// Helper to query Paynecta status
+// Helper to query Paynecta status using transaction_reference
 async function queryPaynectaStatus(transactionReference) {
     if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL) {
         console.log('Paynecta credentials missing – cannot query status');
@@ -414,8 +415,7 @@ async function queryPaynectaStatus(transactionReference) {
     }
     try {
         const url = `${PAYNECTA_API_URL}/payment/status?transaction_reference=${encodeURIComponent(transactionReference)}`;
-        console.log(`Querying Paynecta: ${url}`);
-        
+        console.log(`Querying Paynecta status: ${url}`);
         const response = await axios.get(url, {
             headers: {
                 'X-API-Key': PAYNECTA_API_KEY,
@@ -423,42 +423,45 @@ async function queryPaynectaStatus(transactionReference) {
             },
             timeout: 10000
         });
-        
         if (response.data && response.data.success === true && response.data.data) {
             return response.data.data;
         }
         return null;
     } catch (err) {
-        console.error('Paynecta status query error:', err.response?.data || err.message);
+        console.error('Paynecta status query error:', err.response?.status, err.response?.data || err.message);
         return null;
     }
 }
 
+// Initiate STK Push
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
-    if (!phone || !amount || !productId) return res.status(400).json({ success: false, error: 'Missing fields' });
-    
+    if (!phone || !amount || !productId) {
+        return res.status(400).json({ success: false, error: 'Missing fields' });
+    }
+
+    // Format phone number to 254XXXXXXXXX
     let cleanPhone = phone.replace(/\s/g, '');
     if (cleanPhone.startsWith('0')) cleanPhone = '254' + cleanPhone.substring(1);
     else if (cleanPhone.startsWith('+')) cleanPhone = cleanPhone.substring(1);
-    
+
     const transactionId = 'TXN_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     const products = readJSON(PRODUCTS_FILE, []);
     const product = products.find(p => p.id === parseInt(productId));
     if (!product) return res.status(400).json({ success: false, error: 'Product not found' });
-    
+
     pendingPayments.set(transactionId, {
         productId: parseInt(productId), productTitle: product.title, productGrade: product.grade,
         productTerm: product.term, fileUrl: product.fileUrl, amount: parseInt(amount),
         phone: cleanPhone, status: 'pending', timestamp: Date.now()
     });
-    
+
     const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
     if (!stats.payments) stats.payments = [];
     stats.payments.push({ date: new Date().toISOString(), status: 'pending', amount: parseInt(amount), phone: cleanPhone, productId: parseInt(productId), transactionId });
     writeJSON(STATS_FILE, stats);
-    
-    // If no Paynecta credentials, use demo mode (auto-confirm after 10 seconds for testing)
+
+    // If Paynecta credentials missing, use demo mode (auto-confirm after 10 seconds)
     if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
         console.log('Demo mode: auto-confirming payment in 10 seconds');
         setTimeout(() => {
@@ -477,33 +480,62 @@ app.post('/api/initiate-payment', async (req, res) => {
         }, 10000);
         return res.json({ success: true, transactionId, demoMode: true });
     }
-    
-    // Real Paynecta
+
+    // Real Paynecta STK Push
     try {
-        const response = await axios.post(`${PAYNECTA_API_URL}/payment/initialize`, {
-            code: PAYNECTA_PAYMENT_CODE, mobile_number: cleanPhone, amount: parseInt(amount)
+        const initUrl = `${PAYNECTA_API_URL}/payment/initialize`;
+        console.log(`Initiating STK Push to: ${initUrl}`);
+        const response = await axios.post(initUrl, {
+            code: PAYNECTA_PAYMENT_CODE,
+            mobile_number: cleanPhone,
+            amount: parseInt(amount)
         }, {
-            headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL, 'Content-Type': 'application/json' },
+            headers: {
+                'X-API-Key': PAYNECTA_API_KEY,
+                'X-User-Email': PAYNECTA_EMAIL,
+                'Content-Type': 'application/json'
+            },
             timeout: 30000
         });
-        if (response.data?.success) {
+
+        console.log('Paynecta init response:', response.data);
+
+        if (response.data && response.data.success === true) {
+            // Store the checkout_request_id or transaction_reference if provided
+            const paynectaRef = response.data.data?.transaction_reference || response.data.data?.checkout_request_id;
+            if (paynectaRef) {
+                const payment = pendingPayments.get(transactionId);
+                if (payment) payment.paynectaRef = paynectaRef;
+            }
             res.json({ success: true, transactionId });
         } else {
-            res.status(400).json({ success: false, error: response.data?.message || 'Payment initiation failed' });
+            const errorMsg = response.data?.message || 'Payment initiation failed';
+            console.error('Paynecta init error:', errorMsg);
+            res.status(400).json({ success: false, error: errorMsg });
         }
     } catch (error) {
-        console.error('Paynecta error:', error.response?.data || error.message);
-        res.status(500).json({ success: false, error: error.message });
+        console.error('Paynecta request error:', error.response?.data || error.message);
+        let errorMsg = 'Payment service error. ';
+        if (error.response?.status === 405) {
+            errorMsg += 'HTTP 405: Wrong endpoint or method. Check PAYNECTA_API_URL.';
+        } else if (error.response?.status === 401) {
+            errorMsg += 'Invalid API key or email.';
+        } else if (error.response?.status === 404) {
+            errorMsg += 'API endpoint not found. Check PAYNECTA_API_URL.';
+        } else {
+            errorMsg += error.message;
+        }
+        res.status(500).json({ success: false, error: errorMsg });
     }
 });
 
-// Payment status endpoint - NOW WITH DIRECT PAYNECTA API QUERY
+// Payment status endpoint - queries Paynecta directly
 app.get('/api/payment-status/:transactionId', async (req, res) => {
     const { transactionId } = req.params;
     console.log(`Checking status for ${transactionId}`);
-    
+
     const pending = pendingPayments.get(transactionId);
-    
+
     // If already marked success in memory
     if (pending && pending.status === 'success') {
         const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
@@ -516,28 +548,26 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
         pendingPayments.delete(transactionId);
         return res.json({ status: 'success', verified: true, token: verifyToken });
     }
-    
-    // If failed
+
     if (pending && pending.status === 'failed') {
         pendingPayments.delete(transactionId);
         return res.json({ status: 'failed', verified: false });
     }
-    
-    // If still pending, query Paynecta directly
+
+    // If still pending, query Paynecta
     if (pending) {
         try {
-            const paynectaData = await queryPaynectaStatus(transactionId);
+            // Use the transactionId as the transaction_reference (Paynecta expects the reference from init)
+            const paynectaRef = pending.paynectaRef || transactionId;
+            const paynectaData = await queryPaynectaStatus(paynectaRef);
             if (paynectaData && paynectaData.status === 'completed' && paynectaData.result_code === 0) {
-                // Payment successful!
                 console.log(`✅ Paynecta confirms payment for ${transactionId}`);
                 pending.status = 'success';
-                
-                // Also update stats file
+                // Update stats
                 const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
                 const paymentIndex = stats.payments.findIndex(p => p.transactionId === transactionId);
                 if (paymentIndex !== -1) stats.payments[paymentIndex].status = 'success';
                 writeJSON(STATS_FILE, stats);
-                
                 const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
                 verifiedPayments.set(verifyToken, {
                     productId: pending.productId, productTitle: pending.productTitle,
@@ -559,23 +589,23 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
             return res.json({ status: 'pending', verified: false });
         }
     }
-    
+
     // Check already verified (for completed payments that were confirmed earlier)
     for (const [token, data] of verifiedPayments.entries()) {
         if (data.transactionId === transactionId && data.expires > Date.now()) {
             return res.json({ status: 'success', verified: true, token });
         }
     }
-    
     res.json({ status: 'not_found', verified: false });
 });
 
+// Webhook endpoint (kept for compatibility, but not required)
 app.post('/api/payment-webhook', (req, res) => {
-    // Keep webhook endpoint for future use, but not required anymore
     console.log('Webhook received (optional):', req.body);
     res.sendStatus(200);
 });
 
+// Request download token after successful payment
 app.post('/api/request-download', (req, res) => {
     const { verificationToken, productId } = req.body;
     const verified = verifiedPayments.get(verificationToken);
@@ -596,6 +626,7 @@ app.post('/api/request-download', (req, res) => {
     res.json({ success: true, token: downloadToken });
 });
 
+// Download PDF
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
     const record = downloadTokens.get(token);
@@ -626,6 +657,7 @@ app.get('/api/download/:token', async (req, res) => {
     }
 });
 
+// Admin force confirm (for testing)
 app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
     const { transactionId, productId } = req.body;
     const products = readJSON(PRODUCTS_FILE, []);
@@ -640,7 +672,7 @@ app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
     res.json({ success: true, token: verifyToken });
 });
 
-// ========== PUBLIC ENDPOINTS (unchanged, but include for completeness) ==========
+// ========== PUBLIC ENDPOINTS (shortened for brevity, but all are present) ==========
 app.get('/api/messages', (req, res) => {
     const messages = readJSON(MESSAGES_FILE, []);
     const now = new Date();
@@ -752,4 +784,5 @@ app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`📁 Uploads directory: ${path.resolve(UPLOAD_DIR)}`);
     console.log(`💳 Paynecta configured: ${PAYNECTA_API_KEY ? 'YES' : 'NO'}`);
+    console.log(`🔗 Paynecta API URL: ${PAYNECTA_API_URL}`);
 });
