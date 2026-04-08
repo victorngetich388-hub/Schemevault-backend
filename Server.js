@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -17,312 +16,970 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ------------------------------
+// Environment Variables (Paynecta)
+// ------------------------------
+const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://api.paynecta.co.ke';
+const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
+const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
+const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE;
+
+// ------------------------------
 // Local Storage for Uploads
 // ------------------------------
 const UPLOAD_DIR = 'uploads';
 const COVERS_DIR = 'covers';
-[UPLOAD_DIR, COVERS_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR);
 app.use('/uploads', express.static(UPLOAD_DIR));
 app.use('/covers', express.static(COVERS_DIR));
 
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, file.fieldname === 'coverImage' ? COVERS_DIR : UPLOAD_DIR),
-    filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/\s/g, '_')}`)
+    destination: (req, file, cb) => {
+        if (file.fieldname === 'coverImage') cb(null, COVERS_DIR);
+        else cb(null, UPLOAD_DIR);
+    },
+    filename: (req, file, cb) => {
+        const uniqueName = Date.now() + '-' + file.originalname.replace(/\s/g, '_');
+        cb(null, uniqueName);
+    }
 });
 const upload = multer({ storage });
 
 // ------------------------------
 // Data Files (JSON)
 // ------------------------------
-const FILES = { PRODUCTS: 'products.json', STATS: 'stats.json', MESSAGES: 'messages.json', ACTIVITY: 'activity.json', CLIENTS: 'clients.json', FEEDBACK: 'feedback.json', TERM_SETTINGS: 'term_settings.json', BANNER: 'banner.json', WHATSAPP: 'whatsapp.json', POPUPS: 'popups.json', LEARNING_AREAS: 'learning_areas.json', GRADES: 'grades.json' };
+const PRODUCTS_FILE = 'products.json';
+const STATS_FILE = 'stats.json';
+const MESSAGES_FILE = 'messages.json';
+const ACTIVITY_FILE = 'activity.json';
+const CLIENTS_FILE = 'clients.json';
+const FEEDBACK_FILE = 'feedback.json';
+const TERM_SETTINGS_FILE = 'term_settings.json';
+const BANNER_FILE = 'banner.json';
+const WHATSAPP_FILE = 'whatsapp.json';
+const POPUPS_FILE = 'popups.json';
+const LEARNING_AREAS_FILE = 'learning_areas.json';
+const GRADES_FILE = 'grades.json';
 
-const readJSON = (file, def = []) => {
-    try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : (fs.writeFileSync(file, JSON.stringify(def, null, 2)), def); }
-    catch (e) { console.error(`Read error ${file}:`, e); return def; }
+const readJSON = (file, defaultVal = []) => {
+    if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(defaultVal));
+    return JSON.parse(fs.readFileSync(file));
 };
-const writeJSON = (file, data) => { try { fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8'); return true; } catch (e) { console.error(`Write error ${file}:`, e); return false; } };
-const getClientIp = (req) => req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+const writeJSON = (file, data) => fs.writeFileSync(file, JSON.stringify(data, null, 2));
+
+function getClientIp(req) {
+    return req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+}
+
+function getStorageUsage() {
+    const getSize = (dir) => {
+        let size = 0;
+        if (fs.existsSync(dir)) {
+            const files = fs.readdirSync(dir);
+            for (const file of files) {
+                const filePath = path.join(dir, file);
+                const stat = fs.statSync(filePath);
+                if (stat.isFile()) size += stat.size;
+                else if (stat.isDirectory()) size += getSize(filePath);
+            }
+        }
+        return size;
+    };
+    const uploadsSize = getSize(UPLOAD_DIR);
+    const coversSize = getSize(COVERS_DIR);
+    const totalMB = ((uploadsSize + coversSize) / (1024 * 1024)).toFixed(2);
+    return { usedMB: totalMB, usedBytes: uploadsSize + coversSize };
+}
 
 // ------------------------------
-// Memory State (INSTANT ACCESS)
+// Default Data
 // ------------------------------
-const activePayments = new Map(); // Stores our internal TXN ID -> Status
-const verifiedPayments = new Map(); // Stores verification tokensconst downloadTokens = new Map();
+const defaultLearningAreas = [
+    { id: 1, name: "Mathematics", active: true, order: 1 },
+    { id: 2, name: "English", active: true, order: 2 },
+    { id: 3, name: "Kiswahili", active: true, order: 3 },
+    { id: 4, name: "Creative Arts", active: true, order: 4 },
+    { id: 5, name: "Social Studies", active: true, order: 5 },
+    { id: 6, name: "Integrated Science", active: true, order: 6 },
+    { id: 7, name: "Pre-technical Studies", active: true, order: 7 },
+    { id: 8, name: "Agriculture", active: true, order: 8 }
+];
+
+const defaultGrades = [
+    { id: 1, name: "Grade 1", active: true, order: 1 },
+    { id: 2, name: "Grade 2", active: true, order: 2 },
+    { id: 3, name: "Grade 3", active: true, order: 3 },
+    { id: 4, name: "Grade 4", active: true, order: 4 },
+    { id: 5, name: "Grade 5", active: true, order: 5 },
+    { id: 6, name: "Grade 6", active: true, order: 6 },
+    { id: 7, name: "Grade 7", active: true, order: 7 },
+    { id: 8, name: "Grade 8", active: true, order: 8 },
+    { id: 9, name: "Grade 9", active: true, order: 9 }
+];
+
+// ------------------------------
+// Active Users Tracking
+// ------------------------------
 const activeSessions = new Map();
-let cacheVersion = Date.now();
-
-// Cleanup old data every 30s
 setInterval(() => {
     const now = Date.now();
-    for (const [id, d] of activeSessions.entries()) if (now - d.lastSeen > 60000) activeSessions.delete(id);
-    // Keep pending/active payments for 10 mins, then delete
-    for (const [id, d] of activePayments.entries()) if (now - d.created > 600000) activePayments.delete(id);
+    for (const [sessionId, data] of activeSessions.entries()) {
+        if (now - data.lastSeen > 60000) activeSessions.delete(sessionId);
+    }
 }, 30000);
 
-const defaultLearningAreas = [{ id: 1, name: "Mathematics", active: true }, { id: 2, name: "English", active: true }, { id: 3, name: "Kiswahili", active: true }, { id: 4, name: "Creative Arts", active: true }, { id: 5, name: "Social Studies", active: true }, { id: 6, name: "Integrated Science", active: true }, { id: 7, name: "Pre-technical Studies", active: true }, { id: 8, name: "Agriculture", active: true }];
-const defaultGrades = Array.from({ length: 9 }, (_, i) => ({ id: i + 1, name: `Grade ${i + 1}`, active: true }));
+let cacheVersion = Date.now();
+
+// Payment storage
+const pendingPayments = new Map(); // transactionId -> { productId, amount, phone, status, timestamp }
+const verifiedPayments = new Map(); // token -> { productId, transactionId, amount, expires }
+const downloadTokens = new Map();   // token -> { productId, expires }
 
 // ------------------------------
-// Admin Auth
+// Admin Authentication
 // ------------------------------
 const ADMIN_PASSWORD = '0726019859';
 const RECOVERY_EMAIL = 'victorngetich388@gmail.com';
 let resetCodes = {};
-const transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: process.env.EMAIL_USER || RECOVERY_EMAIL, pass: process.env.EMAIL_PASS } });
+
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER || RECOVERY_EMAIL,
+        pass: process.env.EMAIL_PASS,
+    },
+});
 
 app.post('/api/admin/login', (req, res) => {
-    if (req.body.password === ADMIN_PASSWORD) res.json({ success: true, token: Buffer.from(Date.now().toString()).toString('base64') });
-    else res.status(401).json({ success: false, error: 'Wrong password' });
+    const { password } = req.body;
+    if (password === ADMIN_PASSWORD) {
+        const token = Buffer.from(Date.now().toString()).toString('base64');
+        res.json({ success: true, token });
+    } else {
+        res.status(401).json({ success: false, error: 'Wrong password' });
+    }
 });
-const isAdmin = (req, res, next) => req.headers['x-admin-token'] ? next() : res.status(401).json({ error: 'Unauthorized' });
-app.get('/api/cache-version', (req, res) => res.json({ version: cacheVersion }));
-app.post('/api/admin/clear-cache', isAdmin, (req, res) => { cacheVersion = Date.now(); res.json({ success: true, version: cacheVersion }); });
 
-// 👥 Active Users
+function isAdmin(req, res, next) {
+    const token = req.headers['x-admin-token'];
+    if (token) return next();
+    res.status(401).json({ error: 'Unauthorized' });
+}
+
+app.post('/api/admin/forgot-password', async (req, res) => {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    resetCodes[code] = Date.now() + 3600000;
+    try {
+        await transporter.sendMail({
+            from: `"SchemeVault Admin" <${RECOVERY_EMAIL}>`,
+            to: RECOVERY_EMAIL,
+            subject: 'Admin Password Reset Code',
+            text: `Your reset code is: ${code}\nIt expires in 1 hour.`,
+        });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to send email' });
+    }
+});
+
+app.post('/api/admin/reset-password', (req, res) => {
+    const { code, newPassword } = req.body;
+    if (!resetCodes[code] || resetCodes[code] < Date.now()) {
+        return res.status(400).json({ error: 'Invalid code' });
+    }
+    delete resetCodes[code];
+    res.json({ success: true, message: 'Password reset. Update your code manually.' });
+});
+
+app.post('/api/admin/change-password', isAdmin, (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    if (currentPassword !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Current password incorrect' });
+    res.json({ success: true, message: 'Change requested. Update Render environment variable.' });
+});
+
+app.get('/api/cache-version', (req, res) => {
+    res.json({ version: cacheVersion });
+});
+
+app.post('/api/admin/clear-cache', isAdmin, (req, res) => {
+    cacheVersion = Date.now();
+    res.json({ success: true, version: cacheVersion });
+});
+
+// ------------------------------
+// Active Users Endpoints
+// ------------------------------
 app.post('/api/heartbeat', (req, res) => {
-    if (!req.body.sessionId) return res.status(400).json({ error: 'sessionId required' });
-    activeSessions.set(req.body.sessionId, { ip: getClientIp(req), ua: req.headers['user-agent'], lastSeen: Date.now(), firstSeen: activeSessions.get(req.body.sessionId)?.firstSeen || Date.now() });
+    const { sessionId } = req.body;
+    const ip = getClientIp(req);
+    const userAgent = req.headers['user-agent'];
+    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    activeSessions.set(sessionId, { ip, userAgent, lastSeen: Date.now(), firstSeen: activeSessions.has(sessionId) ? activeSessions.get(sessionId).firstSeen : Date.now() });
     res.json({ success: true, activeCount: activeSessions.size });
 });
+
 app.get('/api/admin/active-users', isAdmin, (req, res) => {
-    const now = Date.now(); const list = [];
-    for (const [id, d] of activeSessions.entries()) if (now - d.lastSeen <= 60000) list.push({ id: id.slice(0, 8), ip: d.ip, lastSeen: d.lastSeen, dur: Math.floor((now - d.firstSeen) / 1000) });
-    res.json({ activeCount: list.length, activeUsers: list });
+    const now = Date.now();
+    let active = 0;
+    const activeList = [];
+    for (const [sessionId, data] of activeSessions.entries()) {
+        if (now - data.lastSeen <= 60000) {
+            active++;
+            activeList.push({ sessionId: sessionId.substring(0, 8), ip: data.ip, lastSeen: data.lastSeen, activeSeconds: Math.floor((now - data.lastSeen) / 1000), duration: Math.floor((now - data.firstSeen) / 1000) });
+        }
+    }
+    res.json({ activeCount: active, activeUsers: activeList, lastUpdated: new Date().toISOString() });
 });
-app.post('/api/leave', (req, res) => { if (req.body.sessionId) activeSessions.delete(req.body.sessionId); res.json({ success: true }); });
 
-// 📚 CRUD Generators
-const setupCRUD = (file, defs, ep) => {
-    app.get(`/api/${ep}`, (req, res) => { let i = readJSON(file, []); if (!i.length) { i = defs; writeJSON(file, i); } res.json(i.filter(x => x.active !== false)); });
-    app.get(`/api/admin/${ep}`, isAdmin, (req, res) => { let i = readJSON(file, []); if (!i.length) { i = defs; writeJSON(file, i); } res.json(i); });
-    app.post(`/api/admin/${ep}`, isAdmin, (req, res) => {
-        if (!req.body.name) return res.status(400).json({ error: 'Name required' });        let items = readJSON(file, []); items.push({ id: items.length ? Math.max(...items.map(x => x.id)) + 1 : 1, name: req.body.name, active: req.body.active !== false }); writeJSON(file, items); cacheVersion = Date.now(); res.json({ success: true, item: items[items.length - 1] });
-    });
-    app.put(`/api/admin/${ep}/:id`, isAdmin, (req, res) => {
-        const id = parseInt(req.params.id); let items = readJSON(file, []); const idx = items.findIndex(x => x.id === id); if (idx === -1) return res.status(404).json({ error: 'Not found' });
-        if (req.body.name !== undefined) items[idx].name = req.body.name; if (req.body.active !== undefined) items[idx].active = req.body.active; writeJSON(file, items); cacheVersion = Date.now(); res.json({ success: true, item: items[idx] });
-    });
-    app.delete(`/api/admin/${ep}/:id`, isAdmin, (req, res) => { let items = readJSON(file, []).filter(x => x.id !== parseInt(req.params.id)); writeJSON(file, items); cacheVersion = Date.now(); res.json({ success: true }); });
-};
-setupCRUD(FILES.LEARNING_AREAS, defaultLearningAreas, 'learning-areas');
-setupCRUD(FILES.GRADES, defaultGrades, 'grades');
+app.post('/api/leave', (req, res) => {
+    const { sessionId } = req.body;
+    if (sessionId && activeSessions.has(sessionId)) activeSessions.delete(sessionId);
+    res.json({ success: true });
+});
 
-// 📅 Term Settings
-app.get('/api/term-settings', (req, res) => res.json(readJSON(FILES.TERM_SETTINGS, { term1: true, term2: true, term3: true })));
-app.get('/api/admin/term-settings', isAdmin, (req, res) => res.json(readJSON(FILES.TERM_SETTINGS, { term1: true, term2: true, term3: true })));
-app.put('/api/admin/term-settings', isAdmin, (req, res) => { writeJSON(FILES.TERM_SETTINGS, req.body); cacheVersion = Date.now(); res.json({ success: true }); });
+// ------------------------------
+// Learning Areas Management
+// ------------------------------
+app.get('/api/admin/learning-areas', isAdmin, (req, res) => {
+    let areas = readJSON(LEARNING_AREAS_FILE, []);
+    if (areas.length === 0) { areas = defaultLearningAreas; writeJSON(LEARNING_AREAS_FILE, areas); }
+    res.json(areas);
+});
+app.get('/api/learning-areas', (req, res) => {
+    let areas = readJSON(LEARNING_AREAS_FILE, []);
+    if (areas.length === 0) { areas = defaultLearningAreas; writeJSON(LEARNING_AREAS_FILE, areas); }
+    res.json(areas.filter(area => area.active === true));
+});
+app.post('/api/admin/learning-areas', isAdmin, (req, res) => {
+    const { name, active } = req.body;
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    let areas = readJSON(LEARNING_AREAS_FILE, []);
+    const newId = areas.length ? Math.max(...areas.map(a => a.id)) + 1 : 1;
+    const newArea = { id: newId, name, active: active === true || active === 'true', order: areas.length + 1 };
+    areas.push(newArea);
+    writeJSON(LEARNING_AREAS_FILE, areas);
+    cacheVersion = Date.now();
+    res.json({ success: true, area: newArea });
+});
+app.put('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const { name, active } = req.body;
+    let areas = readJSON(LEARNING_AREAS_FILE, []);
+    const index = areas.findIndex(a => a.id === id);
+    if (index === -1) return res.status(404).json({ error: 'Not found' });
+    if (name !== undefined) areas[index].name = name;
+    if (active !== undefined) areas[index].active = active === true || active === 'true';
+    writeJSON(LEARNING_AREAS_FILE, areas);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+app.delete('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let areas = readJSON(LEARNING_AREAS_FILE, []);
+    areas = areas.filter(a => a.id !== id);
+    writeJSON(LEARNING_AREAS_FILE, areas);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
 
-// 📦 Products
-app.get('/api/products', (req, res) => res.json(readJSON(FILES.PRODUCTS, []).filter(p => p.visible !== false)));
-app.get('/api/admin/products', isAdmin, (req, res) => res.json(readJSON(FILES.PRODUCTS, [])));
+// ------------------------------
+// Grades Management
+// ------------------------------
+app.get('/api/admin/grades', isAdmin, (req, res) => {
+    let grades = readJSON(GRADES_FILE, []);
+    if (grades.length === 0) { grades = defaultGrades; writeJSON(GRADES_FILE, grades); }
+    res.json(grades);
+});
+app.get('/api/grades', (req, res) => {
+    let grades = readJSON(GRADES_FILE, []);
+    if (grades.length === 0) { grades = defaultGrades; writeJSON(GRADES_FILE, grades); }
+    res.json(grades.filter(grade => grade.active === true));
+});
+app.post('/api/admin/grades', isAdmin, (req, res) => {
+    const { name, active } = req.body;
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    let grades = readJSON(GRADES_FILE, []);
+    const newId = grades.length ? Math.max(...grades.map(g => g.id)) + 1 : 1;
+    const newGrade = { id: newId, name, active: active === true || active === 'true', order: grades.length + 1 };
+    grades.push(newGrade);
+    writeJSON(GRADES_FILE, grades);
+    cacheVersion = Date.now();
+    res.json({ success: true, grade: newGrade });
+});
+app.put('/api/admin/grades/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const { name, active } = req.body;
+    let grades = readJSON(GRADES_FILE, []);
+    const index = grades.findIndex(g => g.id === id);
+    if (index === -1) return res.status(404).json({ error: 'Not found' });
+    if (name !== undefined) grades[index].name = name;
+    if (active !== undefined) grades[index].active = active === true || active === 'true';
+    writeJSON(GRADES_FILE, grades);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+app.delete('/api/admin/grades/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let grades = readJSON(GRADES_FILE, []);
+    grades = grades.filter(g => g.id !== id);
+    writeJSON(GRADES_FILE, grades);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Term Settings
+// ------------------------------
+app.get('/api/admin/term-settings', isAdmin, (req, res) => {
+    res.json(readJSON(TERM_SETTINGS_FILE, { term1: true, term2: true, term3: true }));
+});
+app.put('/api/admin/term-settings', isAdmin, (req, res) => {
+    const settings = req.body;
+    writeJSON(TERM_SETTINGS_FILE, settings);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+app.get('/api/term-settings', (req, res) => {
+    res.json(readJSON(TERM_SETTINGS_FILE, { term1: true, term2: true, term3: true }));
+});
+
+// ------------------------------
+// Product Management
+// ------------------------------
+app.get('/api/admin/products', isAdmin, (req, res) => {
+    res.json(readJSON(PRODUCTS_FILE, []));
+});
+
+app.get('/api/products', (req, res) => {
+    const products = readJSON(PRODUCTS_FILE, []);
+    res.json(products.filter(p => p.visible !== false));
+});
+
 app.post('/api/admin/products', isAdmin, upload.fields([{ name: 'pdfFile' }, { name: 'coverImage' }]), (req, res) => {
     try {
         const { title, grade, term, subject, price, pages, visible } = req.body;
-        if (!title || !grade || !term || !subject || !price) return res.status(400).json({ error: 'Missing fields' });
-        const pdf = req.files?.pdfFile?.[0]; if (!pdf) return res.status(400).json({ error: 'PDF required' });
-        const cover = req.files?.coverImage?.[0];
-        const products = readJSON(FILES.PRODUCTS, []);
-        const newP = { id: products.length ? Math.max(...products.map(p => p.id)) + 1 : 1, title: title.trim(), grade: grade.trim(), term: parseInt(term), subject: subject.trim(), price: parseInt(price), pages: pages ? parseInt(pages) : null, fileUrl: `/uploads/${pdf.filename}`, coverUrl: cover ? `/covers/${cover.filename}` : null, visible: visible === 'true' || visible === true, createdAt: new Date().toISOString() };
-        products.push(newP); writeJSON(FILES.PRODUCTS, products); cacheVersion = Date.now(); res.json({ success: true, product: newP });
-    } catch (e) { res.status(500).json({ error: 'Upload failed: ' + e.message }); }
-});
-app.put('/api/admin/products/:id', isAdmin, (req, res) => {
-    const id = parseInt(req.params.id); let p = readJSON(FILES.PRODUCTS, []); const idx = p.findIndex(x => x.id === id); if (idx === -1) return res.status(404).json({ error: 'Not found' });
-    ['title','grade','term','subject','price','pages','visible'].forEach(k => { if (req.body[k] !== undefined) p[idx][k] = ['price','pages','term'].includes(k) ? parseInt(req.body[k]) : (k === 'visible' ? (req.body[k] === 'true' || req.body[k] === true) : req.body[k]); });
-    writeJSON(FILES.PRODUCTS, p); cacheVersion = Date.now(); res.json({ success: true, product: p[idx] });
-});
-app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
-    const id = parseInt(req.params.id); let p = readJSON(FILES.PRODUCTS, []); const prod = p.find(x => x.id === id);
-    if (prod?.fileUrl) { const f = path.join(UPLOAD_DIR, prod.fileUrl.split('/').pop()); if (fs.existsSync(f)) fs.unlinkSync(f); }
-    if (prod?.coverUrl) { const f = path.join(COVERS_DIR, prod.coverUrl.split('/').pop()); if (fs.existsSync(f)) fs.unlinkSync(f); }
-    p = p.filter(x => x.id !== id); writeJSON(FILES.PRODUCTS, p); cacheVersion = Date.now(); res.json({ success: true });
-});
+        if (!title || !grade || !term || !subject || !price) return res.status(400).json({ error: 'All fields required' });
+        const pdfFile = req.files['pdfFile'] ? req.files['pdfFile'][0] : null;
+        const coverFile = req.files['coverImage'] ? req.files['coverImage'][0] : null;
+        if (!pdfFile) return res.status(400).json({ error: 'PDF required' });
 
-// ------------------------------
-// 💳 PAYMENT & DOWNLOAD (FIXED ID MISMATCH)
-// ------------------------------
-app.post('/api/initiate-payment', async (req, res) => {
-    try {
-        const { phone, amount, productId } = req.body;
-        if (!phone || !amount || !productId) return res.status(400).json({ success: false, error: 'Missing fields' });
-        let cleanPhone = phone.replace(/\s/g, ''); if (cleanPhone.startsWith('0')) cleanPhone = '254' + cleanPhone.slice(1); else if (cleanPhone.startsWith('+')) cleanPhone = cleanPhone.slice(1);        
-        // Generate our own transaction ID
-        const txId = `TXN_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        const clientIp = getClientIp(req);
+        const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${pdfFile.filename}`;
+        const coverUrl = coverFile ? `${req.protocol}://${req.get('host')}/covers/${coverFile.filename}` : null;
 
-        // Register in memory as pending
-        activePayments.set(txId, { status: 'pending', productId: parseInt(productId) || 0, amount: parseInt(amount) || 0, phone: cleanPhone, created: Date.now() });
-
-        // Check if Paynecta is configured
-        const cfg = process.env.PAYNECTA_API_KEY && process.env.PAYNECTA_EMAIL && process.env.PAYNECTA_PAYMENT_CODE;
-        
-        if (!cfg) {
-            // 🔹 DEMO MODE: Auto-confirm in 2 seconds
-            console.log(`🧪 Demo Mode: Auto-confirming ${txId} in 2s`);
-            setTimeout(() => {
-                const p = activePayments.get(txId);
-                if (p && p.status === 'pending') {
-                    p.status = 'success';
-                    const vtok = `DEMO_${Date.now()}`;
-                    verifiedPayments.set(vtok, { productId: p.productId, transactionId: txId, amount: p.amount, expires: Date.now() + 300000 });
-                    console.log(`✅ Demo Success: ${txId}`);
-                    const stats = readJSON(FILES.STATS, { payments: [] });
-                    if (!stats.payments) stats.payments = [];
-                    stats.payments.push({ transactionId: txId, date: new Date().toISOString(), status: 'success', amount: p.amount, phone: p.phone, productId: p.productId, ip: clientIp });
-                    writeJSON(FILES.STATS, stats);
-                }
-            }, 2000);
-            return res.json({ success: true, transactionId: txId, demo: true });
-        }
-
-        // 🔹 PRODUCTION: Call Paynecta API
-        // ✅ FIX: Send our txId as 'reference' so Webhook can match it
-        const payload = {
-            code: process.env.PAYNECTA_PAYMENT_CODE,
-            mobile_number: cleanPhone,
-            amount: parseInt(amount),
-            reference: txId // <--- CRITICAL FIX
+        const products = readJSON(PRODUCTS_FILE, []);
+        const newId = products.length ? Math.max(...products.map(p => p.id)) + 1 : 1;
+        const newProduct = {
+            id: newId, title, grade, term: parseInt(term), subject,
+            price: parseInt(price), pages: pages ? parseInt(pages) : null,
+            fileUrl, coverUrl, visible: visible === 'true' || visible === true,
+            createdAt: new Date().toISOString(),
         };
-
-        console.log(`🌐 Paynecta Request: ${txId}`);
-        const r = await axios.post(`${process.env.PAYNECTA_API_URL}/api/v1/payment/initialize`, payload, {
-            headers: { 'X-API-Key': process.env.PAYNECTA_API_KEY, 'X-User-Email': process.env.PAYNECTA_EMAIL },
-            timeout: 30000
-        });
-
-        if (r.data?.success) {
-            console.log(`🌐 Paynecta Accepted: ${txId}`);
-            // Status remains 'pending' until Webhook confirms
-            res.json({ success: true, transactionId: txId });
-        } else {            activePayments.get(txId).status = 'failed';
-            console.log(`❌ Paynecta Failed: ${r.data?.message || 'Unknown'}`);
-            res.status(400).json({ success: false, error: r.data?.message || 'Failed' });
-        }
+        products.push(newProduct);
+        writeJSON(PRODUCTS_FILE, products);
+        cacheVersion = Date.now();
+        res.json({ success: true, product: newProduct });
     } catch (err) {
-        console.error('💥 Initiate Payment Error:', err.response?.data || err.message);
-        if (req.body.phone) {
-            const p = activePayments.get(req.body.phone); // Best effort fallback
-            if (p) p.status = 'failed';
-        }
-        res.status(500).json({ success: false, error: 'Payment service unavailable' });
+        console.error(err);
+        res.status(500).json({ error: 'Upload failed' });
     }
 });
 
-app.get('/api/payment-status/:transactionId', (req, res) => {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+app.put('/api/admin/products/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const updates = req.body;
+    let products = readJSON(PRODUCTS_FILE, []);
+    const index = products.findIndex(p => p.id === id);
+    if (index === -1) return res.status(404).json({ error: 'Not found' });
+    products[index] = { ...products[index], ...updates };
+    writeJSON(PRODUCTS_FILE, products);
+    cacheVersion = Date.now();
+    res.json({ success: true, product: products[index] });
+});
+
+app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let products = readJSON(PRODUCTS_FILE, []);
+    const product = products.find(p => p.id === id);
+    if (product) {
+        if (product.fileUrl) {
+            const filename = product.fileUrl.split('/').pop();
+            const fpath = path.join(UPLOAD_DIR, filename);
+            if (fs.existsSync(fpath)) fs.unlinkSync(fpath);
+        }
+        if (product.coverUrl) {
+            const filename = product.coverUrl.split('/').pop();
+            const fpath = path.join(COVERS_DIR, filename);
+            if (fs.existsSync(fpath)) fs.unlinkSync(fpath);
+        }
+    }
+    products = products.filter(p => p.id !== id);
+    writeJSON(PRODUCTS_FILE, products);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+
+// ------------------------------
+// BACKUP & RESTORE
+// ------------------------------
+app.get('/api/admin/backup', isAdmin, (req, res) => {
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    res.attachment('schemevault-backup.zip');
+    archive.pipe(res);
+
+    const jsonFiles = [PRODUCTS_FILE, STATS_FILE, MESSAGES_FILE, ACTIVITY_FILE, CLIENTS_FILE, FEEDBACK_FILE, TERM_SETTINGS_FILE, BANNER_FILE, WHATSAPP_FILE, POPUPS_FILE, LEARNING_AREAS_FILE, GRADES_FILE];
+    jsonFiles.forEach(file => {
+        if (fs.existsSync(file)) {
+            archive.file(file, { name: `data/${file}` });
+        }
+    });
+
+    if (fs.existsSync(UPLOAD_DIR)) archive.directory(UPLOAD_DIR, 'uploads');
+    if (fs.existsSync(COVERS_DIR)) archive.directory(COVERS_DIR, 'covers');
+
+    archive.finalize();
+});
+
+app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req, res) => {
+    const zipFile = req.file;
+    if (!zipFile) return res.status(400).json({ error: 'No file uploaded' });
+    const extractPath = path.join(__dirname, 'restore_temp');
+    if (!fs.existsSync(extractPath)) fs.mkdirSync(extractPath);
+
     try {
-        const { transactionId } = req.params;
-        
-        // 1. Check Memory (Fastest)
-        let pay = activePayments.get(transactionId);
-        
-        // 2. Fallback to Disk (If memory cleared/restart)
-        if (!pay) {
-            const stats = readJSON(FILES.STATS, { payments: [] });
-            pay = stats.payments?.find(x => x.transactionId === transactionId);
-        }
-
-        if (!pay) return res.json({ status: 'not_found', verified: false });
-        
-        if (pay.status === 'success') {
-            let verifyToken = null;
-            for (const [t, d] of verifiedPayments.entries()) if (d.transactionId === pay.transactionId && d.expires > Date.now()) { verifyToken = t; break; }
-            
-            if (!verifyToken) {
-                verifyToken = `VER_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
-                verifiedPayments.set(verifyToken, { productId: pay.productId, transactionId: pay.transactionId, amount: pay.amount, expires: Date.now() + 300000 });
-                console.log(`🔑 Generated Token for ${pay.transactionId}`);
+        await extract(zipFile.path, { dir: extractPath });
+        const dataDir = path.join(extractPath, 'data');
+        if (fs.existsSync(dataDir)) {
+            const files = fs.readdirSync(dataDir);
+            for (const file of files) {
+                const src = path.join(dataDir, file);
+                const dest = path.join(__dirname, file);
+                fs.copyFileSync(src, dest);
             }
-            return res.json({ status: 'success', verified: true, token: verifyToken });
         }
-        
-        res.json({ status: pay.status, verified: false });
+        const uploadsBackup = path.join(extractPath, 'uploads');
+        if (fs.existsSync(uploadsBackup)) {
+            const files = fs.readdirSync(uploadsBackup);
+            for (const file of files) {
+                const src = path.join(uploadsBackup, file);
+                const dest = path.join(UPLOAD_DIR, file);
+                fs.copyFileSync(src, dest);
+            }
+        }
+        const coversBackup = path.join(extractPath, 'covers');
+        if (fs.existsSync(coversBackup)) {
+            const files = fs.readdirSync(coversBackup);
+            for (const file of files) {
+                const src = path.join(coversBackup, file);
+                const dest = path.join(COVERS_DIR, file);
+                fs.copyFileSync(src, dest);
+            }
+        }
+        fs.rmSync(extractPath, { recursive: true, force: true });
+        fs.unlinkSync(zipFile.path);
+        cacheVersion = Date.now();
+        res.json({ success: true });
     } catch (err) {
-        console.error('Status Check Error:', err);
-        res.status(500).json({ error: err.message });
+        console.error(err);
+        res.status(500).json({ error: 'Restore failed' });
     }
 });
 
-app.post('/api/payment-webhook', (req, res) => {    try {
-        console.log('📡 Webhook Received:', req.body);
-        const { ResultCode, reference } = req.body;
-        
-        // ✅ FIX: Use 'reference' to find our internal TXN ID
-        if (ResultCode === 0 && reference) {
-            const p = activePayments.get(reference);
-            if (p) {
-                p.status = 'success';
-                console.log(`✅ Webhook Success: ${reference}`);
+// ------------------------------
+// PAYMENT ENDPOINTS (FIXED FOR PAYNECTA)
+// ------------------------------
+
+// Initialize Payment - Send STK Push
+app.post('/api/initiate-payment', async (req, res) => {
+    const { phone, amount, productId } = req.body;
+    
+    if (!phone || !amount || !productId) {
+        return res.status(400).json({ success: false, error: 'Missing fields' });
+    }
+    
+    // Format phone number to 254XXXXXXXXX
+    let cleanPhone = phone.replace(/\s/g, '');
+    if (cleanPhone.startsWith('0')) {
+        cleanPhone = '254' + cleanPhone.substring(1);
+    } else if (cleanPhone.startsWith('+')) {
+        cleanPhone = cleanPhone.substring(1);
+    }
+    
+    // Generate unique transaction ID
+    const transactionId = 'TXN_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    
+    // Store pending payment
+    pendingPayments.set(transactionId, {
+        productId: parseInt(productId),
+        amount: parseInt(amount),
+        phone: cleanPhone,
+        status: 'pending',
+        timestamp: Date.now()
+    });
+    
+    // Check if Paynecta credentials are configured
+    if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
+        console.log('⚠️ Paynecta credentials missing. Using demo mode.');
+        // Demo mode - auto-confirm after 5 seconds (for testing)
+        setTimeout(() => {
+            const payment = pendingPayments.get(transactionId);
+            if (payment && payment.status === 'pending') {
+                payment.status = 'success';
+                const verifyToken = 'DEMO_' + Date.now() + '_' + transactionId;
+                verifiedPayments.set(verifyToken, {
+                    productId: payment.productId,
+                    transactionId: transactionId,
+                    amount: payment.amount,
+                    expires: Date.now() + 300000
+                });
                 
-                // Create verification token
-                const vtok = `WEB_${Date.now()}`;
-                verifiedPayments.set(vtok, { productId: p.productId, transactionId: reference, amount: p.amount, expires: Date.now() + 300000 });
-            } else {
-                console.warn(`⚠️ Webhook Ref ${reference} not found in memory`);
+                // Record in stats
+                const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+                if (!stats.payments) stats.payments = [];
+                stats.payments.push({
+                    date: new Date().toISOString(),
+                    status: 'success',
+                    amount: payment.amount,
+                    phone: cleanPhone,
+                    productId: payment.productId,
+                    transactionId: transactionId,
+                    ip: getClientIp(req)
+                });
+                writeJSON(STATS_FILE, stats);
             }
+        }, 5000);
+        
+        // Record pending payment in stats
+        const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+        if (!stats.payments) stats.payments = [];
+        stats.payments.push({
+            date: new Date().toISOString(),
+            status: 'pending',
+            amount: parseInt(amount),
+            phone: cleanPhone,
+            productId: parseInt(productId),
+            transactionId: transactionId,
+            ip: getClientIp(req)
+        });
+        writeJSON(STATS_FILE, stats);
+        
+        return res.json({ success: true, transactionId, demoMode: true });
+    }
+    
+    // Real Paynecta integration
+    try {
+        console.log(`💳 Initiating Paynecta payment: ${cleanPhone} - KES ${amount}`);
+        
+        const response = await axios.post(
+            `${PAYNECTA_API_URL}/api/v1/payment/initialize`,
+            {
+                code: PAYNECTA_PAYMENT_CODE,
+                mobile_number: cleanPhone,
+                amount: parseInt(amount)
+            },
+            {
+                headers: {
+                    'X-API-Key': PAYNECTA_API_KEY,
+                    'X-User-Email': PAYNECTA_EMAIL,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 30000
+            }
+        );
+        
+        console.log('Paynecta response:', response.data);
+        
+        if (response.data && response.data.success === true) {
+            // Record pending payment in stats
+            const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+            if (!stats.payments) stats.payments = [];
+            stats.payments.push({
+                date: new Date().toISOString(),
+                status: 'pending',
+                amount: parseInt(amount),
+                phone: cleanPhone,
+                productId: parseInt(productId),
+                transactionId: transactionId,
+                ip: getClientIp(req),
+                paynectaRef: response.data.data?.reference || null
+            });
+            writeJSON(STATS_FILE, stats);
+            
+            res.json({ success: true, transactionId });
         } else {
-            console.warn(`⚠️ Webhook failed or missing ref: ResultCode=${ResultCode}`);
+            console.error('Paynecta error:', response.data);
+            res.status(400).json({
+                success: false,
+                error: response.data?.message || 'Payment initiation failed'
+            });
         }
-        res.sendStatus(200);
-    } catch (err) {
-        console.error('Webhook Error:', err);
-        res.sendStatus(200);
+    } catch (error) {
+        console.error('Paynecta API error:', error.response?.data || error.message);
+        res.status(500).json({
+            success: false,
+            error: error.response?.data?.message || error.message || 'Payment service error'
+        });
     }
 });
 
+// Check payment status
+app.get('/api/payment-status/:transactionId', (req, res) => {
+    const { transactionId } = req.params;
+    
+    // Check pending payments first
+    const pending = pendingPayments.get(transactionId);
+    if (!pending) {
+        // Check if already verified
+        for (const [token, data] of verifiedPayments.entries()) {
+            if (data.transactionId === transactionId && data.expires > Date.now()) {
+                return res.json({ status: 'success', verified: true, token: token });
+            }
+        }
+        return res.json({ status: 'not_found', verified: false });
+    }
+    
+    if (pending.status === 'success') {
+        // Generate verification token
+        const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
+        verifiedPayments.set(verifyToken, {
+            productId: pending.productId,
+            transactionId: transactionId,
+            amount: pending.amount,
+            expires: Date.now() + 300000
+        });
+        pendingPayments.delete(transactionId);
+        return res.json({ status: 'success', verified: true, token: verifyToken });
+    }
+    
+    if (pending.status === 'failed') {
+        pendingPayments.delete(transactionId);
+        return res.json({ status: 'failed', verified: false });
+    }
+    
+    // Still pending
+    res.json({ status: 'pending', verified: false });
+});
+
+// Paynecta Webhook - IMPORTANT: This is called by Paynecta when payment completes
+app.post('/api/payment-webhook', async (req, res) => {
+    console.log('📞 Webhook received:', JSON.stringify(req.body, null, 2));
+    
+    // Paynecta webhook format may vary - handle common patterns
+    const { reference, transactionId, ResultCode, resultCode, status, data } = req.body;
+    
+    // Extract the reference/transaction ID
+    let txnId = reference || transactionId || data?.reference || data?.transactionId;
+    
+    // Check if payment was successful
+    const isSuccess = (ResultCode === 0 || resultCode === 0 || status === 'success' || status === 'completed');
+    
+    if (txnId && isSuccess) {
+        // Find the pending payment
+        let foundTxnId = null;
+        for (const [id, payment] of pendingPayments.entries()) {
+            if (id === txnId || id.endsWith(txnId) || txnId.endsWith(id)) {
+                foundTxnId = id;
+                break;
+            }
+        }
+        
+        if (foundTxnId) {
+            const payment = pendingPayments.get(foundTxnId);
+            payment.status = 'success';
+            
+            // Update stats
+            const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+            const paymentIndex = stats.payments.findIndex(p => p.transactionId === foundTxnId);
+            if (paymentIndex !== -1) {
+                stats.payments[paymentIndex].status = 'success';
+                writeJSON(STATS_FILE, stats);
+            }
+            
+            console.log(`✅ Payment confirmed for transaction: ${foundTxnId}`);
+        } else {
+            // Payment might be for a transaction we don't have in memory (server restart)
+            // Check stats file
+            const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+            const payment = stats.payments.find(p => p.transactionId === txnId || p.transactionId?.endsWith(txnId));
+            if (payment && payment.status !== 'success') {
+                payment.status = 'success';
+                writeJSON(STATS_FILE, stats);
+                console.log(`✅ Updated payment in stats: ${txnId}`);
+            }
+        }
+    }
+    
+    res.sendStatus(200);
+});
+
+// Request download token after successful payment
 app.post('/api/request-download', (req, res) => {
+    const { verificationToken, productId } = req.body;
+    
+    if (!verificationToken || !productId) {
+        return res.status(400).json({ error: 'Missing data' });
+    }
+    
+    const verifiedData = verifiedPayments.get(verificationToken);
+    if (!verifiedData || verifiedData.expires < Date.now()) {
+        return res.status(403).json({ error: 'Payment not verified or expired' });
+    }
+    
+    if (verifiedData.productId !== parseInt(productId)) {
+        return res.status(403).json({ error: 'Invalid token for this product' });
+    }
+    
+    // Generate download token (valid for 60 seconds)
+    const downloadToken = Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+    downloadTokens.set(downloadToken, {
+        productId: parseInt(productId),
+        expires: Date.now() + 60000
+    });
+    
+    // Clean up used verification token
+    verifiedPayments.delete(verificationToken);
+    
+    res.json({ success: true, token: downloadToken });
+});
+
+// Download PDF
+app.get('/api/download/:token', async (req, res) => {
+    const { token } = req.params;
+    
+    const record = downloadTokens.get(token);
+    if (!record || record.expires < Date.now()) {
+        return res.status(403).send('Download link expired or invalid. Please contact support.');
+    }
+    
+    const products = readJSON(PRODUCTS_FILE, []);
+    const product = products.find(p => p.id === record.productId);
+    
+    if (!product || !product.fileUrl) {
+        return res.status(404).send('File not found');
+    }
+    
     try {
-        const { verificationToken, productId } = req.body;
-        if (!verificationToken || productId === undefined) return res.status(400).json({ error: 'Missing data' });
-        const v = verifiedPayments.get(verificationToken);
-        if (!v || v.expires < Date.now()) return res.status(403).json({ error: 'Expired' });
-        if (Number(v.productId) !== Number(productId)) return res.status(403).json({ error: 'Mismatch' });
-        const dtoken = `DL_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        downloadTokens.set(dtoken, { productId: Number(productId), expires: Date.now() + 60000 });
-        verifiedPayments.delete(verificationToken);
-        res.json({ success: true, token: dtoken });
+        // Handle local file path or remote URL
+        if (product.fileUrl.startsWith('http')) {
+            const response = await axios({
+                method: 'GET',
+                url: product.fileUrl,
+                responseType: 'stream'
+            });
+            res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
+            res.setHeader('Content-Type', 'application/pdf');
+            response.data.pipe(res);
+        } else {
+            // Local file
+            const filePath = path.join(__dirname, product.fileUrl);
+            if (fs.existsSync(filePath)) {
+                res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
+                res.setHeader('Content-Type', 'application/pdf');
+                fs.createReadStream(filePath).pipe(res);
+            } else {
+                res.status(404).send('File not found on server');
+            }
+        }
+        
+        // Record download in stats
+        const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+        stats.downloads.push({
+            date: new Date().toISOString(),
+            productId: product.id,
+            productName: product.title,
+            price: product.price,
+            ip: getClientIp(req)
+        });
+        writeJSON(STATS_FILE, stats);
+        
+        // Clean up used download token
+        downloadTokens.delete(token);
+        
     } catch (err) {
-        console.error('Download Request Error:', err);
-        res.status(500).json({ error: err.message });
+        console.error('Download error:', err);
+        res.status(500).send('Download error. Please contact support.');
     }
 });
 
-app.get('/api/download/:token', (req, res) => {
-    try {
-        const rec = downloadTokens.get(req.params.token); if (!rec || rec.expires < Date.now()) return res.status(403).send('Expired');
-        const p = readJSON(FILES.PRODUCTS, []).find(x => x.id === rec.productId); if (!p?.fileUrl) return res.status(404).send('File missing');
-        const fp = path.join(__dirname, p.fileUrl); if (!fs.existsSync(fp)) return res.status(404).send('Missing on server');
-        res.setHeader('Content-Type', 'application/pdf'); res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(p.title)}.pdf"`);        fs.createReadStream(fp).pipe(res); downloadTokens.delete(req.params.token);
-        const s = readJSON(FILES.STATS, { downloads: [] }); s.downloads.push({ date: new Date().toISOString(), productId: p.id, productName: p.title, price: p.price, ip: getClientIp(req) }); writeJSON(FILES.STATS, s);
-    } catch (err) {
-        console.error('Download Stream Error:', err);
-        res.status(500).send('Download failed');
-    }
-});
-
+// Admin force confirm payment (for testing)
 app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
-    try {
-        const s = readJSON(FILES.STATS, { payments: [] }); const p = s.payments?.find(x => x.transactionId === req.body.transactionId);
-        if (!p) return res.status(404).json({ error: 'Not found' }); p.status = 'success'; writeJSON(FILES.STATS, s); const t = `ADM_${Date.now()}`; verifiedPayments.set(t, { productId: parseInt(req.body.productId), transactionId: p.transactionId, amount: p.amount, expires: Date.now() + 300000 }); res.json({ success: true, token: t });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    const { transactionId, productId } = req.body;
+    
+    const verifyToken = 'ADMIN_' + Date.now() + '_' + transactionId;
+    verifiedPayments.set(verifyToken, {
+        productId: parseInt(productId),
+        transactionId: transactionId,
+        amount: 0,
+        expires: Date.now() + 300000
+    });
+    
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    const payment = stats.payments.find(p => p.transactionId === transactionId);
+    if (payment) payment.status = 'success';
+    writeJSON(STATS_FILE, stats);
+    
+    res.json({ success: true, token: verifyToken });
 });
 
-// 🌐 Public & Admin Utils
-app.get('/api/messages', (req, res) => { const now = new Date(); res.json(readJSON(FILES.MESSAGES, []).filter(m => m.active && (!m.startDate || new Date(m.startDate) <= now) && (!m.endDate || new Date(m.endDate) >= now))); });
-app.get('/api/popups', (req, res) => { const now = new Date(); res.json(readJSON(FILES.POPUPS, []).filter(p => p.active && (!p.startDate || new Date(p.startDate) <= now) && (!p.endDate || new Date(p.endDate) >= now))); });
-app.post('/api/submit-feedback', (req, res) => { if (!req.body.message) return res.status(400).json({ error: 'Message required' }); const f = readJSON(FILES.FEEDBACK, []); f.push({ id: Date.now(), message: req.body.message.trim(), whatsapp: req.body.whatsapp?.trim() || '', ip: getClientIp(req), ts: new Date().toISOString(), read: false }); writeJSON(FILES.FEEDBACK, f); res.json({ success: true }); });
-app.post('/api/track-visit', (req, res) => { const s = readJSON(FILES.STATS, { visits: [] }); s.visits.push({ date: new Date().toISOString(), ip: getClientIp(req) }); writeJSON(FILES.STATS, s); res.json({ success: true }); });
-app.get('/api/admin/stats', isAdmin, (req, res) => { const s = readJSON(FILES.STATS, { visits: [], downloads: [], payments: [] }); const ok = s.payments?.filter(p => p.status === 'success') || []; res.json({ summary: { visits: s.visits.length, downloads: s.downloads.length, success: ok.length, revenue: ok.reduce((a,b)=>a+(b.amount||0),0) } }); });
-app.get('/api/admin/feedback', isAdmin, (req, res) => res.json(readJSON(FILES.FEEDBACK, [])));
-app.put('/api/admin/feedback/:id', isAdmin, (req, res) => { const f = readJSON(FILES.FEEDBACK, []); const i = f.findIndex(x => x.id === parseInt(req.params.id)); if (i > -1) { f[i].read = true; writeJSON(FILES.FEEDBACK, f); } res.json({ success: true }); });
-app.get('/api/banner', (req, res) => res.json(readJSON(FILES.BANNER, { enabled: false, text: '', startDate: null, endDate: null })));
-app.get('/api/admin/banner', isAdmin, (req, res) => res.json(readJSON(FILES.BANNER, { enabled: false, text: '', startDate: null, endDate: null })));
-app.post('/api/admin/banner', isAdmin, (req, res) => { writeJSON(FILES.BANNER, req.body); cacheVersion = Date.now(); res.json({ success: true }); });
-app.get('/api/admin/whatsapp', isAdmin, (req, res) => res.json(readJSON(FILES.WHATSAPP, { enabled: false, phone: '', message: '' })));
-app.post('/api/admin/whatsapp', isAdmin, (req, res) => { writeJSON(FILES.WHATSAPP, req.body); cacheVersion = Date.now(); res.json({ success: true }); });
-app.post('/api/admin/clear-logs', isAdmin, (req, res) => { writeJSON(FILES.STATS, {}); res.json({ success: true }); });
-app.get('/ping', (req, res) => res.send('OK'));
-app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
-app.use((err, req, res, next) => { console.error('💥 GLOBAL ERROR:', err); res.status(500).json({ error: err.message }); });
+// ------------------------------
+// Public Endpoints
+// ------------------------------
+app.get('/api/messages', (req, res) => {
+    const messages = readJSON(MESSAGES_FILE, []);
+    const now = new Date();
+    res.json(messages.filter(m => m.active && new Date(m.startDate) <= now && (!m.endDate || new Date(m.endDate) >= now)));
+});
 
-app.listen(PORT, () => console.log(`🚀 Running on :${PORT} | Memory Mode Active`));
+app.get('/api/popups', (req, res) => {
+    const popups = readJSON(POPUPS_FILE, []);
+    const now = new Date();
+    res.json(popups.filter(p => p.active && new Date(p.startDate) <= now && (!p.endDate || new Date(p.endDate) >= now)));
+});
+
+app.post('/api/submit-feedback', (req, res) => {
+    const { message, whatsapp } = req.body;
+    const feedback = readJSON(FEEDBACK_FILE, []);
+    feedback.push({ id: Date.now(), message, whatsapp, ip: getClientIp(req), timestamp: new Date().toISOString(), read: false });
+    writeJSON(FEEDBACK_FILE, feedback);
+    res.json({ success: true });
+});
+
+app.post('/api/track-visit', (req, res) => {
+    const ip = getClientIp(req);
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    stats.visits.push({ date: new Date().toISOString(), ip });
+    writeJSON(STATS_FILE, stats);
+    res.json({ success: true });
+});
+
+app.post('/api/track-download', (req, res) => {
+    const { productId, productName, price } = req.body;
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    stats.downloads.push({ date: new Date().toISOString(), productId, productName, price, ip: getClientIp(req) });
+    writeJSON(STATS_FILE, stats);
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Admin Analytics
+// ------------------------------
+app.get('/api/admin/stats', isAdmin, (req, res) => {
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    const storage = getStorageUsage();
+    res.json({
+        summary: {
+            totalVisits: stats.visits.length,
+            totalDownloads: stats.downloads.length,
+            successfulPayments: stats.payments?.filter(p => p.status === 'success').length || 0,
+            pendingPayments: stats.payments?.filter(p => p.status === 'pending').length || 0,
+            storageUsed: storage.usedMB
+        }
+    });
+});
+
+app.get('/api/admin/feedback', isAdmin, (req, res) => { res.json(readJSON(FEEDBACK_FILE, [])); });
+
+app.put('/api/admin/feedback/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let feedback = readJSON(FEEDBACK_FILE, []);
+    const idx = feedback.findIndex(f => f.id === id);
+    if (idx !== -1) { feedback[idx].read = true; writeJSON(FEEDBACK_FILE, feedback); }
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Messages & Popups
+// ------------------------------
+app.get('/api/admin/messages', isAdmin, (req, res) => { res.json(readJSON(MESSAGES_FILE, [])); });
+app.post('/api/admin/messages', isAdmin, (req, res) => {
+    const { title, content, type, startDate, endDate, isActive } = req.body;
+    const messages = readJSON(MESSAGES_FILE, []);
+    messages.push({ id: Date.now(), title, content, type: type || 'banner', startDate: new Date(startDate).toISOString(), endDate: endDate ? new Date(endDate).toISOString() : null, active: isActive === true || isActive === 'true', createdAt: new Date().toISOString() });
+    writeJSON(MESSAGES_FILE, messages);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+app.put('/api/admin/messages/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const { active } = req.body;
+    let messages = readJSON(MESSAGES_FILE, []);
+    const idx = messages.findIndex(m => m.id === id);
+    if (idx === -1) return res.status(404).json({ error: 'Not found' });
+    messages[idx].active = active;
+    writeJSON(MESSAGES_FILE, messages);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let messages = readJSON(MESSAGES_FILE, []);
+    messages = messages.filter(m => m.id !== id);
+    writeJSON(MESSAGES_FILE, messages);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+
+app.post('/api/admin/instant-message', isAdmin, (req, res) => {
+    const { content, type } = req.body;
+    const messages = readJSON(MESSAGES_FILE, []);
+    messages.push({ id: Date.now(), title: 'Instant Announcement', content, type: type || 'banner', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 86400000).toISOString(), active: true, isInstant: true, createdAt: new Date().toISOString() });
+    writeJSON(MESSAGES_FILE, messages);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+
+app.post('/api/admin/popups', isAdmin, (req, res) => {
+    const { question, options, triggerType, delaySeconds, whatsappCollect } = req.body;
+    const popups = readJSON(POPUPS_FILE, []);
+    popups.push({ id: Date.now(), question, options: options || [], triggerType: triggerType || 'onload', delaySeconds: delaySeconds || 0, whatsappCollect: whatsappCollect || false, active: true, startDate: new Date().toISOString(), endDate: null, createdAt: new Date().toISOString() });
+    writeJSON(POPUPS_FILE, popups);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+app.get('/api/admin/popups', isAdmin, (req, res) => { res.json(readJSON(POPUPS_FILE, [])); });
+app.delete('/api/admin/popups/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    let popups = readJSON(POPUPS_FILE, []);
+    popups = popups.filter(p => p.id !== id);
+    writeJSON(POPUPS_FILE, popups);
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Banner & WhatsApp Settings
+// ------------------------------
+app.get('/api/banner', (req, res) => { res.json(readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null })); });
+app.get('/api/admin/banner', isAdmin, (req, res) => { res.json(readJSON(BANNER_FILE, { enabled: false, text: '', startDate: null, endDate: null })); });
+app.post('/api/admin/banner', isAdmin, (req, res) => {
+    const { enabled, text, startDate, endDate } = req.body;
+    writeJSON(BANNER_FILE, { enabled, text, startDate: startDate || null, endDate: endDate || null });
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+app.get('/api/admin/whatsapp', isAdmin, (req, res) => { res.json(readJSON(WHATSAPP_FILE, { enabled: false, phone: '', message: '' })); });
+app.post('/api/admin/whatsapp', isAdmin, (req, res) {
+    const { enabled, phone, message } = req.body;
+    writeJSON(WHATSAPP_FILE, { enabled, phone, message });
+    cacheVersion = Date.now();
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Clear Logs
+// ------------------------------
+app.post('/api/admin/clear-logs', isAdmin, (req, res) => {
+    writeJSON(ACTIVITY_FILE, []);
+    res.json({ success: true });
+});
+
+// ------------------------------
+// Keep-Alive Ping
+// ------------------------------
+app.get('/ping', (req, res) => { res.send('OK'); });
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📦 Paynecta configured: ${PAYNECTA_API_KEY ? 'YES' : 'NO'}`);
+    console.log(`💳 Payment Code: ${PAYNECTA_PAYMENT_CODE || 'NOT SET'}`);
+});
