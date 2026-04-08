@@ -130,10 +130,10 @@ setInterval(() => {
 
 let cacheVersion = Date.now();
 
-// Payment storage
+// Payment storage - IMPORTANT: These need to persist between requests
 const pendingPayments = new Map(); // transactionId -> { productId, amount, phone, status, timestamp }
-const verifiedPayments = new Map(); // token -> { productId, transactionId, amount, expires }
-const downloadTokens = new Map();   // token -> { productId, expires }
+const verifiedPayments = new Map(); // token -> { productId, transactionId, amount, expires, downloadToken? }
+const downloadTokens = new Map();   // token -> { productId, fileUrl, filename, expires }
 
 // ------------------------------
 // Admin Authentication
@@ -212,9 +212,8 @@ app.post('/api/admin/clear-cache', isAdmin, (req, res) => {
 app.post('/api/heartbeat', (req, res) => {
     const { sessionId } = req.body;
     const ip = getClientIp(req);
-    const userAgent = req.headers['user-agent'];
     if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
-    activeSessions.set(sessionId, { ip, userAgent, lastSeen: Date.now(), firstSeen: activeSessions.has(sessionId) ? activeSessions.get(sessionId).firstSeen : Date.now() });
+    activeSessions.set(sessionId, { ip, lastSeen: Date.now(), firstSeen: activeSessions.has(sessionId) ? activeSessions.get(sessionId).firstSeen : Date.now() });
     res.json({ success: true, activeCount: activeSessions.size });
 });
 
@@ -225,10 +224,10 @@ app.get('/api/admin/active-users', isAdmin, (req, res) => {
     for (const [sessionId, data] of activeSessions.entries()) {
         if (now - data.lastSeen <= 60000) {
             active++;
-            activeList.push({ sessionId: sessionId.substring(0, 8), ip: data.ip, lastSeen: data.lastSeen, activeSeconds: Math.floor((now - data.lastSeen) / 1000), duration: Math.floor((now - data.firstSeen) / 1000) });
+            activeList.push({ sessionId: sessionId.substring(0, 8), ip: data.ip, lastSeen: data.lastSeen });
         }
     }
-    res.json({ activeCount: active, activeUsers: activeList, lastUpdated: new Date().toISOString() });
+    res.json({ activeCount: active, activeUsers: activeList });
 });
 
 app.post('/api/leave', (req, res) => {
@@ -484,13 +483,13 @@ app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req,
     }
 });
 
-// ------------------------------
-// PAYMENT ENDPOINTS (FIXED FOR PAYNECTA)
-// ------------------------------
+// ========== FIXED PAYMENT ENDPOINTS ==========
 
 // Initialize Payment - Send STK Push
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
+    
+    console.log(`📱 Payment initiation: phone=${phone}, amount=${amount}, productId=${productId}`);
     
     if (!phone || !amount || !productId) {
         return res.status(400).json({ success: false, error: 'Missing fields' });
@@ -507,26 +506,46 @@ app.post('/api/initiate-payment', async (req, res) => {
     // Generate unique transaction ID
     const transactionId = 'TXN_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     
-    // Store pending payment
+    // Get product details for file URL
+    const products = readJSON(PRODUCTS_FILE, []);
+    const product = products.find(p => p.id === parseInt(productId));
+    
+    if (!product) {
+        return res.status(400).json({ success: false, error: 'Product not found' });
+    }
+    
+    // Store pending payment with product file info
     pendingPayments.set(transactionId, {
         productId: parseInt(productId),
+        productTitle: product.title,
+        productGrade: product.grade,
+        productTerm: product.term,
+        fileUrl: product.fileUrl,
         amount: parseInt(amount),
         phone: cleanPhone,
         status: 'pending',
         timestamp: Date.now()
     });
     
-    // Check if Paynecta credentials are configured
+    // If Paynecta credentials missing, use demo mode (auto-confirm after 3 seconds for testing)
     if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
-        console.log('⚠️ Paynecta credentials missing. Using demo mode.');
-        // Demo mode - auto-confirm after 5 seconds (for testing)
+        console.log('⚠️ Paynecta credentials missing. Using DEMO MODE - auto-confirm in 3 seconds');
+        
+        // Auto-confirm after 3 seconds (for testing)
         setTimeout(() => {
             const payment = pendingPayments.get(transactionId);
             if (payment && payment.status === 'pending') {
+                console.log(`✅ DEMO MODE: Auto-confirming payment for ${transactionId}`);
                 payment.status = 'success';
+                
+                // Generate verification token
                 const verifyToken = 'DEMO_' + Date.now() + '_' + transactionId;
                 verifiedPayments.set(verifyToken, {
                     productId: payment.productId,
+                    productTitle: payment.productTitle,
+                    productGrade: payment.productGrade,
+                    productTerm: payment.productTerm,
+                    fileUrl: payment.fileUrl,
                     transactionId: transactionId,
                     amount: payment.amount,
                     expires: Date.now() + 300000
@@ -541,12 +560,11 @@ app.post('/api/initiate-payment', async (req, res) => {
                     amount: payment.amount,
                     phone: cleanPhone,
                     productId: payment.productId,
-                    transactionId: transactionId,
-                    ip: getClientIp(req)
+                    transactionId: transactionId
                 });
                 writeJSON(STATS_FILE, stats);
             }
-        }, 5000);
+        }, 3000);
         
         // Record pending payment in stats
         const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
@@ -557,8 +575,7 @@ app.post('/api/initiate-payment', async (req, res) => {
             amount: parseInt(amount),
             phone: cleanPhone,
             productId: parseInt(productId),
-            transactionId: transactionId,
-            ip: getClientIp(req)
+            transactionId: transactionId
         });
         writeJSON(STATS_FILE, stats);
         
@@ -567,7 +584,7 @@ app.post('/api/initiate-payment', async (req, res) => {
     
     // Real Paynecta integration
     try {
-        console.log(`💳 Initiating Paynecta payment: ${cleanPhone} - KES ${amount}`);
+        console.log(`💳 Initiating Paynecta payment for ${cleanPhone} - KES ${amount}`);
         
         const response = await axios.post(
             `${PAYNECTA_API_URL}/api/v1/payment/initialize`,
@@ -586,10 +603,9 @@ app.post('/api/initiate-payment', async (req, res) => {
             }
         );
         
-        console.log('Paynecta response:', response.data);
+        console.log('Paynecta response:', JSON.stringify(response.data, null, 2));
         
         if (response.data && response.data.success === true) {
-            // Record pending payment in stats
             const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
             if (!stats.payments) stats.payments = [];
             stats.payments.push({
@@ -599,7 +615,6 @@ app.post('/api/initiate-payment', async (req, res) => {
                 phone: cleanPhone,
                 productId: parseInt(productId),
                 transactionId: transactionId,
-                ip: getClientIp(req),
                 paynectaRef: response.data.data?.reference || null
             });
             writeJSON(STATS_FILE, stats);
@@ -621,49 +636,80 @@ app.post('/api/initiate-payment', async (req, res) => {
     }
 });
 
-// Check payment status
+// Check payment status - FIXED to return file info for download
 app.get('/api/payment-status/:transactionId', (req, res) => {
     const { transactionId } = req.params;
     
+    console.log(`🔍 Checking payment status for: ${transactionId}`);
+    
     // Check pending payments first
     const pending = pendingPayments.get(transactionId);
-    if (!pending) {
-        // Check if already verified
-        for (const [token, data] of verifiedPayments.entries()) {
-            if (data.transactionId === transactionId && data.expires > Date.now()) {
-                return res.json({ status: 'success', verified: true, token: token });
-            }
-        }
-        return res.json({ status: 'not_found', verified: false });
-    }
     
-    if (pending.status === 'success') {
-        // Generate verification token
+    if (pending && pending.status === 'success') {
+        console.log(`✅ Payment successful for ${transactionId}, generating verification token`);
+        
+        // Generate verification token with file info
         const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
         verifiedPayments.set(verifyToken, {
             productId: pending.productId,
+            productTitle: pending.productTitle,
+            productGrade: pending.productGrade,
+            productTerm: pending.productTerm,
+            fileUrl: pending.fileUrl,
             transactionId: transactionId,
             amount: pending.amount,
-            expires: Date.now() + 300000
+            expires: Date.now() + 300000  // 5 minutes
         });
+        
+        // Clean up pending payment
         pendingPayments.delete(transactionId);
-        return res.json({ status: 'success', verified: true, token: verifyToken });
+        
+        return res.json({ 
+            status: 'success', 
+            verified: true, 
+            token: verifyToken,
+            productInfo: {
+                title: pending.productTitle,
+                grade: pending.productGrade,
+                term: pending.productTerm
+            }
+        });
     }
     
-    if (pending.status === 'failed') {
+    if (pending && pending.status === 'failed') {
         pendingPayments.delete(transactionId);
         return res.json({ status: 'failed', verified: false });
     }
     
-    // Still pending
-    res.json({ status: 'pending', verified: false });
+    if (pending) {
+        return res.json({ status: 'pending', verified: false });
+    }
+    
+    // Check if already verified (for webhook-triggered payments)
+    for (const [token, data] of verifiedPayments.entries()) {
+        if (data.transactionId === transactionId && data.expires > Date.now()) {
+            console.log(`✅ Found existing verified payment for ${transactionId}`);
+            return res.json({ 
+                status: 'success', 
+                verified: true, 
+                token: token,
+                productInfo: {
+                    title: data.productTitle,
+                    grade: data.productGrade,
+                    term: data.productTerm
+                }
+            });
+        }
+    }
+    
+    return res.json({ status: 'not_found', verified: false });
 });
 
-// Paynecta Webhook - IMPORTANT: This is called by Paynecta when payment completes
+// Paynecta Webhook - Called when payment completes
 app.post('/api/payment-webhook', async (req, res) => {
     console.log('📞 Webhook received:', JSON.stringify(req.body, null, 2));
     
-    // Paynecta webhook format may vary - handle common patterns
+    // Paynecta webhook format - adjust based on actual Paynecta response
     const { reference, transactionId, ResultCode, resultCode, status, data } = req.body;
     
     // Extract the reference/transaction ID
@@ -673,37 +719,44 @@ app.post('/api/payment-webhook', async (req, res) => {
     const isSuccess = (ResultCode === 0 || resultCode === 0 || status === 'success' || status === 'completed');
     
     if (txnId && isSuccess) {
+        console.log(`✅ Webhook: Payment successful for ${txnId}`);
+        
         // Find the pending payment
+        let foundPayment = null;
         let foundTxnId = null;
+        
         for (const [id, payment] of pendingPayments.entries()) {
             if (id === txnId || id.endsWith(txnId) || txnId.endsWith(id)) {
                 foundTxnId = id;
+                foundPayment = payment;
                 break;
             }
         }
         
-        if (foundTxnId) {
-            const payment = pendingPayments.get(foundTxnId);
-            payment.status = 'success';
+        if (foundPayment) {
+            foundPayment.status = 'success';
+            console.log(`✅ Updated pending payment status for ${foundTxnId}`);
             
-            // Update stats
-            const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-            const paymentIndex = stats.payments.findIndex(p => p.transactionId === foundTxnId);
-            if (paymentIndex !== -1) {
-                stats.payments[paymentIndex].status = 'success';
-                writeJSON(STATS_FILE, stats);
-            }
-            
-            console.log(`✅ Payment confirmed for transaction: ${foundTxnId}`);
+            // Generate verification token
+            const verifyToken = 'WEB_' + Date.now() + '_' + foundTxnId;
+            verifiedPayments.set(verifyToken, {
+                productId: foundPayment.productId,
+                productTitle: foundPayment.productTitle,
+                productGrade: foundPayment.productGrade,
+                productTerm: foundPayment.productTerm,
+                fileUrl: foundPayment.fileUrl,
+                transactionId: foundTxnId,
+                amount: foundPayment.amount,
+                expires: Date.now() + 300000
+            });
         } else {
-            // Payment might be for a transaction we don't have in memory (server restart)
-            // Check stats file
+            // Update stats file
             const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
             const payment = stats.payments.find(p => p.transactionId === txnId || p.transactionId?.endsWith(txnId));
             if (payment && payment.status !== 'success') {
                 payment.status = 'success';
                 writeJSON(STATS_FILE, stats);
-                console.log(`✅ Updated payment in stats: ${txnId}`);
+                console.log(`✅ Updated payment in stats for ${txnId}`);
             }
         }
     }
@@ -711,71 +764,100 @@ app.post('/api/payment-webhook', async (req, res) => {
     res.sendStatus(200);
 });
 
-// Request download token after successful payment
+// Request download token - FIXED to use stored file URL
 app.post('/api/request-download', (req, res) => {
     const { verificationToken, productId } = req.body;
+    
+    console.log(`📥 Download request: token=${verificationToken}, productId=${productId}`);
     
     if (!verificationToken || !productId) {
         return res.status(400).json({ error: 'Missing data' });
     }
     
     const verifiedData = verifiedPayments.get(verificationToken);
-    if (!verifiedData || verifiedData.expires < Date.now()) {
-        return res.status(403).json({ error: 'Payment not verified or expired' });
+    if (!verifiedData) {
+        console.log(`❌ Verification token not found: ${verificationToken}`);
+        return res.status(403).json({ error: 'Invalid verification token' });
+    }
+    
+    if (verifiedData.expires < Date.now()) {
+        console.log(`❌ Verification token expired: ${verificationToken}`);
+        verifiedPayments.delete(verificationToken);
+        return res.status(403).json({ error: 'Verification token expired' });
     }
     
     if (verifiedData.productId !== parseInt(productId)) {
-        return res.status(403).json({ error: 'Invalid token for this product' });
+        console.log(`❌ Product ID mismatch: expected ${verifiedData.productId}, got ${productId}`);
+        return res.status(403).json({ error: 'Product ID mismatch' });
     }
     
-    // Generate download token (valid for 60 seconds)
-    const downloadToken = Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+    // Get fresh product data to ensure file URL is valid
+    const products = readJSON(PRODUCTS_FILE, []);
+    const product = products.find(p => p.id === parseInt(productId));
+    
+    if (!product || !product.fileUrl) {
+        console.log(`❌ Product not found or missing file URL: ${productId}`);
+        return res.status(404).json({ error: 'Product file not found' });
+    }
+    
+    // Generate download token (valid for 2 minutes)
+    const downloadToken = Math.random().toString(36).substring(2, 20) + Date.now().toString(36);
     downloadTokens.set(downloadToken, {
         productId: parseInt(productId),
-        expires: Date.now() + 60000
+        fileUrl: product.fileUrl,
+        filename: `${product.title.replace(/ /g, '_')}_${product.grade}_Term${product.term}.pdf`,
+        expires: Date.now() + 120000  // 2 minutes
     });
     
     // Clean up used verification token
     verifiedPayments.delete(verificationToken);
     
+    console.log(`✅ Download token generated: ${downloadToken} for product ${product.title}`);
+    
     res.json({ success: true, token: downloadToken });
 });
 
-// Download PDF
+// Download PDF - FIXED to handle both local and remote files
 app.get('/api/download/:token', async (req, res) => {
     const { token } = req.params;
     
+    console.log(`📥 Download request for token: ${token}`);
+    
     const record = downloadTokens.get(token);
-    if (!record || record.expires < Date.now()) {
-        return res.status(403).send('Download link expired or invalid. Please contact support.');
+    if (!record) {
+        console.log(`❌ Download token not found: ${token}`);
+        return res.status(403).send('Download link invalid. Please contact support.');
     }
     
-    const products = readJSON(PRODUCTS_FILE, []);
-    const product = products.find(p => p.id === record.productId);
-    
-    if (!product || !product.fileUrl) {
-        return res.status(404).send('File not found');
+    if (record.expires < Date.now()) {
+        console.log(`❌ Download token expired: ${token}`);
+        downloadTokens.delete(token);
+        return res.status(403).send('Download link expired. Please contact support.');
     }
+    
+    console.log(`📄 Downloading file: ${record.filename} from ${record.fileUrl}`);
     
     try {
-        // Handle local file path or remote URL
-        if (product.fileUrl.startsWith('http')) {
+        // Set headers for PDF download
+        res.setHeader('Content-Disposition', `attachment; filename="${record.filename}"`);
+        res.setHeader('Content-Type', 'application/pdf');
+        
+        // Handle file URL (could be local path or remote URL)
+        if (record.fileUrl.startsWith('http')) {
+            // Remote file (from Render or external)
             const response = await axios({
                 method: 'GET',
-                url: product.fileUrl,
+                url: record.fileUrl,
                 responseType: 'stream'
             });
-            res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
-            res.setHeader('Content-Type', 'application/pdf');
             response.data.pipe(res);
         } else {
             // Local file
-            const filePath = path.join(__dirname, product.fileUrl);
+            const filePath = path.join(__dirname, record.fileUrl);
             if (fs.existsSync(filePath)) {
-                res.setHeader('Content-Disposition', `attachment; filename="${product.title.replace(/ /g, '_')}.pdf"`);
-                res.setHeader('Content-Type', 'application/pdf');
                 fs.createReadStream(filePath).pipe(res);
             } else {
+                console.log(`❌ Local file not found: ${filePath}`);
                 res.status(404).send('File not found on server');
             }
         }
@@ -784,9 +866,8 @@ app.get('/api/download/:token', async (req, res) => {
         const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
         stats.downloads.push({
             date: new Date().toISOString(),
-            productId: product.id,
-            productName: product.title,
-            price: product.price,
+            productId: record.productId,
+            productName: record.filename,
             ip: getClientIp(req)
         });
         writeJSON(STATS_FILE, stats);
@@ -794,21 +875,34 @@ app.get('/api/download/:token', async (req, res) => {
         // Clean up used download token
         downloadTokens.delete(token);
         
+        console.log(`✅ Download successful for ${record.filename}`);
+        
     } catch (err) {
         console.error('Download error:', err);
         res.status(500).send('Download error. Please contact support.');
     }
 });
 
-// Admin force confirm payment (for testing)
+// Admin force confirm payment (for testing/backup)
 app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
     const { transactionId, productId } = req.body;
+    
+    const products = readJSON(PRODUCTS_FILE, []);
+    const product = products.find(p => p.id === parseInt(productId));
+    
+    if (!product) {
+        return res.status(404).json({ error: 'Product not found' });
+    }
     
     const verifyToken = 'ADMIN_' + Date.now() + '_' + transactionId;
     verifiedPayments.set(verifyToken, {
         productId: parseInt(productId),
+        productTitle: product.title,
+        productGrade: product.grade,
+        productTerm: product.term,
+        fileUrl: product.fileUrl,
         transactionId: transactionId,
-        amount: 0,
+        amount: product.price,
         expires: Date.now() + 300000
     });
     
@@ -957,7 +1051,7 @@ app.post('/api/admin/banner', isAdmin, (req, res) => {
     res.json({ success: true });
 });
 app.get('/api/admin/whatsapp', isAdmin, (req, res) => { res.json(readJSON(WHATSAPP_FILE, { enabled: false, phone: '', message: '' })); });
-app.post('/api/admin/whatsapp', isAdmin, (req, res) {
+app.post('/api/admin/whatsapp', isAdmin, (req, res) => {
     const { enabled, phone, message } = req.body;
     writeJSON(WHATSAPP_FILE, { enabled, phone, message });
     cacheVersion = Date.now();
