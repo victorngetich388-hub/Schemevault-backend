@@ -147,7 +147,7 @@ const transporter = nodemailer.createTransport({
 });
 
 // ========== PAYNECTA CONFIG ==========
-// IMPORTANT: No trailing slash in the base URL
+// IMPORTANT: Set PAYNECTA_API_URL to https://paynecta.co.ke/api/v1 in Render environment variables
 const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
@@ -405,7 +405,7 @@ app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req,
     }
 });
 
-// ========== PAYMENT ENDPOINTS (FIXED) ==========
+// ========== PAYMENT ENDPOINTS ==========
 
 // Helper to query Paynecta status using transaction_reference
 async function queryPaynectaStatus(transactionReference) {
@@ -501,7 +501,7 @@ app.post('/api/initiate-payment', async (req, res) => {
         console.log('Paynecta init response:', response.data);
 
         if (response.data && response.data.success === true) {
-            // Store the checkout_request_id or transaction_reference if provided
+            // Store the transaction reference if returned
             const paynectaRef = response.data.data?.transaction_reference || response.data.data?.checkout_request_id;
             if (paynectaRef) {
                 const payment = pendingPayments.get(transactionId);
@@ -517,11 +517,11 @@ app.post('/api/initiate-payment', async (req, res) => {
         console.error('Paynecta request error:', error.response?.data || error.message);
         let errorMsg = 'Payment service error. ';
         if (error.response?.status === 405) {
-            errorMsg += 'HTTP 405: Wrong endpoint or method. Check PAYNECTA_API_URL.';
+            errorMsg += 'HTTP 405: Wrong endpoint. Check that PAYNECTA_API_URL includes /api/v1';
         } else if (error.response?.status === 401) {
             errorMsg += 'Invalid API key or email.';
         } else if (error.response?.status === 404) {
-            errorMsg += 'API endpoint not found. Check PAYNECTA_API_URL.';
+            errorMsg += 'Endpoint not found. Check PAYNECTA_API_URL.';
         } else {
             errorMsg += error.message;
         }
@@ -557,7 +557,6 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
     // If still pending, query Paynecta
     if (pending) {
         try {
-            // Use the transactionId as the transaction_reference (Paynecta expects the reference from init)
             const paynectaRef = pending.paynectaRef || transactionId;
             const paynectaData = await queryPaynectaStatus(paynectaRef);
             if (paynectaData && paynectaData.status === 'completed' && paynectaData.result_code === 0) {
@@ -672,7 +671,16 @@ app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
     res.json({ success: true, token: verifyToken });
 });
 
-// ========== PUBLIC ENDPOINTS (shortened for brevity, but all are present) ==========
+// ========== DEBUG ENDPOINT (temporary, can be removed later) ==========
+app.get('/api/debug-paynecta', (req, res) => {
+    res.json({
+        PAYNECTA_API_URL: process.env.PAYNECTA_API_URL,
+        constructed_init_url: `${process.env.PAYNECTA_API_URL}/payment/initialize`,
+        message: "If the constructed URL contains '/api/v1', then the URL is correct."
+    });
+});
+
+// ========== PUBLIC ENDPOINTS ==========
 app.get('/api/messages', (req, res) => {
     const messages = readJSON(MESSAGES_FILE, []);
     const now = new Date();
