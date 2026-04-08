@@ -147,7 +147,7 @@ const transporter = nodemailer.createTransport({
 });
 
 // ========== PAYNECTA CONFIG ==========
-const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://api.paynecta.co.ke';
+const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
 const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE;
@@ -404,26 +404,32 @@ app.post('/api/admin/restore', isAdmin, upload.single('backupFile'), async (req,
     }
 });
 
-// ========== AUTOMATIC PAYMENT CONFIRMATION (NO MANUAL STEPS) ==========
+// ========== PAYMENT ENDPOINTS (WITH DIRECT PAYNECTA STATUS API) ==========
 
-// Helper function to query Paynecta for transaction status
-async function checkPaynectaStatus(transactionId, phone, amount) {
-    if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
-        return null; // demo mode
+// Helper to query Paynecta status
+async function queryPaynectaStatus(transactionReference) {
+    if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL) {
+        console.log('Paynecta credentials missing – cannot query status');
+        return null;
     }
     try {
-        // Note: Paynecta may have a status endpoint. If not, we rely on webhook or simulation.
-        // For now, we'll return null and let the pending payment time out (will be handled by demo mode fallback).
-        // If Paynecta provides a status API, replace this with the actual call.
-        console.log(`Querying Paynecta status for ${transactionId}...`);
-        // Example (if endpoint exists):
-        // const response = await axios.get(`${PAYNECTA_API_URL}/api/v1/payment/status/${transactionId}`, {
-        //     headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL }
-        // });
-        // return response.data;
+        const url = `${PAYNECTA_API_URL}/payment/status?transaction_reference=${encodeURIComponent(transactionReference)}`;
+        console.log(`Querying Paynecta: ${url}`);
+        
+        const response = await axios.get(url, {
+            headers: {
+                'X-API-Key': PAYNECTA_API_KEY,
+                'X-User-Email': PAYNECTA_EMAIL
+            },
+            timeout: 10000
+        });
+        
+        if (response.data && response.data.success === true && response.data.data) {
+            return response.data.data;
+        }
         return null;
     } catch (err) {
-        console.error('Paynecta status query error:', err.message);
+        console.error('Paynecta status query error:', err.response?.data || err.message);
         return null;
     }
 }
@@ -452,9 +458,9 @@ app.post('/api/initiate-payment', async (req, res) => {
     stats.payments.push({ date: new Date().toISOString(), status: 'pending', amount: parseInt(amount), phone: cleanPhone, productId: parseInt(productId), transactionId });
     writeJSON(STATS_FILE, stats);
     
-    // If no Paynecta credentials, use demo mode (auto-confirm after 5 seconds)
+    // If no Paynecta credentials, use demo mode (auto-confirm after 10 seconds for testing)
     if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
-        console.log('Demo mode: auto-confirming payment in 5 seconds');
+        console.log('Demo mode: auto-confirming payment in 10 seconds');
         setTimeout(() => {
             const payment = pendingPayments.get(transactionId);
             if (payment && payment.status === 'pending') {
@@ -468,13 +474,13 @@ app.post('/api/initiate-payment', async (req, res) => {
                 });
                 console.log(`Demo payment confirmed for ${transactionId}`);
             }
-        }, 5000);
+        }, 10000);
         return res.json({ success: true, transactionId, demoMode: true });
     }
     
     // Real Paynecta
     try {
-        const response = await axios.post(`${PAYNECTA_API_URL}/api/v1/payment/initialize`, {
+        const response = await axios.post(`${PAYNECTA_API_URL}/payment/initialize`, {
             code: PAYNECTA_PAYMENT_CODE, mobile_number: cleanPhone, amount: parseInt(amount)
         }, {
             headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL, 'Content-Type': 'application/json' },
@@ -491,12 +497,14 @@ app.post('/api/initiate-payment', async (req, res) => {
     }
 });
 
-// Payment status endpoint - automatically checks and confirms
+// Payment status endpoint - NOW WITH DIRECT PAYNECTA API QUERY
 app.get('/api/payment-status/:transactionId', async (req, res) => {
     const { transactionId } = req.params;
     console.log(`Checking status for ${transactionId}`);
     
     const pending = pendingPayments.get(transactionId);
+    
+    // If already marked success in memory
     if (pending && pending.status === 'success') {
         const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
         verifiedPayments.set(verifyToken, {
@@ -509,46 +517,62 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
         return res.json({ status: 'success', verified: true, token: verifyToken });
     }
     
+    // If failed
     if (pending && pending.status === 'failed') {
         pendingPayments.delete(transactionId);
         return res.json({ status: 'failed', verified: false });
     }
     
+    // If still pending, query Paynecta directly
     if (pending) {
-        // Try to check with Paynecta if credentials exist (optional)
-        // For now, we'll just return pending. The frontend will keep polling.
-        // You can implement a webhook or a direct status check here if Paynecta supports it.
-        return res.json({ status: 'pending', verified: false });
+        try {
+            const paynectaData = await queryPaynectaStatus(transactionId);
+            if (paynectaData && paynectaData.status === 'completed' && paynectaData.result_code === 0) {
+                // Payment successful!
+                console.log(`✅ Paynecta confirms payment for ${transactionId}`);
+                pending.status = 'success';
+                
+                // Also update stats file
+                const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+                const paymentIndex = stats.payments.findIndex(p => p.transactionId === transactionId);
+                if (paymentIndex !== -1) stats.payments[paymentIndex].status = 'success';
+                writeJSON(STATS_FILE, stats);
+                
+                const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
+                verifiedPayments.set(verifyToken, {
+                    productId: pending.productId, productTitle: pending.productTitle,
+                    productGrade: pending.productGrade, productTerm: pending.productTerm,
+                    fileUrl: pending.fileUrl, transactionId, amount: pending.amount,
+                    expires: Date.now() + 300000
+                });
+                pendingPayments.delete(transactionId);
+                return res.json({ status: 'success', verified: true, token: verifyToken });
+            } else if (paynectaData && (paynectaData.status === 'failed' || paynectaData.status === 'cancelled')) {
+                pending.status = 'failed';
+                pendingPayments.delete(transactionId);
+                return res.json({ status: 'failed', verified: false });
+            }
+            // Still pending
+            return res.json({ status: 'pending', verified: false });
+        } catch (err) {
+            console.error('Error querying Paynecta:', err);
+            return res.json({ status: 'pending', verified: false });
+        }
     }
     
-    // Already verified?
+    // Check already verified (for completed payments that were confirmed earlier)
     for (const [token, data] of verifiedPayments.entries()) {
         if (data.transactionId === transactionId && data.expires > Date.now()) {
             return res.json({ status: 'success', verified: true, token });
         }
     }
+    
     res.json({ status: 'not_found', verified: false });
 });
 
-// Webhook endpoint (for Paynecta to call)
 app.post('/api/payment-webhook', (req, res) => {
-    console.log('Webhook received:', JSON.stringify(req.body, null, 2));
-    const { reference, transactionId, ResultCode, status } = req.body;
-    let txnId = reference || transactionId;
-    const isSuccess = (ResultCode === 0 || status === 'success' || status === 'completed');
-    if (txnId && isSuccess) {
-        for (const [id, payment] of pendingPayments.entries()) {
-            if (id === txnId || id.endsWith(txnId)) {
-                payment.status = 'success';
-                console.log(`Webhook confirmed payment for ${id}`);
-                break;
-            }
-        }
-        const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
-        const p = stats.payments.find(p => p.transactionId === txnId);
-        if (p) p.status = 'success';
-        writeJSON(STATS_FILE, stats);
-    }
+    // Keep webhook endpoint for future use, but not required anymore
+    console.log('Webhook received (optional):', req.body);
     res.sendStatus(200);
 });
 
@@ -616,7 +640,7 @@ app.post('/api/admin/force-confirm', isAdmin, (req, res) => {
     res.json({ success: true, token: verifyToken });
 });
 
-// ========== PUBLIC ENDPOINTS (unchanged) ==========
+// ========== PUBLIC ENDPOINTS (unchanged, but include for completeness) ==========
 app.get('/api/messages', (req, res) => {
     const messages = readJSON(MESSAGES_FILE, []);
     const now = new Date();
