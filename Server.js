@@ -4,160 +4,149 @@ const cors = require('cors');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const nodemailer = require('nodemailer');
+const useragent = require('express-useragent');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(useragent.express());
+app.use(express.json());
 
-// ========== STORAGE SETUP ==========
+// Persistent Storage Directories
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const COVERS_DIR = path.join(DATA_DIR, 'covers');
+[DATA_DIR, UPLOAD_DIR, COVERS_DIR].forEach(d => {
+    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+});
 
 app.use('/uploads', express.static(UPLOAD_DIR));
+app.use('/covers', express.static(COVERS_DIR));
 
-const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
-const AREAS_FILE = path.join(DATA_DIR, 'learning_areas.json');
-
-const readJSON = (f, d = []) => {
-    if (!fs.existsSync(f)) return d;
-    try { return JSON.parse(fs.readFileSync(f)); } catch { return d; }
+const DB = {
+    prods: path.join(DATA_DIR, 'products.json'),
+    conf: path.join(DATA_DIR, 'config.json'),
+    logs: path.join(DATA_DIR, 'logs.json')
 };
-const writeJSON = (f, d) => fs.writeFileSync(f, JSON.stringify(d, null, 2));
 
+const read = (f, d = []) => { try { return JSON.parse(fs.readFileSync(f)); } catch { return d; } };
+const save = (f, d) => fs.writeFileSync(f, JSON.stringify(d, null, 2));
+
+// Initialize System Config
+if (!fs.existsSync(DB.conf)) {
+    save(DB.conf, { password: '0726019859', ticker: 'Welcome to SchemeVault!', tickerActive: false });
+}
+
+// Email Transporter (Gmail)
+const mailer = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+});
+
+// File Upload Logic
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+    destination: (req, file, cb) => cb(null, file.fieldname === 'pdfFile' ? UPLOAD_DIR : COVERS_DIR),
     filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname.replace(/\s/g, '_'))
 });
 const upload = multer({ storage });
 
-const pendingPayments = new Map();
-const verifiedPayments = new Map();
-const downloadTokens = new Map();
+let tempCodes = new Map();
 
-// ========== ADMIN ROUTES ==========
+// --- VISITOR TRACKING ---
+app.post('/api/track', async (req, res) => {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+    let loc = "Unknown Location";
+    try {
+        const g = await axios.get(`http://ip-api.com/json/${ip}?fields=status,city,country`);
+        if(g.data.status === 'success') loc = `${g.data.city}, ${g.data.country}`;
+    } catch(e) {}
+    
+    const logs = read(DB.logs);
+    logs.unshift({
+        ip, loc,
+        device: `${req.useragent.platform} | ${req.useragent.browser}`,
+        time: new Date().toLocaleString()
+    });
+    save(DB.logs, logs.slice(0, 1000));
+    res.sendStatus(200);
+});
+
+// --- ADMIN API ---
 app.post('/api/admin/login', (req, res) => {
-    if (req.body.password === '0726019859') res.json({ success: true, token: 'ADM-' + Date.now() });
+    const conf = read(DB.conf, {});
+    if(req.body.password === conf.password) res.json({ success: true, token: 'ADM_' + Date.now() });
     else res.status(401).json({ success: false });
 });
 
-app.get('/api/admin/products', (req, res) => res.json(readJSON(PRODUCTS_FILE)));
-app.get('/api/admin/learning-areas', (req, res) => res.json(readJSON(AREAS_FILE)));
+app.post('/api/admin/request-code', async (req, res) => {
+    const code = Math.floor(100000 + Math.random() * 900000);
+    tempCodes.set('change', code);
+    try {
+        await mailer.sendMail({
+            from: process.env.EMAIL_USER,
+            to: 'victorngetich388@gmail.com',
+            subject: 'SchemeVault Security Code',
+            text: `Your change code is: ${code}. If you did not request this, ignore.`
+        });
+        res.json({ success: true });
+    } catch(e) { res.status(500).json({ error: 'Mail failed' }); }
+});
 
-app.post('/api/admin/products', upload.single('pdfFile'), (req, res) => {
-    const products = readJSON(PRODUCTS_FILE);
-    const newP = {
+app.post('/api/admin/update-password', (req, res) => {
+    if(req.body.code == tempCodes.get('change')) {
+        const conf = read(DB.conf, {});
+        conf.password = req.body.newPassword;
+        save(DB.conf, conf);
+        tempCodes.delete('change');
+        res.json({ success: true });
+    } else res.status(400).json({ error: 'Invalid code' });
+});
+
+app.post('/api/admin/upload', upload.fields([{name:'pdfFile'}, {name:'coverImage'}]), (req, res) => {
+    const prods = read(DB.prods);
+    prods.push({
         id: Date.now(),
         title: req.body.title,
         grade: req.body.grade,
-        term: parseInt(req.body.term),
-        subject: req.body.subject,
         price: parseInt(req.body.price),
-        visible: req.body.visible === 'true' || req.body.visible === true,
-        fileUrl: `/uploads/${req.file.filename}`
-    };
-    products.push(newP);
-    writeJSON(PRODUCTS_FILE, products);
+        visible: req.body.visible === 'true',
+        hideAt: req.body.hideAt || null,
+        downloads: 0,
+        pdf: `/uploads/${req.files.pdfFile[0].filename}`,
+        cover: req.files.coverImage ? `/covers/${req.files.coverImage[0].filename}` : null
+    });
+    save(DB.prods, prods);
     res.json({ success: true });
 });
 
-app.put('/api/admin/products/:id', (req, res) => {
-    let products = readJSON(PRODUCTS_FILE);
-    const idx = products.findIndex(p => p.id === parseInt(req.params.id));
-    if (idx !== -1) {
-        products[idx] = { ...products[idx], ...req.body };
-        writeJSON(PRODUCTS_FILE, products);
-        res.json({ success: true });
-    } else res.status(404).json({ error: 'Not found' });
+app.get('/api/admin/data', (req, res) => {
+    res.json({ logs: read(DB.logs), prods: read(DB.prods), conf: read(DB.conf, {}) });
 });
 
-app.delete('/api/admin/products/:id', (req, res) => {
-    let products = readJSON(PRODUCTS_FILE);
-    products = products.filter(p => p.id !== parseInt(req.params.id));
-    writeJSON(PRODUCTS_FILE, products);
+app.post('/api/admin/ticker', (req, res) => {
+    const conf = read(DB.conf, {});
+    conf.ticker = req.body.text;
+    conf.tickerActive = req.body.active;
+    save(DB.conf, conf);
     res.json({ success: true });
 });
 
-app.post('/api/admin/learning-areas', (req, res) => {
-    const areas = readJSON(AREAS_FILE);
-    areas.push({ id: Date.now(), name: req.body.name });
-    writeJSON(AREAS_FILE, areas);
+app.delete('/api/admin/product/:id', (req, res) => {
+    let prods = read(DB.prods);
+    prods = prods.filter(p => p.id !== parseInt(req.params.id));
+    save(DB.prods, prods);
     res.json({ success: true });
 });
 
-app.delete('/api/admin/learning-areas/:id', (req, res) => {
-    let areas = readJSON(AREAS_FILE);
-    areas = areas.filter(a => a.id !== parseInt(req.params.id));
-    writeJSON(AREAS_FILE, areas);
-    res.json({ success: true });
+// --- CLIENT API ---
+app.get('/api/client/init', (req, res) => {
+    const conf = read(DB.conf, {});
+    const prods = read(DB.prods).filter(p => {
+        if (!p.visible) return false;
+        if (p.hideAt && new Date(p.hideAt) < new Date()) return false;
+        return true;
+    });
+    res.json({ prods, ticker: conf.tickerActive ? conf.ticker : null });
 });
 
-// ========== CUSTOMER ROUTES ==========
-app.get('/api/products', (req, res) => {
-    res.json(readJSON(PRODUCTS_FILE).filter(p => p.visible !== false));
-});
-
-app.get('/api/learning-areas', (req, res) => res.json(readJSON(AREAS_FILE)));
-
-app.post('/api/initiate-payment', async (req, res) => {
-    const { phone, amount, productId } = req.body;
-    const txnId = 'TXN_' + Date.now();
-    const product = readJSON(PRODUCTS_FILE).find(p => p.id === parseInt(productId));
-    if (!product) return res.status(404).json({ error: 'Product not found' });
-
-    pendingPayments.set(txnId, { productId: product.id, amount, fileUrl: product.fileUrl, title: product.title, timestamp: Date.now(), status: 'pending' });
-
-    if (!process.env.PAYNECTA_API_KEY) return res.json({ success: true, transactionId: txnId });
-
-    try {
-        const response = await axios.post('https://paynecta.co.ke/api/v1/payment/initialize', {
-            code: process.env.PAYNECTA_PAYMENT_CODE,
-            mobile_number: phone.replace(/^0/, '254'),
-            amount: parseInt(amount)
-        }, { headers: { 'X-API-Key': process.env.PAYNECTA_API_KEY, 'X-User-Email': process.env.PAYNECTA_EMAIL } });
-        res.json({ success: true, transactionId: txnId });
-    } catch (e) { res.status(500).json({ error: 'STK Push Failed' }); }
-});
-
-app.get('/api/payment-status/:txnId', (req, res) => {
-    const p = pendingPayments.get(req.params.txnId);
-    if (!p) return res.json({ status: 'not_found' });
-    if (!process.env.PAYNECTA_API_KEY && (Date.now() - p.timestamp > 10000)) p.status = 'success';
-
-    if (p.status === 'success') {
-        const vToken = 'VER_' + Math.random().toString(36).substr(2);
-        verifiedPayments.set(vToken, { ...p, expires: Date.now() + 600000 });
-        pendingPayments.delete(req.params.txnId);
-        return res.json({ status: 'success', verified: true, token: vToken });
-    }
-    res.json({ status: 'pending' });
-});
-
-app.post('/api/request-download', (req, res) => {
-    const { verificationToken, productId } = req.body;
-    const v = verifiedPayments.get(verificationToken);
-    if (!v || v.productId !== parseInt(productId)) return res.status(403).json({ error: 'Session Expired' });
-
-    const dlToken = 'DL_' + Math.random().toString(36).substr(2);
-    downloadTokens.set(dlToken, { fileUrl: v.fileUrl, title: v.title, expires: Date.now() + 120000 });
-    res.json({ success: true, token: dlToken });
-});
-
-app.get('/api/download/:token', (req, res) => {
-    const d = downloadTokens.get(req.params.token);
-    if (!d || d.expires < Date.now()) return res.status(403).send('Expired');
-    const filename = d.fileUrl.split('/').pop();
-    const filePath = path.join(UPLOAD_DIR, filename);
-    if (fs.existsSync(filePath)) {
-        res.download(filePath, `${d.title}${path.extname(filename)}`);
-        downloadTokens.delete(req.params.token);
-    } else res.status(404).send('File missing');
-});
-
-app.get('/api/term-settings', (req, res) => res.json({term1:true, term2:true, term3:true}));
-
-app.listen(PORT, () => console.log(`Server live on ${PORT}`));
+app.listen(3000, () => console.log('Server started on port 3000'));
