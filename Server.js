@@ -27,7 +27,7 @@ if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR, { recursive: true });
 app.use('/uploads', express.static(UPLOAD_DIR));
 app.use('/covers', express.static(COVERS_DIR));
 
-// ========== FILE UPLOAD (supports PDF, DOC, DOCX) ==========
+// ========== FILE UPLOAD (PDF, DOC, DOCX) ==========
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         if (file.fieldname === 'coverImage') cb(null, COVERS_DIR);
@@ -59,7 +59,7 @@ const upload = multer({
     }
 });
 
-// ========== JSON DATA FILES ==========
+// ========== JSON DATA FILES (inside DATA_DIR) ==========
 const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
 const STATS_AGGREGATED_FILE = path.join(DATA_DIR, 'stats_aggregated.json');
 const VISIT_LOGS_FILE = path.join(DATA_DIR, 'visit_logs.json');
