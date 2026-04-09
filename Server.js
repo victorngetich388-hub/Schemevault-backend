@@ -15,8 +15,17 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// ========== PERSISTENT STORAGE (Render Disk) ==========
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+// ========== PERSISTENT STORAGE (with fallback) ==========
+// Use Render Disk if mounted, otherwise local ./data folder
+const DATA_DIR = (() => {
+    if (process.env.DATA_DIR && fs.existsSync(process.env.DATA_DIR)) {
+        return process.env.DATA_DIR;
+    }
+    const fallback = path.join(__dirname, 'data');
+    console.log(`⚠️ DATA_DIR not set or missing. Using fallback: ${fallback}`);
+    return fallback;
+})();
+
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const COVERS_DIR = path.join(DATA_DIR, 'covers');
 
@@ -27,6 +36,10 @@ if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR, { recursive: true });
 
 app.use('/uploads', express.static(UPLOAD_DIR));
 app.use('/covers', express.static(COVERS_DIR));
+
+console.log(`📁 Data directory: ${DATA_DIR}`);
+console.log(`📁 Uploads: ${UPLOAD_DIR}`);
+console.log(`📁 Covers: ${COVERS_DIR}`);
 
 // ========== FILE UPLOAD ==========
 const storage = multer.diskStorage({
@@ -75,10 +88,24 @@ const LEARNING_AREAS_FILE = path.join(DATA_DIR, 'learning_areas.json');
 const GRADES_FILE = path.join(DATA_DIR, 'grades.json');
 
 const readJSON = (file, defaultVal = []) => {
-    if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(defaultVal));
-    return JSON.parse(fs.readFileSync(file));
+    if (!fs.existsSync(file)) {
+        fs.writeFileSync(file, JSON.stringify(defaultVal));
+        return defaultVal;
+    }
+    try {
+        return JSON.parse(fs.readFileSync(file));
+    } catch (err) {
+        console.error(`Error reading ${file}:`, err);
+        return defaultVal;
+    }
 };
-const writeJSON = (file, data) => fs.writeFileSync(file, JSON.stringify(data, null, 2));
+const writeJSON = (file, data) => {
+    try {
+        fs.writeFileSync(file, JSON.stringify(data, null, 2));
+    } catch (err) {
+        console.error(`Error writing ${file}:`, err);
+    }
+};
 
 function getAggregatedStats() {
     return readJSON(STATS_AGGREGATED_FILE, { totalVisits: 0, totalDownloads: 0, totalPayments: 0 });
@@ -161,7 +188,7 @@ const transporter = nodemailer.createTransport({
     },
 });
 
-// ========== PAYNECTA CONFIG (with graceful fallback) ==========
+// ========== PAYNECTA CONFIG (graceful fallback) ==========
 const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
@@ -169,6 +196,8 @@ const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE;
 
 if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
     console.log('⚠️ Paynecta credentials missing. Payments will use demo mode (auto-confirm after 10 seconds).');
+} else {
+    console.log('✅ Paynecta credentials loaded.');
 }
 
 // ========== MULTER ERROR HANDLER ==========
@@ -769,7 +798,7 @@ app.post('/api/initiate-payment', async (req, res) => {
     });
     writeJSON(STATS_FILE, stats);
 
-    // Demo mode if Paynecta credentials missing
+    // Demo mode if credentials missing
     if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
         console.log('Demo mode: auto-confirming in 10 seconds');
         setTimeout(() => {
@@ -843,7 +872,6 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
         const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
         verifiedPayments.set(verifyToken, { ...pending, transactionId, expires: Date.now() + 300000 });
         pendingPayments.delete(transactionId);
-        // track payment
         fetch(`${req.protocol}://${req.get('host')}/api/track-payment`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -951,10 +979,10 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
 
 // ========== HEALTH ==========
 app.get('/ping', (req, res) => res.send('OK'));
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📁 Persistent data directory: ${DATA_DIR}`);
-    console.log(`💳 Paynecta configured: ${PAYNECTA_API_KEY ? 'YES' : 'NO'}`);
+    console.log(`📁 Data directory: ${DATA_DIR}`);
+    console.log(`💳 Paynecta: ${PAYNECTA_API_KEY ? 'configured' : 'demo mode'}`);
 });
