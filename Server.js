@@ -27,7 +27,7 @@ if (!fs.existsSync(COVERS_DIR)) fs.mkdirSync(COVERS_DIR, { recursive: true });
 app.use('/uploads', express.static(UPLOAD_DIR));
 app.use('/covers', express.static(COVERS_DIR));
 
-// ========== FILE UPLOAD (PDF, DOC, DOCX) ==========
+// ========== FILE UPLOAD ==========
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         if (file.fieldname === 'coverImage') cb(null, COVERS_DIR);
@@ -718,23 +718,38 @@ app.delete('/api/admin/messages/:id', isAdmin, (req, res) => {
     res.json({ success: true });
 });
 
-// ========== PAYMENT ENDPOINTS (FIXED) ==========
+// ========== PAYMENT ENDPOINTS (FIXED WITH DETAILED LOGGING) ==========
 async function queryPaynectaStatus(transactionReference) {
-    if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL) return null;
+    if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL) {
+        console.log('⚠️ Paynecta credentials missing, cannot query status');
+        return null;
+    }
     try {
         const url = `${PAYNECTA_API_URL}/payment/status?transaction_reference=${encodeURIComponent(transactionReference)}`;
+        console.log(`📡 Querying Paynecta: ${url}`);
         const response = await axios.get(url, {
-            headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL },
+            headers: {
+                'X-API-Key': PAYNECTA_API_KEY,
+                'X-User-Email': PAYNECTA_EMAIL
+            },
             timeout: 10000
         });
-        if (response.data?.success && response.data?.data) return response.data.data;
+        console.log(`📡 Paynecta response:`, JSON.stringify(response.data, null, 2));
+        if (response.data?.success && response.data?.data) {
+            return response.data.data;
+        }
         return null;
-    } catch (err) { console.error(err); return null; }
+    } catch (err) {
+        console.error(`❌ Status query error:`, err.response?.status, err.response?.data || err.message);
+        return null;
+    }
 }
 
 app.post('/api/initiate-payment', async (req, res) => {
     const { phone, amount, productId } = req.body;
-    if (!phone || !amount || !productId) return res.status(400).json({ success: false, error: 'Missing fields' });
+    if (!phone || !amount || !productId) {
+        return res.status(400).json({ success: false, error: 'Missing fields' });
+    }
     
     let cleanPhone = phone.replace(/\s/g, '');
     if (cleanPhone.startsWith('0')) cleanPhone = '254' + cleanPhone.substring(1);
@@ -751,26 +766,42 @@ app.post('/api/initiate-payment', async (req, res) => {
         phone: cleanPhone, status: 'pending', timestamp: Date.now(), paynectaRef: null
     });
     
+    const stats = readJSON(STATS_FILE, { visits: [], downloads: [], payments: [] });
+    if (!stats.payments) stats.payments = [];
+    stats.payments.push({
+        date: new Date().toISOString(),
+        status: 'pending',
+        amount: parseInt(amount),
+        phone: cleanPhone,
+        productId: parseInt(productId),
+        transactionId
+    });
+    writeJSON(STATS_FILE, stats);
+    
+    // Demo mode if credentials missing
     if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
-        // Demo mode
+        console.log('🎮 Demo mode: auto-confirming payment in 5 seconds');
         setTimeout(() => {
             const payment = pendingPayments.get(transactionId);
             if (payment && payment.status === 'pending') {
                 payment.status = 'success';
                 const verifyToken = 'DEMO_' + Date.now() + '_' + transactionId;
-                verifiedPayments.set(verifyToken, { ...payment, transactionId, expires: Date.now() + 300000 });
-                fetch(`${req.protocol}://${req.get('host')}/api/track-payment`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ transactionId, amount: payment.amount, productId: payment.productId })
-                }).catch(() => {});
+                verifiedPayments.set(verifyToken, {
+                    productId: payment.productId, productTitle: payment.productTitle,
+                    productGrade: payment.productGrade, productTerm: payment.productTerm,
+                    fileUrl: payment.fileUrl, transactionId, amount: payment.amount,
+                    expires: Date.now() + 300000
+                });
+                console.log(`✅ Demo payment confirmed for ${transactionId}`);
             }
-        }, 10000);
+        }, 5000);
         return res.json({ success: true, transactionId, demoMode: true });
     }
     
+    // Real Paynecta
     try {
         const initUrl = `${PAYNECTA_API_URL}/payment/initialize`;
+        console.log(`💳 Initiating STK Push to: ${initUrl}`);
         const response = await axios.post(initUrl, {
             code: PAYNECTA_PAYMENT_CODE,
             mobile_number: cleanPhone,
@@ -784,20 +815,27 @@ app.post('/api/initiate-payment', async (req, res) => {
             timeout: 30000
         });
         
+        console.log(`💳 Paynecta init response:`, JSON.stringify(response.data, null, 2));
+        
         if (response.data?.success === true) {
-            // IMPORTANT: Store the transaction_reference
-            const paynectaRef = response.data.data?.transaction_reference || response.data.data?.checkout_request_id;
+            const paynectaRef = response.data.data?.transaction_reference || 
+                               response.data.data?.checkout_request_id ||
+                               response.data.data?.reference ||
+                               null;
             const payment = pendingPayments.get(transactionId);
             if (payment && paynectaRef) {
                 payment.paynectaRef = paynectaRef;
                 console.log(`✅ Stored Paynecta reference: ${paynectaRef}`);
+            } else {
+                console.log(`⚠️ No transaction_reference received from Paynecta. Will use transactionId as fallback.`);
             }
             res.json({ success: true, transactionId });
         } else {
+            console.error(`❌ Paynecta init failed:`, response.data?.message);
             res.status(400).json({ success: false, error: response.data?.message || 'Payment initiation failed' });
         }
     } catch (error) {
-        console.error('Paynecta error:', error.message);
+        console.error(`❌ Paynecta request error:`, error.response?.data || error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -811,22 +849,25 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
         // Already verified?
         for (const [token, data] of verifiedPayments.entries()) {
             if (data.transactionId === transactionId && data.expires > Date.now()) {
+                console.log(`✅ Found already verified payment for ${transactionId}`);
                 return res.json({ status: 'success', verified: true, token });
             }
         }
         return res.json({ status: 'not_found', verified: false });
     }
     
+    // Already marked success in memory?
     if (pending.status === 'success') {
         const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
         verifiedPayments.set(verifyToken, { ...pending, transactionId, expires: Date.now() + 300000 });
         pendingPayments.delete(transactionId);
+        console.log(`✅ Payment already success in memory for ${transactionId}`);
         return res.json({ status: 'success', verified: true, token: verifyToken });
     }
     
     // Query Paynecta
     const paynectaRef = pending.paynectaRef || transactionId;
-    console.log(`📡 Querying Paynecta with ref: ${paynectaRef}`);
+    console.log(`📡 Querying Paynecta with reference: ${paynectaRef}`);
     const paynectaData = await queryPaynectaStatus(paynectaRef);
     
     if (paynectaData && paynectaData.status === 'completed' && paynectaData.result_code === 0) {
@@ -835,12 +876,14 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
         const verifyToken = 'VER_' + Date.now() + '_' + transactionId;
         verifiedPayments.set(verifyToken, { ...pending, transactionId, expires: Date.now() + 300000 });
         pendingPayments.delete(transactionId);
+        
         // Track payment
         fetch(`${req.protocol}://${req.get('host')}/api/track-payment`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ transactionId, amount: pending.amount, productId: pending.productId })
         }).catch(() => {});
+        
         return res.json({ status: 'success', verified: true, token: verifyToken });
     } else if (paynectaData && (paynectaData.status === 'failed' || paynectaData.status === 'cancelled')) {
         console.log(`❌ Payment failed for ${transactionId}`);
@@ -849,6 +892,7 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
         return res.json({ status: 'failed', verified: false });
     }
     
+    console.log(`⏳ Payment still pending for ${transactionId}`);
     return res.json({ status: 'pending', verified: false });
 });
 
@@ -870,7 +914,8 @@ app.post('/api/request-download', (req, res) => {
     else filename += '.pdf';
     
     downloadTokens.set(downloadToken, {
-        productId: verified.productId, fileUrl: verified.fileUrl,
+        productId: verified.productId,
+        fileUrl: verified.fileUrl,
         filename: filename,
         expires: Date.now() + 120000
     });
@@ -946,6 +991,19 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
     res.json({ summary: aggregated, storageUsed: storageMB });
 });
 
+// ========== DEBUG ENDPOINT (temporary) ==========
+app.get('/api/debug-pending', isAdmin, (req, res) => {
+    const pending = Array.from(pendingPayments.entries()).map(([id, p]) => ({
+        transactionId: id,
+        paynectaRef: p.paynectaRef,
+        status: p.status,
+        productTitle: p.productTitle,
+        amount: p.amount,
+        timestamp: p.timestamp
+    }));
+    res.json({ pending });
+});
+
 // ========== HEALTH ==========
 app.get('/ping', (req, res) => res.send('OK'));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
@@ -953,4 +1011,5 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`📁 Persistent data directory: ${DATA_DIR}`);
+    console.log(`💳 Paynecta configured: ${PAYNECTA_API_KEY ? 'YES' : 'NO'}`);
 });
