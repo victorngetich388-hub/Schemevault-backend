@@ -201,15 +201,31 @@ app.post('/api/leave', (req, res) => {
   res.json({ success: true });
 });
 
-// ---------- PAYMENT FLOW ----------
+// ---------- PAYMENT FLOW (FIXED WITH DETAILED LOGGING) ----------
 app.post('/api/initiate-payment', async (req, res) => {
+  console.log('=== PAYMENT INITIATION ===');
+  console.log('Request body:', JSON.stringify(req.body));
+  
   const { phone, amount, productId } = req.body;
-  if (!phone || !amount || !productId) return res.status(400).json({ error: 'Missing fields' });
+  
+  if (!phone || !amount || !productId) {
+    console.log('Missing fields');
+    return res.status(400).json({ error: 'Phone, amount, and product ID are required' });
+  }
+  
   const product = readJSON('products.json').find(p => p.id === productId);
-  if (!product) return res.status(404).json({ error: 'Product not found' });
+  if (!product) {
+    console.log('Product not found:', productId);
+    return res.status(404).json({ error: 'Product not found' });
+  }
 
   const transactionId = uuidv4();
   const formattedPhone = phone.replace(/^0/, '254').replace(/\D/g, '');
+  
+  console.log('Formatted phone:', formattedPhone);
+  console.log('Amount:', amount);
+  console.log('Product:', product.title);
+
   const pending = {
     transactionId,
     productId,
@@ -221,35 +237,94 @@ app.post('/api/initiate-payment', async (req, res) => {
   };
   pendingPayments.set(transactionId, pending);
 
+  console.log('Paynecta credentials present:', {
+    apiKey: !!PAYNECTA_API_KEY,
+    email: !!PAYNECTA_EMAIL,
+    paymentCode: !!PAYNECTA_PAYMENT_CODE
+  });
+
+  // Demo mode if credentials missing
   if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
     console.log('Demo mode: auto-confirm after 10s');
     setTimeout(() => {
       const p = pendingPayments.get(transactionId);
       if (p) p.status = 'completed';
     }, 10000);
-    return res.json({ success: true, transactionId });
+    return res.json({ success: true, transactionId, demo: true });
   }
 
   try {
-    const response = await axios.post(`${PAYNECTA_API_URL}/payment/initialize`, {
+    const payload = {
       payment_code: PAYNECTA_PAYMENT_CODE,
-      mobile_number: formattedPhone,
-      amount: amount
-    }, {
-      headers: {
-        'X-API-Key': PAYNECTA_API_KEY,
-        'X-User-Email': PAYNECTA_EMAIL,
-        'Content-Type': 'application/json'
+      mobile_number: formattedPhone,   // Try "phone_number" if this fails
+      amount: String(amount)           // Some gateways require string
+    };
+    
+    console.log('Paynecta request payload:', JSON.stringify(payload));
+    console.log('Paynecta URL:', `${PAYNECTA_API_URL}/payment/initialize`);
+    
+    const response = await axios.post(
+      `${PAYNECTA_API_URL}/payment/initialize`,
+      payload,
+      {
+        headers: {
+          'X-API-Key': PAYNECTA_API_KEY,
+          'X-User-Email': PAYNECTA_EMAIL,
+          'Content-Type': 'application/json'
+        },
+        timeout: 20000
       }
-    });
-    const { transaction_reference } = response.data;
-    pending.transaction_reference = transaction_reference;
+    );
+    
+    console.log('Paynecta response status:', response.status);
+    console.log('Paynecta response data:', JSON.stringify(response.data));
+    
+    const { transaction_reference, checkout_request_id } = response.data;
+    const reference = transaction_reference || checkout_request_id;
+    
+    if (!reference) {
+      console.error('No transaction reference in response');
+      throw new Error('No transaction reference received from Paynecta');
+    }
+    
+    pending.transaction_reference = reference;
     pendingPayments.set(transactionId, pending);
+    
     res.json({ success: true, transactionId });
+    
   } catch (error) {
-    console.error('Paynecta init error:', error.response?.data || error.message);
+    console.error('=== PAYNECTA ERROR ===');
+    if (error.response) {
+      console.error('Status:', error.response.status);
+      console.error('Headers:', JSON.stringify(error.response.headers));
+      console.error('Data:', JSON.stringify(error.response.data));
+    } else if (error.request) {
+      console.error('No response received. Request:', error.request._currentUrl);
+      console.error('Error code:', error.code);
+    } else {
+      console.error('Error message:', error.message);
+    }
+    console.error('Full error:', error);
+    
     pending.status = 'failed';
-    res.status(500).json({ error: 'Payment initiation failed' });
+    pendingPayments.set(transactionId, pending);
+    
+    let errorMessage = 'Payment initiation failed';
+    if (error.response?.data?.message) {
+      errorMessage = error.response.data.message;
+    } else if (error.response?.data?.error) {
+      errorMessage = error.response.data.error;
+    } else if (error.response?.status === 401) {
+      errorMessage = 'Invalid API credentials';
+    } else if (error.response?.status === 400) {
+      errorMessage = 'Invalid request – check payment code or phone number';
+    } else if (error.code === 'ECONNABORTED') {
+      errorMessage = 'Payment gateway timeout';
+    } else if (error.code === 'ENOTFOUND') {
+      errorMessage = 'Cannot reach payment gateway';
+    }
+    
+    res.status(500).json({ error: errorMessage });
   }
 });
 
