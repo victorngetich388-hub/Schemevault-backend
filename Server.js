@@ -1,226 +1,458 @@
 const express = require('express');
-const cors = require('cors');
 const multer = require('multer');
+const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-
+const archiver = require('archiver');
+const unzipper = require('unzipper');
+const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-// Persistent storage
+// ---------- Configuration ----------
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const COVERS_DIR = path.join(DATA_DIR, 'covers');
+const ADMIN_PASSWORD = '0726019859';
+const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
+const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY || '';
+const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL || '';
+const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE || '';
 
-[DATA_DIR, UPLOAD_DIR, COVERS_DIR].forEach(dir => {
+// Ensure directories exist
+[DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(dir => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-app.use('/uploads', express.static(UPLOAD_DIR));
+// ---------- Data Helpers ----------
+const readJSON = (file) => {
+  const filePath = path.join(DATA_DIR, file);
+  if (!fs.existsSync(filePath)) return [];
+  try { return JSON.parse(fs.readFileSync(filePath, 'utf-8')); } catch { return []; }
+};
+const writeJSON = (file, data) => fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data, null, 2));
+
+// In-memory stores
+const pendingPayments = new Map();
+const downloadTokens = new Map();
+const verificationTokens = new Map();
+
+// Cache version for frontend sync
+let cacheVersion = 1;
+const bumpCache = () => { cacheVersion++; };
+
+// ---------- Middleware ----------
+app.use(cors());
+app.use(express.json());
+app.use('/uploads', express.static(UPLOADS_DIR));
 app.use('/covers', express.static(COVERS_DIR));
 
-console.log(`📁 Using data dir: ${DATA_DIR}`);
-
-// Multer for uploads
+// Multer
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, file.fieldname === 'coverImage' ? COVERS_DIR : UPLOAD_DIR);
+    const isCover = req.path.includes('cover');
+    cb(null, isCover ? COVERS_DIR : UPLOADS_DIR);
   },
   filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + file.originalname.replace(/\s/g, '_'));
+    const ext = path.extname(file.originalname);
+    cb(null, `${Date.now()}-${Math.round(Math.random() * 1E9)}${ext}`);
   }
 });
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 }
-});
-
-// JSON helpers
-const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
-const LEARNING_AREAS_FILE = path.join(DATA_DIR, 'learning_areas.json');
-const GRADES_FILE = path.join(DATA_DIR, 'grades.json');
-const TERM_SETTINGS_FILE = path.join(DATA_DIR, 'term_settings.json');
-
-const readJSON = (file, defaultVal = []) => {
-  if (!fs.existsSync(file)) {
-    fs.writeFileSync(file, JSON.stringify(defaultVal, null, 2));
-    return defaultVal;
+const fileFilter = (req, file, cb) => {
+  const allowedDoc = /pdf|doc|docx/;
+  const allowedImg = /jpeg|jpg|png|webp/;
+  const isCover = req.path.includes('cover');
+  const ext = path.extname(file.originalname).toLowerCase().slice(1);
+  if ((isCover && allowedImg.test(ext)) || (!isCover && allowedDoc.test(ext))) {
+    cb(null, true);
+  } else {
+    cb(new Error(isCover ? 'Only images allowed' : 'Only PDF/DOC/DOCX allowed'));
   }
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch (e) { return defaultVal; }
+};
+const upload = multer({ storage, fileFilter, limits: { fileSize: 50 * 1024 * 1024 } });
+
+// ---------- Auth Middleware ----------
+const adminAuth = (req, res, next) => {
+  const token = req.headers['x-admin-token'];
+  if (token === Buffer.from(ADMIN_PASSWORD).toString('base64')) return next();
+  res.status(401).json({ error: 'Unauthorized' });
 };
 
-const writeJSON = (file, data) => {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+// ---------- Helper: Visitor Logging ----------
+const logVisit = (req) => {
+  const logs = readJSON('visits.json');
+  logs.push({
+    ip: req.ip,
+    userAgent: req.headers['user-agent'],
+    timestamp: new Date().toISOString(),
+  });
+  writeJSON('visits.json', logs.slice(-1000));
+  const stats = readJSON('stats.json') || { visits: 0, downloads: 0, payments: 0 };
+  stats.visits = (stats.visits || 0) + 1;
+  writeJSON('stats.json', stats);
 };
 
-// ADMIN PASSWORD (change in Render Environment Variables if needed)
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '0726019859';
+app.use((req, res, next) => { if (req.method === 'GET') logVisit(req); next(); });
 
-// HEALTH CHECKS - This fixes the "Cannot GET /ping" issue
-app.get('/ping', (req, res) => res.send('OK'));
+// ---------- PUBLIC ENDPOINTS ----------
+
+// Health
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// ADMIN LOGIN - Fixed token handling
-app.post('/api/admin/login', (req, res) => {
-  const { password } = req.body;
-  if (password === ADMIN_PASSWORD) {
-    const token = 'admin_' + Date.now() + '_' + Math.random().toString(36).substring(2);
-    res.json({ success: true, token });
-  } else {
-    res.status(401).json({ success: false, error: 'Wrong password' });
-  }
+// Products + metadata
+app.get('/api/products', (req, res) => {
+  const products = readJSON('products.json');
+  res.json(products);
 });
 
-function isAdmin(req, res, next) {
-  const token = req.headers['x-admin-token'];
-  if (token && token.startsWith('admin_')) return next();
-  res.status(401).json({ error: 'Unauthorized' });
-}
+// Banner
+app.get('/api/banner', (req, res) => {
+  const banner = readJSON('banner.json') || { text: '', enabled: false };
+  res.json(banner);
+});
 
-// Learning Areas
-app.get('/api/admin/learning-areas', isAdmin, (req, res) => res.json(readJSON(LEARNING_AREAS_FILE, [])));
-app.get('/api/learning-areas', (req, res) => res.json(readJSON(LEARNING_AREAS_FILE, []).filter(a => a.active !== false)));
+// WhatsApp
+app.get('/api/admin/whatsapp', (req, res) => {
+  const wa = readJSON('whatsapp.json') || { enabled: false, number: '', message: 'Hello' };
+  res.json(wa);
+});
 
-app.post('/api/admin/learning-areas', isAdmin, (req, res) => {
-  const { name } = req.body;
-  if (!name) return res.status(400).json({ error: 'Name required' });
-  let areas = readJSON(LEARNING_AREAS_FILE, []);
-  const newId = areas.length ? Math.max(...areas.map(a => a.id || 0)) + 1 : 1;
-  areas.push({ id: newId, name, active: true });
-  writeJSON(LEARNING_AREAS_FILE, areas);
+// Term settings (public format)
+app.get('/api/term-settings', (req, res) => {
+  const terms = readJSON('terms.json') || { enabled: [1,2,3], default: 1 };
+  res.json({
+    term1: terms.enabled.includes(1),
+    term2: terms.enabled.includes(2),
+    term3: terms.enabled.includes(3),
+    defaultTerm: terms.default
+  });
+});
+
+// Popups
+app.get('/api/popups', (req, res) => {
+  const popups = readJSON('popups.json') || [];
+  res.json(popups);
+});
+
+// Submit feedback
+app.post('/api/submit-feedback', (req, res) => {
+  const { message, whatsapp } = req.body;
+  const feedbacks = readJSON('feedback.json') || [];
+  feedbacks.push({ id: uuidv4(), message, whatsapp, timestamp: new Date().toISOString() });
+  writeJSON('feedback.json', feedbacks);
   res.json({ success: true });
 });
 
-app.delete('/api/admin/learning-areas/:id', isAdmin, (req, res) => {
-  const id = parseInt(req.params.id);
-  let areas = readJSON(LEARNING_AREAS_FILE, []);
-  areas = areas.filter(a => a.id !== id);
-  writeJSON(LEARNING_AREAS_FILE, areas);
-  res.json({ success: true });
+// Cache version
+app.get('/api/cache-version', (req, res) => {
+  res.json({ version: cacheVersion });
 });
 
 // Grades
-app.get('/api/admin/grades', isAdmin, (req, res) => res.json(readJSON(GRADES_FILE, [])));
-app.post('/api/admin/grades', isAdmin, (req, res) => {
-  const { name } = req.body;
-  if (!name) return res.status(400).json({ error: 'Name required' });
-  let grades = readJSON(GRADES_FILE, []);
-  const newId = grades.length ? Math.max(...grades.map(g => g.id || 0)) + 1 : 1;
-  grades.push({ id: newId, name, active: true });
-  writeJSON(GRADES_FILE, grades);
-  res.json({ success: true });
-});
-
-app.delete('/api/admin/grades/:id', isAdmin, (req, res) => {
-  const id = parseInt(req.params.id);
-  let grades = readJSON(GRADES_FILE, []);
-  grades = grades.filter(g => g.id !== id);
-  writeJSON(GRADES_FILE, grades);
-  res.json({ success: true });
-});
-
-// Products (with cover + pages)
-app.get('/api/admin/products', isAdmin, (req, res) => res.json(readJSON(PRODUCTS_FILE, [])));
-app.get('/api/products', (req, res) => res.json(readJSON(PRODUCTS_FILE, []).filter(p => p.visible !== false)));
-
-app.post('/api/admin/products', isAdmin, upload.fields([{name:'pdfFile', maxCount:1}, {name:'coverImage', maxCount:1}]), (req, res) => {
-  try {
-    const { title, grade, term, subject, price, pages, visible } = req.body;
-    const pdfFile = req.files?.pdfFile?.[0];
-    if (!title || !grade || !term || !subject || !price || !pdfFile) {
-      return res.status(400).json({ error: 'Missing fields or PDF' });
-    }
-    const fileUrl = `/uploads/${pdfFile.filename}`;
-    const coverFile = req.files?.coverImage?.[0];
-    const coverUrl = coverFile ? `/covers/${coverFile.filename}` : null;
-
-    const products = readJSON(PRODUCTS_FILE, []);
-    const newId = products.length ? Math.max(...products.map(p => p.id || 0)) + 1 : 1;
-
-    const newProduct = {
-      id: newId, title, grade, term: parseInt(term), subject,
-      price: parseInt(price), pages: pages ? parseInt(pages) : null,
-      fileUrl, coverUrl, visible: visible === 'true' || visible === true,
-      createdAt: new Date().toISOString()
-    };
-
-    products.push(newProduct);
-    writeJSON(PRODUCTS_FILE, products);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+app.get('/api/grades', (req, res) => {
+  let grades = readJSON('grades.json');
+  if (!grades.length) {
+    grades = Array.from({ length: 9 }, (_, i) => ({ name: `Grade ${i+1}`, active: true }));
+    writeJSON('grades.json', grades);
   }
+  res.json(grades);
 });
 
-app.put('/api/admin/products/:id', isAdmin, (req, res) => {
-  const id = parseInt(req.params.id);
-  let products = readJSON(PRODUCTS_FILE, []);
-  const index = products.findIndex(p => p.id === id);
-  if (index === -1) return res.status(404).json({ error: 'Not found' });
-  products[index] = { ...products[index], ...req.body };
-  writeJSON(PRODUCTS_FILE, products);
+// Learning areas (subjects)
+app.get('/api/learning-areas', (req, res) => {
+  const areas = readJSON('subjects.json') || [];
+  res.json(areas);
+});
+
+// Track visit (POST)
+app.post('/api/track-visit', (req, res) => {
+  logVisit(req);
   res.json({ success: true });
 });
 
-app.delete('/api/admin/products/:id', isAdmin, (req, res) => {
-  const id = parseInt(req.params.id);
-  let products = readJSON(PRODUCTS_FILE, []);
-  const product = products.find(p => p.id === id);
-  if (product) {
-    if (product.fileUrl) {
-      const fn = product.fileUrl.split('/').pop();
-      fs.unlinkSync(path.join(UPLOAD_DIR, fn)).catch(() => {});
-    }
-    if (product.coverUrl) {
-      const fn = product.coverUrl.split('/').pop();
-      fs.unlinkSync(path.join(COVERS_DIR, fn)).catch(() => {});
-    }
-  }
-  products = products.filter(p => p.id !== id);
-  writeJSON(PRODUCTS_FILE, products);
+// Heartbeat
+app.post('/api/heartbeat', (req, res) => {
+  const { sessionId } = req.body;
+  const sessions = readJSON('sessions.json') || {};
+  sessions[sessionId] = Date.now();
+  writeJSON('sessions.json', sessions);
   res.json({ success: true });
 });
 
-// Simple banner for running advert
-app.get('/api/admin/banner', isAdmin, (req, res) => res.json({ enabled: true, text: 'Welcome to SchemeVault - Premium CBE Schemes' }));
+// Leave
+app.post('/api/leave', (req, res) => {
+  const { sessionId } = req.body;
+  const sessions = readJSON('sessions.json') || {};
+  delete sessions[sessionId];
+  writeJSON('sessions.json', sessions);
+  res.json({ success: true });
+});
 
-// Basic payment demo (STK push simulation)
-const pending = new Map();
-const verified = new Map();
-
-app.post('/api/initiate-payment', (req, res) => {
+// ---------- PAYMENT FLOW ----------
+app.post('/api/initiate-payment', async (req, res) => {
   const { phone, amount, productId } = req.body;
-  const txId = 'TXN_' + Date.now();
-  setTimeout(() => {
-    const vToken = 'VER_' + Date.now();
-    verified.set(vToken, { productId: parseInt(productId), expires: Date.now() + 300000 });
-  }, 7000);
-  res.json({ success: true, transactionId: txId });
+  if (!phone || !amount || !productId) return res.status(400).json({ error: 'Missing fields' });
+  const product = readJSON('products.json').find(p => p.id === productId);
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+
+  const transactionId = uuidv4();
+  const formattedPhone = phone.replace(/^0/, '254').replace(/\D/g, '');
+  const pending = {
+    transactionId,
+    productId,
+    amount,
+    phone: formattedPhone,
+    status: 'pending',
+    createdAt: Date.now(),
+    fileUrl: product.fileUrl,
+  };
+  pendingPayments.set(transactionId, pending);
+
+  if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
+    console.log('Demo mode: auto-confirm after 10s');
+    setTimeout(() => {
+      const p = pendingPayments.get(transactionId);
+      if (p) p.status = 'completed';
+    }, 10000);
+    return res.json({ success: true, transactionId });
+  }
+
+  try {
+    const response = await axios.post(`${PAYNECTA_API_URL}/payment/initialize`, {
+      payment_code: PAYNECTA_PAYMENT_CODE,
+      mobile_number: formattedPhone,
+      amount: amount
+    }, {
+      headers: {
+        'X-API-Key': PAYNECTA_API_KEY,
+        'X-User-Email': PAYNECTA_EMAIL,
+        'Content-Type': 'application/json'
+      }
+    });
+    const { transaction_reference } = response.data;
+    pending.transaction_reference = transaction_reference;
+    pendingPayments.set(transactionId, pending);
+    res.json({ success: true, transactionId });
+  } catch (error) {
+    console.error('Paynecta init error:', error.response?.data || error.message);
+    pending.status = 'failed';
+    res.status(500).json({ error: 'Payment initiation failed' });
+  }
 });
 
-app.get('/api/payment-status/:transactionId', (req, res) => {
-  for (const [token, data] of verified) {
-    if (data.expires > Date.now()) return res.json({ verified: true, token });
+app.get('/api/payment-status/:transactionId', async (req, res) => {
+  const { transactionId } = req.params;
+  const pending = pendingPayments.get(transactionId);
+  if (!pending) return res.status(404).json({ error: 'Transaction not found' });
+
+  if (pending.status === 'completed') {
+    const token = uuidv4();
+    verificationTokens.set(token, { productId: pending.productId, expires: Date.now() + 5 * 60 * 1000 });
+    return res.json({ status: 'success', verified: true, token });
   }
-  res.json({ verified: false });
+
+  if (pending.status === 'failed') return res.json({ status: 'failed' });
+
+  if (pending.transaction_reference && PAYNECTA_API_KEY) {
+    try {
+      const response = await axios.get(`${PAYNECTA_API_URL}/payment/status`, {
+        params: { transaction_reference: pending.transaction_reference },
+        headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL }
+      });
+      const data = response.data;
+      if (data.status === 'completed' && data.result_code === '0') {
+        pending.status = 'completed';
+        pendingPayments.set(transactionId, pending);
+        const stats = readJSON('stats.json') || {};
+        stats.payments = (stats.payments || 0) + 1;
+        writeJSON('stats.json', stats);
+        const payments = readJSON('payments.json');
+        payments.push({ transactionId, productId: pending.productId, amount: pending.amount, timestamp: new Date().toISOString() });
+        writeJSON('payments.json', payments);
+        bumpCache();
+        const token = uuidv4();
+        verificationTokens.set(token, { productId: pending.productId, expires: Date.now() + 5 * 60 * 1000 });
+        return res.json({ status: 'success', verified: true, token });
+      }
+    } catch (e) { /* ignore */ }
+  }
+  res.json({ status: 'pending' });
 });
 
 app.post('/api/request-download', (req, res) => {
-  const { verificationToken } = req.body;
-  if (verified.has(verificationToken)) {
-    res.json({ success: true, token: 'DL_' + Date.now() });
-    verified.delete(verificationToken);
-  } else res.status(403).json({ error: 'Invalid token' });
+  const { verificationToken, productId } = req.body;
+  const v = verificationTokens.get(verificationToken);
+  if (!v || v.productId !== productId || v.expires < Date.now()) {
+    return res.status(403).json({ error: 'Invalid or expired token' });
+  }
+  verificationTokens.delete(verificationToken);
+  const downloadToken = uuidv4();
+  downloadTokens.set(downloadToken, { productId, expires: Date.now() + 2 * 60 * 1000 });
+  const stats = readJSON('stats.json') || {};
+  stats.downloads = (stats.downloads || 0) + 1;
+  writeJSON('stats.json', stats);
+  const downloads = readJSON('downloads.json');
+  downloads.push({ productId, timestamp: new Date().toISOString() });
+  writeJSON('downloads.json', downloads);
+  bumpCache();
+  res.json({ success: true, token: downloadToken });
 });
 
-app.get('/api/download/:token', (req, res) => res.send('Download link active'));
-
-app.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
+app.get('/api/download/:token', (req, res) => {
+  const { token } = req.params;
+  const d = downloadTokens.get(token);
+  if (!d || d.expires < Date.now()) return res.status(403).send('Invalid or expired download link');
+  const product = readJSON('products.json').find(p => p.id === d.productId);
+  if (!product) return res.status(404).send('Product not found');
+  downloadTokens.delete(token);
+  const filePath = path.join(UPLOADS_DIR, path.basename(product.fileUrl));
+  res.download(filePath, product.title + path.extname(filePath));
 });
+
+// ---------- ADMIN ENDPOINTS (all protected) ----------
+app.post('/api/admin/login', (req, res) => {
+  const { password } = req.body;
+  if (password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
+  res.json({ token: Buffer.from(ADMIN_PASSWORD).toString('base64') });
+});
+
+app.get('/api/admin/stats', adminAuth, (req, res) => {
+  const stats = readJSON('stats.json') || { visits: 0, downloads: 0, payments: 0 };
+  const sessions = readJSON('sessions.json') || {};
+  const activeUsers = Object.values(sessions).filter(ts => Date.now() - ts < 60000).length;
+  res.json({ ...stats, activeUsers });
+});
+
+// Subjects (Learning Areas)
+app.get('/api/admin/subjects', adminAuth, (req, res) => res.json(readJSON('subjects.json')));
+app.post('/api/admin/subjects', adminAuth, (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  const subjects = readJSON('subjects.json');
+  const newSubject = { id: uuidv4(), name };
+  subjects.push(newSubject);
+  writeJSON('subjects.json', subjects);
+  bumpCache();
+  res.json(newSubject);
+});
+app.delete('/api/admin/subjects/:id', adminAuth, (req, res) => {
+  let subjects = readJSON('subjects.json');
+  subjects = subjects.filter(s => s.id !== req.params.id);
+  writeJSON('subjects.json', subjects);
+  bumpCache();
+  res.json({ success: true });
+});
+
+// Products
+app.post('/api/admin/products', adminAuth, upload.fields([{ name: 'document' }, { name: 'cover' }]), (req, res) => {
+  const { title, grade, subject, term, weeks, price, pages, visibility } = req.body;
+  const docFile = req.files['document']?.[0];
+  if (!docFile) return res.status(400).json({ error: 'Document required' });
+  const products = readJSON('products.json');
+  const newProduct = {
+    id: uuidv4(),
+    title,
+    grade,
+    subject,
+    term: parseInt(term),
+    weeks: parseInt(weeks),
+    price: parseFloat(price),
+    pages: pages || '',
+    fileUrl: `/uploads/${docFile.filename}`,
+    coverUrl: req.files['cover']?.[0] ? `/covers/${req.files['cover'][0].filename}` : null,
+    visibility: visibility === 'true' || visibility === true,
+    createdAt: new Date().toISOString()
+  };
+  products.push(newProduct);
+  writeJSON('products.json', products);
+  bumpCache();
+  res.json(newProduct);
+});
+
+app.put('/api/admin/products/:id', adminAuth, (req, res) => {
+  const products = readJSON('products.json');
+  const index = products.findIndex(p => p.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: 'Not found' });
+  products[index] = { ...products[index], ...req.body };
+  writeJSON('products.json', products);
+  bumpCache();
+  res.json(products[index]);
+});
+
+app.delete('/api/admin/products/:id', adminAuth, (req, res) => {
+  let products = readJSON('products.json');
+  const product = products.find(p => p.id === req.params.id);
+  if (!product) return res.status(404).json({ error: 'Not found' });
+  try { if (product.fileUrl) fs.unlinkSync(path.join(UPLOADS_DIR, path.basename(product.fileUrl))); } catch {}
+  try { if (product.coverUrl) fs.unlinkSync(path.join(COVERS_DIR, path.basename(product.coverUrl))); } catch {}
+  products = products.filter(p => p.id !== req.params.id);
+  writeJSON('products.json', products);
+  bumpCache();
+  res.json({ success: true });
+});
+
+// Terms settings
+app.get('/api/admin/terms', adminAuth, (req, res) => res.json(readJSON('terms.json') || { enabled: [1,2,3], default: 1 }));
+app.post('/api/admin/terms', adminAuth, (req, res) => {
+  writeJSON('terms.json', req.body);
+  bumpCache();
+  res.json({ success: true });
+});
+
+// Banner
+app.get('/api/admin/banner', adminAuth, (req, res) => res.json(readJSON('banner.json') || {}));
+app.post('/api/admin/banner', adminAuth, (req, res) => {
+  writeJSON('banner.json', req.body);
+  bumpCache();
+  res.json({ success: true });
+});
+
+// Popups
+app.get('/api/admin/popups', adminAuth, (req, res) => res.json(readJSON('popups.json')));
+app.post('/api/admin/popups', adminAuth, (req, res) => {
+  const popups = readJSON('popups.json');
+  const newPopup = { id: uuidv4(), ...req.body };
+  popups.push(newPopup);
+  writeJSON('popups.json', popups);
+  bumpCache();
+  res.json(newPopup);
+});
+app.delete('/api/admin/popups/:id', adminAuth, (req, res) => {
+  let popups = readJSON('popups.json');
+  popups = popups.filter(p => p.id !== req.params.id);
+  writeJSON('popups.json', popups);
+  bumpCache();
+  res.json({ success: true });
+});
+
+// WhatsApp
+app.get('/api/admin/wa', adminAuth, (req, res) => res.json(readJSON('whatsapp.json') || {}));
+app.post('/api/admin/wa', adminAuth, (req, res) => {
+  writeJSON('whatsapp.json', req.body);
+  bumpCache();
+  res.json({ success: true });
+});
+
+// Backup & Restore
+app.get('/api/admin/backup', adminAuth, (req, res) => {
+  const archive = archiver('zip', { zlib: { level: 9 } });
+  res.attachment('schemevault-backup.zip');
+  archive.pipe(res);
+  archive.directory(DATA_DIR, false);
+  archive.finalize();
+});
+
+app.post('/api/admin/restore', adminAuth, upload.single('backup'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file' });
+  const zipPath = req.file.path;
+  fs.createReadStream(zipPath)
+    .pipe(unzipper.Extract({ path: DATA_DIR }))
+    .on('close', () => {
+      fs.unlinkSync(zipPath);
+      bumpCache();
+      res.json({ success: true });
+    });
+});
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
