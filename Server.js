@@ -24,7 +24,7 @@ const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE || '';
 // Email configuration for password reset
 const EMAIL_USER = process.env.EMAIL_USER || '';
 const EMAIL_PASS = process.env.EMAIL_PASS || '';
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || EMAIL_USER; // where reset codes are sent
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || EMAIL_USER;
 
 // Ensure directories exist
 [DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(dir => {
@@ -49,17 +49,30 @@ const resetCodes = new Map(); // email -> { code, expires }
 let cacheVersion = 1;
 const bumpCache = () => { cacheVersion++; };
 
+// Load dynamic password if exists
+let currentAdminPassword = ADMIN_PASSWORD;
+try {
+  const config = readJSON('config.json');
+  if (config.adminPassword) currentAdminPassword = config.adminPassword;
+} catch (e) {}
+
 // ---------- Middleware ----------
 app.use(cors({
-  origin: '*', // Allow all origins (adjust in production)
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  origin: [
+    'https://schemevault-frontend.onrender.com', // Replace with your actual frontend URL
+    'http://localhost:3000',
+    'http://127.0.0.1:5500',
+    'http://localhost:5500'
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Admin-Token']
 }));
 app.use(express.json());
 app.use('/uploads', express.static(UPLOADS_DIR));
 app.use('/covers', express.static(COVERS_DIR));
 
-// Multer with detailed error handling
+// Multer configuration
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const isCover = req.path.includes('cover');
@@ -86,12 +99,12 @@ const upload = multer({
   storage, 
   fileFilter, 
   limits: { fileSize: 50 * 1024 * 1024 } 
-}).fields([{ name: 'document', maxCount: 1 }, { name: 'cover', maxCount: 1 }]);
+});
 
 // ---------- Auth Middleware ----------
 const adminAuth = (req, res, next) => {
   const token = req.headers['x-admin-token'];
-  if (token === Buffer.from(ADMIN_PASSWORD).toString('base64')) return next();
+  if (token === Buffer.from(currentAdminPassword).toString('base64')) return next();
   res.status(401).json({ error: 'Unauthorized' });
 };
 
@@ -191,19 +204,135 @@ app.post('/api/leave', (req, res) => {
   res.json({ success: true });
 });
 
-// ---------- PAYMENT FLOW (unchanged) ----------
-// ... (keep all existing payment endpoints from previous code) ...
+// ---------- PAYMENT FLOW ----------
+app.post('/api/initiate-payment', async (req, res) => {
+  const { phone, amount, productId } = req.body;
+  if (!phone || !amount || !productId) return res.status(400).json({ error: 'Missing fields' });
+  const product = readJSON('products.json').find(p => p.id === productId);
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+
+  const transactionId = uuidv4();
+  const formattedPhone = phone.replace(/^0/, '254').replace(/\D/g, '');
+  const pending = {
+    transactionId,
+    productId,
+    amount,
+    phone: formattedPhone,
+    status: 'pending',
+    createdAt: Date.now(),
+    fileUrl: product.fileUrl,
+  };
+  pendingPayments.set(transactionId, pending);
+
+  if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
+    console.log('Demo mode: auto-confirm after 10s');
+    setTimeout(() => {
+      const p = pendingPayments.get(transactionId);
+      if (p) p.status = 'completed';
+    }, 10000);
+    return res.json({ success: true, transactionId });
+  }
+
+  try {
+    const response = await axios.post(`${PAYNECTA_API_URL}/payment/initialize`, {
+      payment_code: PAYNECTA_PAYMENT_CODE,
+      mobile_number: formattedPhone,
+      amount: amount
+    }, {
+      headers: {
+        'X-API-Key': PAYNECTA_API_KEY,
+        'X-User-Email': PAYNECTA_EMAIL,
+        'Content-Type': 'application/json'
+      }
+    });
+    const { transaction_reference } = response.data;
+    pending.transaction_reference = transaction_reference;
+    pendingPayments.set(transactionId, pending);
+    res.json({ success: true, transactionId });
+  } catch (error) {
+    console.error('Paynecta init error:', error.response?.data || error.message);
+    pending.status = 'failed';
+    res.status(500).json({ error: 'Payment initiation failed' });
+  }
+});
+
+app.get('/api/payment-status/:transactionId', async (req, res) => {
+  const { transactionId } = req.params;
+  const pending = pendingPayments.get(transactionId);
+  if (!pending) return res.status(404).json({ error: 'Transaction not found' });
+
+  if (pending.status === 'completed') {
+    const token = uuidv4();
+    verificationTokens.set(token, { productId: pending.productId, expires: Date.now() + 5 * 60 * 1000 });
+    return res.json({ status: 'success', verified: true, token });
+  }
+
+  if (pending.status === 'failed') return res.json({ status: 'failed' });
+
+  if (pending.transaction_reference && PAYNECTA_API_KEY) {
+    try {
+      const response = await axios.get(`${PAYNECTA_API_URL}/payment/status`, {
+        params: { transaction_reference: pending.transaction_reference },
+        headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL }
+      });
+      const data = response.data;
+      if (data.status === 'completed' && data.result_code === '0') {
+        pending.status = 'completed';
+        pendingPayments.set(transactionId, pending);
+        const stats = readJSON('stats.json') || {};
+        stats.payments = (stats.payments || 0) + 1;
+        writeJSON('stats.json', stats);
+        const payments = readJSON('payments.json');
+        payments.push({ transactionId, productId: pending.productId, amount: pending.amount, timestamp: new Date().toISOString() });
+        writeJSON('payments.json', payments);
+        bumpCache();
+        const token = uuidv4();
+        verificationTokens.set(token, { productId: pending.productId, expires: Date.now() + 5 * 60 * 1000 });
+        return res.json({ status: 'success', verified: true, token });
+      }
+    } catch (e) { /* ignore */ }
+  }
+  res.json({ status: 'pending' });
+});
+
+app.post('/api/request-download', (req, res) => {
+  const { verificationToken, productId } = req.body;
+  const v = verificationTokens.get(verificationToken);
+  if (!v || v.productId !== productId || v.expires < Date.now()) {
+    return res.status(403).json({ error: 'Invalid or expired token' });
+  }
+  verificationTokens.delete(verificationToken);
+  const downloadToken = uuidv4();
+  downloadTokens.set(downloadToken, { productId, expires: Date.now() + 2 * 60 * 1000 });
+  const stats = readJSON('stats.json') || {};
+  stats.downloads = (stats.downloads || 0) + 1;
+  writeJSON('stats.json', stats);
+  const downloads = readJSON('downloads.json');
+  downloads.push({ productId, timestamp: new Date().toISOString() });
+  writeJSON('downloads.json', downloads);
+  bumpCache();
+  res.json({ success: true, token: downloadToken });
+});
+
+app.get('/api/download/:token', (req, res) => {
+  const { token } = req.params;
+  const d = downloadTokens.get(token);
+  if (!d || d.expires < Date.now()) return res.status(403).send('Invalid or expired download link');
+  const product = readJSON('products.json').find(p => p.id === d.productId);
+  if (!product) return res.status(404).send('Product not found');
+  downloadTokens.delete(token);
+  const filePath = path.join(UPLOADS_DIR, path.basename(product.fileUrl));
+  res.download(filePath, product.title + path.extname(filePath));
+});
 
 // ---------- PASSWORD RESET ----------
 app.post('/api/admin/forgot-password', async (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email required' });
+  const adminEmail = ADMIN_EMAIL;
+  if (!adminEmail) return res.status(500).json({ error: 'Admin email not configured' });
   
-  // Generate 6-digit code
   const code = Math.floor(100000 + Math.random() * 900000).toString();
-  resetCodes.set(email, { code, expires: Date.now() + 15 * 60 * 1000 });
+  resetCodes.set(adminEmail, { code, expires: Date.now() + 15 * 60 * 1000 });
   
-  // Send email if credentials exist
   if (EMAIL_USER && EMAIL_PASS) {
     try {
       const transporter = nodemailer.createTransporter({
@@ -212,18 +341,18 @@ app.post('/api/admin/forgot-password', async (req, res) => {
       });
       await transporter.sendMail({
         from: `"SchemeVault" <${EMAIL_USER}>`,
-        to: email,
+        to: adminEmail,
         subject: 'Password Reset Code',
         text: `Your reset code is: ${code}\nValid for 15 minutes.`
       });
-      res.json({ success: true, message: 'Reset code sent to email' });
+      res.json({ success: true, email: adminEmail });
     } catch (e) {
       console.error('Email error:', e);
       res.status(500).json({ error: 'Failed to send email' });
     }
   } else {
-    // Demo mode: return code in response (for testing)
-    res.json({ success: true, code, message: 'Email not configured; code returned for testing' });
+    // Demo mode: return code in response
+    res.json({ success: true, email: adminEmail, code });
   }
 });
 
@@ -236,38 +365,16 @@ app.post('/api/admin/reset-password', (req, res) => {
     return res.status(400).json({ error: 'Invalid or expired code' });
   }
   
-  // Update password (in real app would update env var; here we just change the constant)
-  // Since ADMIN_PASSWORD is const, we use a simple file-based storage for dynamic password
   const config = readJSON('config.json') || {};
   config.adminPassword = newPassword;
   writeJSON('config.json', config);
+  currentAdminPassword = newPassword;
   
   resetCodes.delete(email);
-  res.json({ success: true, message: 'Password updated. Restart server to apply.' });
+  res.json({ success: true });
 });
 
-// Load dynamic password if exists
-let currentAdminPassword = ADMIN_PASSWORD;
-try {
-  const config = readJSON('config.json');
-  if (config.adminPassword) currentAdminPassword = config.adminPassword;
-} catch (e) {}
-
-// Override adminAuth to use dynamic password
-const adminAuthDynamic = (req, res, next) => {
-  const token = req.headers['x-admin-token'];
-  if (token === Buffer.from(currentAdminPassword).toString('base64')) return next();
-  res.status(401).json({ error: 'Unauthorized' });
-};
-// Replace original adminAuth with dynamic one
-app.use((req, res, next) => {
-  if (req.path.startsWith('/api/admin') && req.path !== '/api/admin/login' && req.path !== '/api/admin/forgot-password' && req.path !== '/api/admin/reset-password') {
-    return adminAuthDynamic(req, res, next);
-  }
-  next();
-});
-
-// ---------- ADMIN ENDPOINTS (protected) ----------
+// ---------- ADMIN ENDPOINTS ----------
 app.post('/api/admin/login', (req, res) => {
   const { password } = req.body;
   if (password !== currentAdminPassword) {
@@ -276,9 +383,9 @@ app.post('/api/admin/login', (req, res) => {
   res.json({ token: Buffer.from(currentAdminPassword).toString('base64') });
 });
 
-// Subjects
-app.get('/api/admin/subjects', adminAuthDynamic, (req, res) => res.json(readJSON('subjects.json')));
-app.post('/api/admin/subjects', adminAuthDynamic, (req, res) => {
+// Subjects (Learning Areas)
+app.get('/api/admin/subjects', adminAuth, (req, res) => res.json(readJSON('subjects.json')));
+app.post('/api/admin/subjects', adminAuth, (req, res) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
   const subjects = readJSON('subjects.json');
@@ -288,7 +395,7 @@ app.post('/api/admin/subjects', adminAuthDynamic, (req, res) => {
   bumpCache();
   res.json(newSubject);
 });
-app.delete('/api/admin/subjects/:id', adminAuthDynamic, (req, res) => {
+app.delete('/api/admin/subjects/:id', adminAuth, (req, res) => {
   let subjects = readJSON('subjects.json');
   subjects = subjects.filter(s => s.id !== req.params.id);
   writeJSON('subjects.json', subjects);
@@ -297,42 +404,36 @@ app.delete('/api/admin/subjects/:id', adminAuthDynamic, (req, res) => {
 });
 
 // Products upload
-app.post('/api/admin/products', adminAuthDynamic, (req, res) => {
-  upload(req, res, (err) => {
-    if (err) {
-      console.error('Upload error:', err.message);
-      return res.status(400).json({ error: err.message });
-    }
-    
-    const { title, grade, subject, term, weeks, price, pages, visibility } = req.body;
-    const docFile = req.files['document']?.[0];
-    if (!docFile) {
-      return res.status(400).json({ error: 'Document file required' });
-    }
-    
-    const products = readJSON('products.json');
-    const newProduct = {
-      id: uuidv4(),
-      title,
-      grade,
-      subject,
-      term: parseInt(term),
-      weeks: parseInt(weeks),
-      price: parseFloat(price),
-      pages: pages || '',
-      fileUrl: `/uploads/${docFile.filename}`,
-      coverUrl: req.files['cover']?.[0] ? `/covers/${req.files['cover'][0].filename}` : null,
-      visibility: visibility === 'true' || visibility === true,
-      createdAt: new Date().toISOString()
-    };
-    products.push(newProduct);
-    writeJSON('products.json', products);
-    bumpCache();
-    res.json(newProduct);
-  });
+app.post('/api/admin/products', adminAuth, upload.fields([{ name: 'document', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), (req, res) => {
+  if (!req.files || !req.files['document']) {
+    return res.status(400).json({ error: 'Document file required' });
+  }
+  const { title, grade, subject, term, weeks, price, pages, visibility } = req.body;
+  const docFile = req.files['document'][0];
+  const coverFile = req.files['cover'] ? req.files['cover'][0] : null;
+  
+  const products = readJSON('products.json');
+  const newProduct = {
+    id: uuidv4(),
+    title,
+    grade,
+    subject,
+    term: parseInt(term),
+    weeks: parseInt(weeks),
+    price: parseFloat(price),
+    pages: pages || '',
+    fileUrl: `/uploads/${docFile.filename}`,
+    coverUrl: coverFile ? `/covers/${coverFile.filename}` : null,
+    visibility: visibility === 'true' || visibility === true,
+    createdAt: new Date().toISOString()
+  };
+  products.push(newProduct);
+  writeJSON('products.json', products);
+  bumpCache();
+  res.json(newProduct);
 });
 
-app.put('/api/admin/products/:id', adminAuthDynamic, (req, res) => {
+app.put('/api/admin/products/:id', adminAuth, (req, res) => {
   const products = readJSON('products.json');
   const index = products.findIndex(p => p.id === req.params.id);
   if (index === -1) return res.status(404).json({ error: 'Not found' });
@@ -342,7 +443,7 @@ app.put('/api/admin/products/:id', adminAuthDynamic, (req, res) => {
   res.json(products[index]);
 });
 
-app.delete('/api/admin/products/:id', adminAuthDynamic, (req, res) => {
+app.delete('/api/admin/products/:id', adminAuth, (req, res) => {
   let products = readJSON('products.json');
   const product = products.find(p => p.id === req.params.id);
   if (!product) return res.status(404).json({ error: 'Not found' });
@@ -355,24 +456,24 @@ app.delete('/api/admin/products/:id', adminAuthDynamic, (req, res) => {
 });
 
 // Terms
-app.get('/api/admin/terms', adminAuthDynamic, (req, res) => res.json(readJSON('terms.json') || { enabled: [1,2,3], default: 1 }));
-app.post('/api/admin/terms', adminAuthDynamic, (req, res) => {
+app.get('/api/admin/terms', adminAuth, (req, res) => res.json(readJSON('terms.json') || { enabled: [1,2,3], default: 1 }));
+app.post('/api/admin/terms', adminAuth, (req, res) => {
   writeJSON('terms.json', req.body);
   bumpCache();
   res.json({ success: true });
 });
 
 // Banner
-app.get('/api/admin/banner', adminAuthDynamic, (req, res) => res.json(readJSON('banner.json') || {}));
-app.post('/api/admin/banner', adminAuthDynamic, (req, res) => {
+app.get('/api/admin/banner', adminAuth, (req, res) => res.json(readJSON('banner.json') || {}));
+app.post('/api/admin/banner', adminAuth, (req, res) => {
   writeJSON('banner.json', req.body);
   bumpCache();
   res.json({ success: true });
 });
 
 // Popups
-app.get('/api/admin/popups', adminAuthDynamic, (req, res) => res.json(readJSON('popups.json')));
-app.post('/api/admin/popups', adminAuthDynamic, (req, res) => {
+app.get('/api/admin/popups', adminAuth, (req, res) => res.json(readJSON('popups.json')));
+app.post('/api/admin/popups', adminAuth, (req, res) => {
   const popups = readJSON('popups.json');
   const newPopup = { id: uuidv4(), ...req.body };
   popups.push(newPopup);
@@ -380,7 +481,7 @@ app.post('/api/admin/popups', adminAuthDynamic, (req, res) => {
   bumpCache();
   res.json(newPopup);
 });
-app.delete('/api/admin/popups/:id', adminAuthDynamic, (req, res) => {
+app.delete('/api/admin/popups/:id', adminAuth, (req, res) => {
   let popups = readJSON('popups.json');
   popups = popups.filter(p => p.id !== req.params.id);
   writeJSON('popups.json', popups);
@@ -389,15 +490,15 @@ app.delete('/api/admin/popups/:id', adminAuthDynamic, (req, res) => {
 });
 
 // WhatsApp
-app.get('/api/admin/wa', adminAuthDynamic, (req, res) => res.json(readJSON('whatsapp.json') || {}));
-app.post('/api/admin/wa', adminAuthDynamic, (req, res) => {
+app.get('/api/admin/wa', adminAuth, (req, res) => res.json(readJSON('whatsapp.json') || {}));
+app.post('/api/admin/wa', adminAuth, (req, res) => {
   writeJSON('whatsapp.json', req.body);
   bumpCache();
   res.json({ success: true });
 });
 
 // Stats
-app.get('/api/admin/stats', adminAuthDynamic, (req, res) => {
+app.get('/api/admin/stats', adminAuth, (req, res) => {
   const stats = readJSON('stats.json') || { visits: 0, downloads: 0, payments: 0 };
   const sessions = readJSON('sessions.json') || {};
   const activeUsers = Object.values(sessions).filter(ts => Date.now() - ts < 60000).length;
@@ -405,7 +506,7 @@ app.get('/api/admin/stats', adminAuthDynamic, (req, res) => {
 });
 
 // Backup & Restore
-app.get('/api/admin/backup', adminAuthDynamic, (req, res) => {
+app.get('/api/admin/backup', adminAuth, (req, res) => {
   const archive = archiver('zip', { zlib: { level: 9 } });
   res.attachment('schemevault-backup.zip');
   archive.pipe(res);
@@ -413,7 +514,7 @@ app.get('/api/admin/backup', adminAuthDynamic, (req, res) => {
   archive.finalize();
 });
 
-app.post('/api/admin/restore', adminAuthDynamic, upload.single('backup'), (req, res) => {
+app.post('/api/admin/restore', adminAuth, upload.single('backup'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
   const zipPath = req.file.path;
   fs.createReadStream(zipPath)
@@ -424,8 +525,5 @@ app.post('/api/admin/restore', adminAuthDynamic, upload.single('backup'), (req, 
       res.json({ success: true });
     });
 });
-
-// Payment endpoints (keep existing)
-// ... (copy all payment endpoints from previous code) ...
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
