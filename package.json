@@ -1,36 +1,21 @@
 {
   "name": "schemevault-backend",
   "version": "1.0.0",
-  "description": "SchemeVault - Digital marketplace for Kenyan CBE schemes of work",
+  "description": "SchemeVault – CBC Schemes of Work Marketplace Backend",
   "main": "server.js",
-  "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
-  "keywords": [
-    "education",
-    "schemes",
-    "kenya",
-    "cbe",
-    "mpesa",
-    "paynecta"
-  ],
-  "author": "SchemeVault",
-  "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
-    "multer": "^1.4.5-lts.1",
-    "archiver": "^6.0.1",
-    "extract-zip": "^2.0.1",
-    "nodemailer": "^6.9.7",
+    "archiver": "^7.0.1",
     "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
-    "uuid": "^9.0.1",
-    "axios": "^1.6.2",
-    "express-rate-limit": "^7.1.5"
+    "express": "^4.21.1",
+    "extract-zip": "^2.0.1",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.9.16"
   },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
