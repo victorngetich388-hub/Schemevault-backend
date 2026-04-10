@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const COVERS_DIR = path.join(DATA_DIR, 'covers');
-const ADMIN_PASSWORD = '0726019859'; // Default password
+const ADMIN_PASSWORD = '0726019859';
 const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY || '';
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL || '';
@@ -43,7 +43,7 @@ const writeJSON = (file, data) => fs.writeFileSync(path.join(DATA_DIR, file), JS
 const pendingPayments = new Map();
 const downloadTokens = new Map();
 const verificationTokens = new Map();
-const resetCodes = new Map(); // email -> { code, expires }
+const resetCodes = new Map();
 
 // Cache version for frontend sync
 let cacheVersion = 1;
@@ -59,7 +59,8 @@ try {
 // ---------- Middleware ----------
 app.use(cors({
   origin: [
-    'https://schemevault-frontend.onrender.com', // Replace with your actual frontend URL
+    'https://schemevault.onrender.com',
+    'https://schemevault-frontend.onrender.com',
     'http://localhost:3000',
     'http://127.0.0.1:5500',
     'http://localhost:5500'
@@ -95,11 +96,7 @@ const fileFilter = (req, file, cb) => {
     cb(new Error(isCover ? 'Only JPEG, PNG, WEBP images allowed' : 'Only PDF, DOC, DOCX allowed'));
   }
 };
-const upload = multer({ 
-  storage, 
-  fileFilter, 
-  limits: { fileSize: 50 * 1024 * 1024 } 
-});
+const upload = multer({ storage, fileFilter, limits: { fileSize: 50 * 1024 * 1024 } });
 
 // ---------- Auth Middleware ----------
 const adminAuth = (req, res, next) => {
@@ -351,7 +348,6 @@ app.post('/api/admin/forgot-password', async (req, res) => {
       res.status(500).json({ error: 'Failed to send email' });
     }
   } else {
-    // Demo mode: return code in response
     res.json({ success: true, email: adminEmail, code });
   }
 });
@@ -383,7 +379,7 @@ app.post('/api/admin/login', (req, res) => {
   res.json({ token: Buffer.from(currentAdminPassword).toString('base64') });
 });
 
-// Subjects (Learning Areas)
+// Subjects
 app.get('/api/admin/subjects', adminAuth, (req, res) => res.json(readJSON('subjects.json')));
 app.post('/api/admin/subjects', adminAuth, (req, res) => {
   const { name } = req.body;
