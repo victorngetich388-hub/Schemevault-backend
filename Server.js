@@ -121,7 +121,7 @@ const logVisit = (req) => {
 
 app.use((req, res, next) => { if (req.method === 'GET') logVisit(req); next(); });
 
-// ---------- PUBLIC ENDPOINTS ----------
+// ---------- PUBLIC ENDPOINTS (Unified Naming) ----------
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.get('/api/products', (req, res) => {
@@ -134,11 +134,13 @@ app.get('/api/banner', (req, res) => {
   res.json(banner);
 });
 
+// Public WhatsApp settings – matches frontend expectation
 app.get('/api/admin/whatsapp', (req, res) => {
   const wa = readJSON('whatsapp.json') || { enabled: false, number: '', message: 'Hello' };
   res.json(wa);
 });
 
+// Term settings – public read
 app.get('/api/term-settings', (req, res) => {
   const terms = readJSON('terms.json') || { enabled: [1,2,3], default: 1 };
   res.json({
@@ -201,7 +203,7 @@ app.post('/api/leave', (req, res) => {
   res.json({ success: true });
 });
 
-// ---------- PAYMENT FLOW (FIXED WITH DETAILED LOGGING) ----------
+// ---------- PAYMENT FLOW (Robust & Secure) ----------
 app.post('/api/initiate-payment', async (req, res) => {
   console.log('=== PAYMENT INITIATION ===');
   console.log('Request body:', JSON.stringify(req.body));
@@ -256,7 +258,7 @@ app.post('/api/initiate-payment', async (req, res) => {
   try {
     const payload = {
       payment_code: PAYNECTA_PAYMENT_CODE,
-      mobile_number: formattedPhone,   // Try "phone_number" if this fails
+      mobile_number: formattedPhone,   // Change to "phone_number" if required by Paynecta
       amount: String(amount)           // Some gateways require string
     };
     
@@ -296,15 +298,12 @@ app.post('/api/initiate-payment', async (req, res) => {
     console.error('=== PAYNECTA ERROR ===');
     if (error.response) {
       console.error('Status:', error.response.status);
-      console.error('Headers:', JSON.stringify(error.response.headers));
       console.error('Data:', JSON.stringify(error.response.data));
     } else if (error.request) {
-      console.error('No response received. Request:', error.request._currentUrl);
-      console.error('Error code:', error.code);
+      console.error('No response received. Error code:', error.code);
     } else {
       console.error('Error message:', error.message);
     }
-    console.error('Full error:', error);
     
     pending.status = 'failed';
     pendingPayments.set(transactionId, pending);
@@ -526,7 +525,7 @@ app.delete('/api/admin/products/:id', adminAuth, (req, res) => {
   res.json({ success: true });
 });
 
-// Terms
+// Terms (admin write)
 app.get('/api/admin/terms', adminAuth, (req, res) => res.json(readJSON('terms.json') || { enabled: [1,2,3], default: 1 }));
 app.post('/api/admin/terms', adminAuth, (req, res) => {
   writeJSON('terms.json', req.body);
@@ -560,7 +559,7 @@ app.delete('/api/admin/popups/:id', adminAuth, (req, res) => {
   res.json({ success: true });
 });
 
-// WhatsApp
+// WhatsApp (admin write)
 app.get('/api/admin/wa', adminAuth, (req, res) => res.json(readJSON('whatsapp.json') || {}));
 app.post('/api/admin/wa', adminAuth, (req, res) => {
   writeJSON('whatsapp.json', req.body);
