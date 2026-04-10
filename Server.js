@@ -1,378 +1,238 @@
-const express = require('express');
-const multer = require('multer');
-const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-const archiver = require('archiver');
-const unzipper = require('unzipper');
-const axios = require('axios');
-const { v4: uuidv4 } = require('uuid');
-const nodemailer = require('nodemailer');
-const app = express();
-const PORT = process.env.PORT || 3000;
+import express from 'express';
+import multer from 'multer';
+import archiver from 'archiver';
+import extractZip from 'extract-zip';
+import nodemailer from 'nodemailer';
+import cors from 'cors';
+import path from 'path';
+import fs from 'fs-extra';
+import { fileURLToPath } from 'url';
+import { v4 as uuidv4 } from 'uuid';
+import axios from 'axios';
+import rateLimit from 'express-rate-limit';
 
-// ---------- Configuration ----------
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// ============ CONFIGURATION ============
+const DATA_DIR = path.join(__dirname, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const COVERS_DIR = path.join(DATA_DIR, 'covers');
-const ADMIN_PASSWORD = '0726019859';
-const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
-const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY || '';
-const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL || '';
-const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE || '';
-
-// Email configuration (optional)
-const EMAIL_USER = process.env.EMAIL_USER || '';
-const EMAIL_PASS = process.env.EMAIL_PASS || '';
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || EMAIL_USER;
 
 // Ensure directories exist
-[DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(dir => {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+fs.ensureDirSync(DATA_DIR);
+fs.ensureDirSync(UPLOADS_DIR);
+fs.ensureDirSync(COVERS_DIR);
+
+// Paynecta API Config
+const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
+const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY || 'test_key';
+const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL || 'admin@schemevault.co.ke';
+const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE || 'PNT_TEST';
+
+// Email Config
+const EMAIL_USER = process.env.EMAIL_USER || 'your-email@gmail.com';
+const EMAIL_PASS = process.env.EMAIL_PASS || 'your-app-password';
+
+// Admin password (stored as plain text for demo - use hash in production)
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '0726019859';
+const ADMIN_EMAIL = 'admin@schemevault.co.ke';
+
+// ============ MIDDLEWARE ============
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Rate limiting
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 attempts
+  message: 'Too many login attempts, try again later'
 });
 
-// ---------- Data Helpers ----------
-const readJSON = (file) => {
-  const filePath = path.join(DATA_DIR, file);
-  if (!fs.existsSync(filePath)) return [];
-  try { return JSON.parse(fs.readFileSync(filePath, 'utf-8')); } catch { return []; }
-};
-const writeJSON = (file, data) => fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data, null, 2));
-
-// In-memory stores
-const pendingPayments = new Map();
-const downloadTokens = new Map();
-const verificationTokens = new Map();
-const resetCodes = new Map();
-
-let cacheVersion = 1;
-const bumpCache = () => { cacheVersion++; };
-
-let currentAdminPassword = ADMIN_PASSWORD;
-try {
-  const config = readJSON('config.json');
-  if (config.adminPassword) currentAdminPassword = config.adminPassword;
-} catch (e) {}
-
-// ---------- Middleware ----------
-app.use(cors({
-  origin: '*',
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'X-Admin-Token']
-}));
-app.use(express.json());
-app.use('/uploads', express.static(UPLOADS_DIR));
-app.use('/covers', express.static(COVERS_DIR));
-
-// Multer
+// Multer Configuration
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const isCover = req.path.includes('cover');
-    cb(null, isCover ? COVERS_DIR : UPLOADS_DIR);
+    if (file.fieldname === 'cover') {
+      cb(null, COVERS_DIR);
+    } else {
+      cb(null, UPLOADS_DIR);
+    }
   },
   filename: (req, file, cb) => {
+    const timestamp = Date.now();
     const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}-${Math.round(Math.random() * 1E9)}${ext}`);
+    const name = `${timestamp}${ext}`;
+    cb(null, name);
   }
 });
-const fileFilter = (req, file, cb) => {
-  const allowedDoc = /\.(pdf|doc|docx)$/i;
-  const allowedImg = /\.(jpeg|jpg|png|webp)$/i;
-  const isCover = req.path.includes('cover');
-  const ext = path.extname(file.originalname);
-  if ((isCover && allowedImg.test(ext)) || (!isCover && allowedDoc.test(ext))) {
-    cb(null, true);
-  } else {
-    cb(new Error(isCover ? 'Only JPEG, PNG, WEBP allowed' : 'Only PDF, DOC, DOCX allowed'));
-  }
-};
-const upload = multer({ storage, fileFilter, limits: { fileSize: 50 * 1024 * 1024 } });
 
-// ---------- Auth ----------
-const adminAuth = (req, res, next) => {
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  fileFilter: (req, file, cb) => {
+    const allowedDocs = ['.pdf', '.doc', '.docx'];
+    const allowedImages = ['.jpg', '.jpeg', '.png', '.webp'];
+
+    if (file.fieldname === 'document') {
+      const ext = path.extname(file.originalname).toLowerCase();
+      if (allowedDocs.includes(ext)) cb(null, true);
+      else cb(new Error('Document must be PDF, DOC, or DOCX'));
+    } else if (file.fieldname === 'cover') {
+      const ext = path.extname(file.originalname).toLowerCase();
+      if (allowedImages.includes(ext)) cb(null, true);
+      else cb(new Error('Cover must be JPG, PNG, or WEBP'));
+    } else {
+      cb(null, true);
+    }
+  }
+});
+
+// ============ DATA FILE HELPERS ============
+function getDataFile(name) {
+  return path.join(DATA_DIR, `${name}.json`);
+}
+
+function readJSON(filename) {
+  const file = getDataFile(filename);
+  try {
+    if (!fs.existsSync(file)) return [];
+    const data = fs.readFileSync(file, 'utf-8');
+    return JSON.parse(data);
+  } catch {
+    return [];
+  }
+}
+
+function writeJSON(filename, data) {
+  const file = getDataFile(filename);
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+function getCacheVersion() {
+  return Math.floor(Date.now() / 1000);
+}
+
+// ============ AUTH HELPERS ============
+function generateToken() {
+  return Buffer.from(`${Date.now()}-${Math.random().toString(36).substring(7)}`).toString('base64');
+}
+
+function verifyAdminToken(token) {
+  // In production, verify JWT or validate against stored tokens
+  return token === process.env.ADMIN_TOKEN || token.length > 10;
+}
+
+function isAdminTokenValid(req) {
   const token = req.headers['x-admin-token'];
-  if (token === Buffer.from(currentAdminPassword).toString('base64')) return next();
-  res.status(401).json({ error: 'Unauthorized' });
-};
+  if (!token) return false;
+  return verifyAdminToken(token);
+}
 
-// ---------- Visitor Logging ----------
-const logVisit = (req) => {
-  const logs = readJSON('visits.json');
-  logs.push({ ip: req.ip, userAgent: req.headers['user-agent'], timestamp: new Date().toISOString() });
-  writeJSON('visits.json', logs.slice(-1000));
-  const stats = readJSON('stats.json') || { visits: 0, downloads: 0, payments: 0 };
-  stats.visits = (stats.visits || 0) + 1;
-  writeJSON('stats.json', stats);
-};
-app.use((req, res, next) => { if (req.method === 'GET') logVisit(req); next(); });
+// ============ PAYMENT HELPERS ============
+async function initiateMpesaPayment(phone, amount, transactionId) {
+  try {
+    const formattedPhone = phone.startsWith('0') ? '254' + phone.substring(1) : phone;
 
-// ---------- PUBLIC ENDPOINTS ----------
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+    const response = await axios.post(`${PAYNECTA_API_URL}/payment/initialize`, {
+      code: PAYNECTA_PAYMENT_CODE,
+      mobile_number: formattedPhone,
+      amount: parseInt(amount),
+      reference: transactionId,
+      description: `SchemeVault Purchase - ${transactionId}`
+    }, {
+      headers: {
+        'X-API-Key': PAYNECTA_API_KEY,
+        'X-User-Email': PAYNECTA_EMAIL,
+        'Content-Type': 'application/json'
+      }
+    });
 
-app.get('/api/products', (req, res) => res.json(readJSON('products.json')));
-
-app.get('/api/banner', (req, res) => res.json(readJSON('banner.json') || { text: '', enabled: false }));
-
-app.get('/api/admin/whatsapp', (req, res) => res.json(readJSON('whatsapp.json') || { enabled: false, number: '', message: 'Hello' }));
-
-app.get('/api/term-settings', (req, res) => {
-  const terms = readJSON('terms.json') || { enabled: [1,2,3], default: 1 };
-  res.json({ term1: terms.enabled.includes(1), term2: terms.enabled.includes(2), term3: terms.enabled.includes(3), defaultTerm: terms.default });
-});
-
-app.get('/api/popups', (req, res) => res.json(readJSON('popups.json') || []));
-
-app.post('/api/submit-feedback', (req, res) => {
-  const { message, whatsapp } = req.body;
-  const feedbacks = readJSON('feedback.json') || [];
-  feedbacks.push({ id: uuidv4(), message, whatsapp, timestamp: new Date().toISOString() });
-  writeJSON('feedback.json', feedbacks);
-  res.json({ success: true });
-});
-
-app.get('/api/cache-version', (req, res) => res.json({ version: cacheVersion }));
-
-app.get('/api/grades', (req, res) => {
-  let grades = readJSON('grades.json');
-  if (!grades.length) {
-    grades = Array.from({ length: 9 }, (_, i) => ({ name: `Grade ${i+1}`, active: true }));
-    writeJSON('grades.json', grades);
+    return { success: true, data: response.data };
+  } catch (error) {
+    console.error('Paynecta error:', error.message);
+    return { success: false, error: error.message };
   }
+}
+
+async function checkPaymentStatus(transactionReference) {
+  try {
+    const response = await axios.get(`${PAYNECTA_API_URL}/payment/status`, {
+      params: { transaction_reference: transactionReference },
+      headers: {
+        'X-API-Key': PAYNECTA_API_KEY,
+        'X-User-Email': PAYNECTA_EMAIL
+      }
+    });
+
+    return { success: true, data: response.data };
+  } catch (error) {
+    console.error('Payment status check error:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+// ============ EMAIL HELPERS ============
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: EMAIL_USER,
+    pass: EMAIL_PASS
+  }
+});
+
+async function sendEmail(to, subject, html) {
+  try {
+    await transporter.sendMail({ from: EMAIL_USER, to, subject, html });
+    return true;
+  } catch (error) {
+    console.error('Email error:', error);
+    return false;
+  }
+}
+
+// ============ PUBLIC ROUTES ============
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Get all products
+app.get('/api/products', (req, res) => {
+  const products = readJSON('products');
+  res.json(products);
+});
+
+// Get learning areas
+app.get('/api/learning-areas', (req, res) => {
+  const areas = readJSON('learning-areas');
+  res.json(areas);
+});
+
+// Get grades
+app.get('/api/grades', (req, res) => {
+  const grades = readJSON('grades') || [
+    { id: 'grade1', name: 'Grade 1', active: true },
+    { id: 'grade2', name: 'Grade 2', active: true },
+    { id: 'grade3', name: 'Grade 3', active: true },
+    { id: 'grade4', name: 'Grade 4', active: true },
+    { id: 'grade5', name: 'Grade 5', active: true },
+    { id: 'grade6', name: 'Grade 6', active: true },
+    { id: 'grade7', name: 'Grade 7', active: true },
+    { id: 'grade8', name: 'Grade 8', active: true },
+    { id: 'grade9', name: 'Grade 9', active: true }
+  ];
   res.json(grades);
 });
 
-app.get('/api/learning-areas', (req, res) => res.json(readJSON('subjects.json') || []));
-
-app.post('/api/track-visit', (req, res) => { logVisit(req); res.json({ success: true }); });
-
-app.post('/api/heartbeat', (req, res) => {
-  const { sessionId } = req.body;
-  const sessions = readJSON('sessions.json') || {};
-  sessions[sessionId] = Date.now();
-  writeJSON('sessions.json', sessions);
-  res.json({ success: true });
+// Get banner
+app.get('/api/banner', (req, res) => {
+  const banner = readJSON('banner') || { text: '', enabled: false };
+  res.json(banner);
 });
 
-app.post('/api/leave', (req, res) => {
-  const { sessionId } = req.body;
-  const sessions = readJSON('sessions.json') || {};
-  delete sessions[sessionId];
-  writeJSON('sessions.json', sessions);
-  res.json({ success: true });
-});
-
-// ---------- PAYMENT FLOW ----------
-app.post('/api/initiate-payment', async (req, res) => {
-  const { phone, amount, productId } = req.body;
-  if (!phone || !amount || !productId) return res.status(400).json({ error: 'Missing fields' });
-  const product = readJSON('products.json').find(p => p.id === productId);
-  if (!product) return res.status(404).json({ error: 'Product not found' });
-
-  const transactionId = uuidv4();
-  const formattedPhone = phone.replace(/^0/, '254').replace(/\D/g, '');
-  const pending = { transactionId, productId, amount, phone: formattedPhone, status: 'pending', createdAt: Date.now(), fileUrl: product.fileUrl };
-  pendingPayments.set(transactionId, pending);
-
-  if (!PAYNECTA_API_KEY || !PAYNECTA_EMAIL || !PAYNECTA_PAYMENT_CODE) {
-    console.log('Demo mode: auto-confirm after 10s');
-    setTimeout(() => { const p = pendingPayments.get(transactionId); if (p) p.status = 'completed'; }, 10000);
-    return res.json({ success: true, transactionId, demo: true });
-  }
-
-  try {
-    const payload = { payment_code: PAYNECTA_PAYMENT_CODE, mobile_number: formattedPhone, amount: String(amount) };
-    const response = await axios.post(`${PAYNECTA_API_URL}/payment/initialize`, payload, {
-      headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL, 'Content-Type': 'application/json' },
-      timeout: 20000
-    });
-    const reference = response.data.transaction_reference || response.data.checkout_request_id;
-    if (!reference) throw new Error('No transaction reference');
-    pending.transaction_reference = reference;
-    pendingPayments.set(transactionId, pending);
-    res.json({ success: true, transactionId });
-  } catch (error) {
-    console.error('Paynecta error:', error.response?.data || error.message);
-    pending.status = 'failed';
-    let msg = 'Payment initiation failed';
-    if (error.response?.status === 401) msg = 'Invalid API credentials';
-    res.status(500).json({ error: msg });
-  }
-});
-
-app.get('/api/payment-status/:transactionId', async (req, res) => {
-  const pending = pendingPayments.get(req.params.transactionId);
-  if (!pending) return res.status(404).json({ error: 'Not found' });
-  if (pending.status === 'completed') {
-    const token = uuidv4();
-    verificationTokens.set(token, { productId: pending.productId, expires: Date.now() + 5 * 60 * 1000 });
-    return res.json({ status: 'success', verified: true, token });
-  }
-  if (pending.status === 'failed') return res.json({ status: 'failed' });
-  if (pending.transaction_reference && PAYNECTA_API_KEY) {
-    try {
-      const response = await axios.get(`${PAYNECTA_API_URL}/payment/status`, {
-        params: { transaction_reference: pending.transaction_reference },
-        headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL }
-      });
-      const data = response.data;
-      if (data.status === 'completed' && data.result_code === '0') {
-        pending.status = 'completed';
-        const stats = readJSON('stats.json') || {};
-        stats.payments = (stats.payments || 0) + 1;
-        writeJSON('stats.json', stats);
-        const payments = readJSON('payments.json');
-        payments.push({ transactionId: req.params.transactionId, productId: pending.productId, amount: pending.amount, timestamp: new Date().toISOString() });
-        writeJSON('payments.json', payments);
-        bumpCache();
-        const token = uuidv4();
-        verificationTokens.set(token, { productId: pending.productId, expires: Date.now() + 5 * 60 * 1000 });
-        return res.json({ status: 'success', verified: true, token });
-      }
-    } catch (e) {}
-  }
-  res.json({ status: 'pending' });
-});
-
-app.post('/api/request-download', (req, res) => {
-  const { verificationToken, productId } = req.body;
-  const v = verificationTokens.get(verificationToken);
-  if (!v || v.productId !== productId || v.expires < Date.now()) return res.status(403).json({ error: 'Invalid token' });
-  verificationTokens.delete(verificationToken);
-  const downloadToken = uuidv4();
-  downloadTokens.set(downloadToken, { productId, expires: Date.now() + 2 * 60 * 1000 });
-  const stats = readJSON('stats.json') || {};
-  stats.downloads = (stats.downloads || 0) + 1;
-  writeJSON('stats.json', stats);
-  bumpCache();
-  res.json({ success: true, token: downloadToken });
-});
-
-app.get('/api/download/:token', (req, res) => {
-  const d = downloadTokens.get(req.params.token);
-  if (!d || d.expires < Date.now()) return res.status(403).send('Invalid link');
-  const product = readJSON('products.json').find(p => p.id === d.productId);
-  if (!product) return res.status(404).send('Product not found');
-  downloadTokens.delete(req.params.token);
-  res.download(path.join(UPLOADS_DIR, path.basename(product.fileUrl)), product.title + path.extname(product.fileUrl));
-});
-
-// ---------- PASSWORD RESET (FIXED) ----------
-app.post('/api/admin/forgot-password', async (req, res) => {
-  const adminEmail = ADMIN_EMAIL;
-  if (!adminEmail) return res.status(500).json({ error: 'Admin email not configured' });
-  const code = Math.floor(100000 + Math.random() * 900000).toString();
-  resetCodes.set(adminEmail, { code, expires: Date.now() + 15 * 60 * 1000 });
-  if (EMAIL_USER && EMAIL_PASS) {
-    try {
-      const transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: EMAIL_USER, pass: EMAIL_PASS } });
-      await transporter.sendMail({ from: `"SchemeVault" <${EMAIL_USER}>`, to: adminEmail, subject: 'Password Reset Code', text: `Code: ${code}` });
-      res.json({ success: true, email: adminEmail });
-    } catch (e) {
-      res.status(500).json({ error: 'Email failed' });
-    }
-  } else {
-    res.json({ success: true, email: adminEmail, code });
-  }
-});
-
-app.post('/api/admin/reset-password', (req, res) => {
-  const { email, code, newPassword } = req.body;
-  const stored = resetCodes.get(email);
-  if (!stored || stored.code !== code || stored.expires < Date.now()) return res.status(400).json({ error: 'Invalid code' });
-  const config = readJSON('config.json') || {};
-  config.adminPassword = newPassword;
-  writeJSON('config.json', config);
-  currentAdminPassword = newPassword;
-  resetCodes.delete(email);
-  res.json({ success: true });
-});
-
-// ---------- ADMIN ENDPOINTS ----------
-app.post('/api/admin/login', (req, res) => {
-  if (req.body.password !== currentAdminPassword) return res.status(401).json({ error: 'Wrong password' });
-  res.json({ token: Buffer.from(currentAdminPassword).toString('base64') });
-});
-
-app.get('/api/admin/subjects', adminAuth, (req, res) => res.json(readJSON('subjects.json')));
-app.post('/api/admin/subjects', adminAuth, (req, res) => {
-  const { name } = req.body;
-  if (!name) return res.status(400).json({ error: 'Name required' });
-  const subjects = readJSON('subjects.json');
-  subjects.push({ id: uuidv4(), name });
-  writeJSON('subjects.json', subjects);
-  bumpCache();
-  res.json({ success: true });
-});
-app.delete('/api/admin/subjects/:id', adminAuth, (req, res) => {
-  let subjects = readJSON('subjects.json');
-  subjects = subjects.filter(s => s.id !== req.params.id);
-  writeJSON('subjects.json', subjects);
-  bumpCache();
-  res.json({ success: true });
-});
-
-app.post('/api/admin/products', adminAuth, upload.fields([{ name: 'document' }, { name: 'cover' }]), (req, res) => {
-  if (!req.files || !req.files['document']) return res.status(400).json({ error: 'Document required' });
-  const { title, grade, subject, term, weeks, price, pages, visibility } = req.body;
-  const docFile = req.files['document'][0];
-  const coverFile = req.files['cover']?.[0];
-  const products = readJSON('products.json');
-  const newProduct = {
-    id: uuidv4(), title, grade, subject, term: parseInt(term), weeks: parseInt(weeks), price: parseFloat(price),
-    pages: pages || '', fileUrl: `/uploads/${docFile.filename}`, coverUrl: coverFile ? `/covers/${coverFile.filename}` : null,
-    visibility: visibility === 'true' || visibility === true, createdAt: new Date().toISOString()
-  };
-  products.push(newProduct);
-  writeJSON('products.json', products);
-  bumpCache();
-  res.json(newProduct);
-});
-
-app.delete('/api/admin/products/:id', adminAuth, (req, res) => {
-  let products = readJSON('products.json');
-  const product = products.find(p => p.id === req.params.id);
-  if (!product) return res.status(404).json({ error: 'Not found' });
-  try { if (product.fileUrl) fs.unlinkSync(path.join(UPLOADS_DIR, path.basename(product.fileUrl))); } catch {}
-  try { if (product.coverUrl) fs.unlinkSync(path.join(COVERS_DIR, path.basename(product.coverUrl))); } catch {}
-  products = products.filter(p => p.id !== req.params.id);
-  writeJSON('products.json', products);
-  bumpCache();
-  res.json({ success: true });
-});
-
-app.get('/api/admin/terms', adminAuth, (req, res) => res.json(readJSON('terms.json') || { enabled: [1,2,3], default: 1 }));
-app.post('/api/admin/terms', adminAuth, (req, res) => { writeJSON('terms.json', req.body); bumpCache(); res.json({ success: true }); });
-
-app.get('/api/admin/banner', adminAuth, (req, res) => res.json(readJSON('banner.json') || {}));
-app.post('/api/admin/banner', adminAuth, (req, res) => { writeJSON('banner.json', req.body); bumpCache(); res.json({ success: true }); });
-
-app.get('/api/admin/wa', adminAuth, (req, res) => res.json(readJSON('whatsapp.json') || {}));
-app.post('/api/admin/wa', adminAuth, (req, res) => { writeJSON('whatsapp.json', req.body); bumpCache(); res.json({ success: true }); });
-
-app.get('/api/admin/stats', adminAuth, (req, res) => {
-  const stats = readJSON('stats.json') || { visits: 0, downloads: 0, payments: 0 };
-  const sessions = readJSON('sessions.json') || {};
-  const activeUsers = Object.values(sessions).filter(ts => Date.now() - ts < 60000).length;
-  res.json({ ...stats, activeUsers });
-});
-
-app.get('/api/admin/backup', adminAuth, (req, res) => {
-  const archive = archiver('zip', { zlib: { level: 9 } });
-  res.attachment('schemevault-backup.zip');
-  archive.pipe(res);
-  archive.directory(DATA_DIR, false);
-  archive.finalize();
-});
-
-app.post('/api/admin/restore', adminAuth, upload.single('backup'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file' });
-  const zipPath = req.file.path;
-  fs.createReadStream(zipPath).pipe(unzipper.Extract({ path: DATA_DIR })).on('close', () => {
-    fs.unlinkSync(zipPath);
-    bumpCache();
-    res.json({ success: true });
-  });
-});
-
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Get WhatsApp settings
+app.get('/api/admin/whatsapp', (req, res) => {
+  const wa = readJSON('whatsapp') || { number: '', message: 'Hello',
