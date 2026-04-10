@@ -12,10 +12,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ---------- Configuration ----------
+// Render Disk mount path – must be set in environment variables
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const COVERS_DIR = path.join(DATA_DIR, 'covers');
-const ADMIN_PASSWORD = '0726019859';
+const ADMIN_PASSWORD = '0726019859'; // default password
 const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY || '';
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL || '';
@@ -39,17 +40,17 @@ const readJSON = (file) => {
 };
 const writeJSON = (file, data) => fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data, null, 2));
 
-// In-memory stores
+// In-memory stores (these do not need persistence)
 const pendingPayments = new Map();
 const downloadTokens = new Map();
 const verificationTokens = new Map();
 const resetCodes = new Map();
 
-// Cache version for frontend sync
+// Cache version for frontend sync – bump on any data change
 let cacheVersion = 1;
 const bumpCache = () => { cacheVersion++; };
 
-// Load dynamic password if exists
+// Load dynamic password if it was changed via reset
 let currentAdminPassword = ADMIN_PASSWORD;
 try {
   const config = readJSON('config.json');
@@ -73,7 +74,7 @@ app.use(express.json());
 app.use('/uploads', express.static(UPLOADS_DIR));
 app.use('/covers', express.static(COVERS_DIR));
 
-// Multer configuration
+// Multer configuration for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const isCover = req.path.includes('cover');
@@ -121,26 +122,28 @@ const logVisit = (req) => {
 
 app.use((req, res, next) => { if (req.method === 'GET') logVisit(req); next(); });
 
-// ---------- PUBLIC ENDPOINTS (Unified Naming) ----------
+// ---------- PUBLIC ENDPOINTS ----------
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
+// Products list
 app.get('/api/products', (req, res) => {
   const products = readJSON('products.json');
   res.json(products);
 });
 
+// Banner (public)
 app.get('/api/banner', (req, res) => {
   const banner = readJSON('banner.json') || { text: '', enabled: false };
   res.json(banner);
 });
 
-// Public WhatsApp settings – matches frontend expectation
+// WhatsApp settings (public)
 app.get('/api/admin/whatsapp', (req, res) => {
   const wa = readJSON('whatsapp.json') || { enabled: false, number: '', message: 'Hello' };
   res.json(wa);
 });
 
-// Term settings – public read
+// Term settings (public)
 app.get('/api/term-settings', (req, res) => {
   const terms = readJSON('terms.json') || { enabled: [1,2,3], default: 1 };
   res.json({
@@ -151,11 +154,13 @@ app.get('/api/term-settings', (req, res) => {
   });
 });
 
+// Popups (public)
 app.get('/api/popups', (req, res) => {
   const popups = readJSON('popups.json') || [];
   res.json(popups);
 });
 
+// Feedback submission
 app.post('/api/submit-feedback', (req, res) => {
   const { message, whatsapp } = req.body;
   const feedbacks = readJSON('feedback.json') || [];
@@ -164,10 +169,12 @@ app.post('/api/submit-feedback', (req, res) => {
   res.json({ success: true });
 });
 
+// Cache version (for frontend auto‑refresh)
 app.get('/api/cache-version', (req, res) => {
   res.json({ version: cacheVersion });
 });
 
+// Grades list
 app.get('/api/grades', (req, res) => {
   let grades = readJSON('grades.json');
   if (!grades.length) {
@@ -177,16 +184,19 @@ app.get('/api/grades', (req, res) => {
   res.json(grades);
 });
 
+// Learning areas (subjects)
 app.get('/api/learning-areas', (req, res) => {
   const areas = readJSON('subjects.json') || [];
   res.json(areas);
 });
 
+// Visitor tracking
 app.post('/api/track-visit', (req, res) => {
   logVisit(req);
   res.json({ success: true });
 });
 
+// Heartbeat for active user count
 app.post('/api/heartbeat', (req, res) => {
   const { sessionId } = req.body;
   const sessions = readJSON('sessions.json') || {};
@@ -195,6 +205,7 @@ app.post('/api/heartbeat', (req, res) => {
   res.json({ success: true });
 });
 
+// User leave
 app.post('/api/leave', (req, res) => {
   const { sessionId } = req.body;
   const sessions = readJSON('sessions.json') || {};
@@ -203,7 +214,7 @@ app.post('/api/leave', (req, res) => {
   res.json({ success: true });
 });
 
-// ---------- PAYMENT FLOW (Robust & Secure) ----------
+// ---------- PAYMENT FLOW (with payload variants) ----------
 app.post('/api/initiate-payment', async (req, res) => {
   console.log('=== PAYMENT INITIATION ===');
   console.log('Request body:', JSON.stringify(req.body));
@@ -239,6 +250,7 @@ app.post('/api/initiate-payment', async (req, res) => {
   };
   pendingPayments.set(transactionId, pending);
 
+  // Check for Paynecta credentials
   console.log('Paynecta credentials present:', {
     apiKey: !!PAYNECTA_API_KEY,
     email: !!PAYNECTA_EMAIL,
@@ -256,11 +268,30 @@ app.post('/api/initiate-payment', async (req, res) => {
   }
 
   try {
+    // ===== TRY THESE PAYLOAD FORMATS ONE BY ONE =====
+    // Uncomment the one that works for your Paynecta account.
+    
+    // Option 1: mobile_number + string amount (most common)
     const payload = {
       payment_code: PAYNECTA_PAYMENT_CODE,
-      mobile_number: formattedPhone,   // Change to "phone_number" if required by Paynecta
-      amount: String(amount)           // Some gateways require string
+      mobile_number: formattedPhone,
+      amount: String(amount)
     };
+    
+    // Option 2: phone_number + string amount
+    // const payload = {
+    //   payment_code: PAYNECTA_PAYMENT_CODE,
+    //   phone_number: formattedPhone,
+    //   amount: String(amount)
+    // };
+    
+    // Option 3: mobile_number + integer amount + currency
+    // const payload = {
+    //   payment_code: PAYNECTA_PAYMENT_CODE,
+    //   mobile_number: formattedPhone,
+    //   amount: parseInt(amount),
+    //   currency: 'KES'
+    // };
     
     console.log('Paynecta request payload:', JSON.stringify(payload));
     console.log('Paynecta URL:', `${PAYNECTA_API_URL}/payment/initialize`);
@@ -285,7 +316,6 @@ app.post('/api/initiate-payment', async (req, res) => {
     const reference = transaction_reference || checkout_request_id;
     
     if (!reference) {
-      console.error('No transaction reference in response');
       throw new Error('No transaction reference received from Paynecta');
     }
     
@@ -300,28 +330,19 @@ app.post('/api/initiate-payment', async (req, res) => {
       console.error('Status:', error.response.status);
       console.error('Data:', JSON.stringify(error.response.data));
     } else if (error.request) {
-      console.error('No response received. Error code:', error.code);
+      console.error('No response received. Code:', error.code);
     } else {
-      console.error('Error message:', error.message);
+      console.error('Message:', error.message);
     }
     
     pending.status = 'failed';
     pendingPayments.set(transactionId, pending);
     
     let errorMessage = 'Payment initiation failed';
-    if (error.response?.data?.message) {
-      errorMessage = error.response.data.message;
-    } else if (error.response?.data?.error) {
-      errorMessage = error.response.data.error;
-    } else if (error.response?.status === 401) {
-      errorMessage = 'Invalid API credentials';
-    } else if (error.response?.status === 400) {
-      errorMessage = 'Invalid request – check payment code or phone number';
-    } else if (error.code === 'ECONNABORTED') {
-      errorMessage = 'Payment gateway timeout';
-    } else if (error.code === 'ENOTFOUND') {
-      errorMessage = 'Cannot reach payment gateway';
-    }
+    if (error.response?.status === 401) errorMessage = 'Invalid API credentials';
+    else if (error.response?.status === 400) errorMessage = 'Invalid request – check payment code/phone';
+    else if (error.code === 'ECONNABORTED') errorMessage = 'Gateway timeout';
+    else if (error.code === 'ENOTFOUND') errorMessage = 'Cannot reach Paynecta';
     
     res.status(500).json({ error: errorMessage });
   }
@@ -453,7 +474,7 @@ app.post('/api/admin/login', (req, res) => {
   res.json({ token: Buffer.from(currentAdminPassword).toString('base64') });
 });
 
-// Subjects
+// Subjects (Learning Areas)
 app.get('/api/admin/subjects', adminAuth, (req, res) => res.json(readJSON('subjects.json')));
 app.post('/api/admin/subjects', adminAuth, (req, res) => {
   const { name } = req.body;
@@ -525,7 +546,7 @@ app.delete('/api/admin/products/:id', adminAuth, (req, res) => {
   res.json({ success: true });
 });
 
-// Terms (admin write)
+// Terms (admin)
 app.get('/api/admin/terms', adminAuth, (req, res) => res.json(readJSON('terms.json') || { enabled: [1,2,3], default: 1 }));
 app.post('/api/admin/terms', adminAuth, (req, res) => {
   writeJSON('terms.json', req.body);
@@ -533,7 +554,7 @@ app.post('/api/admin/terms', adminAuth, (req, res) => {
   res.json({ success: true });
 });
 
-// Banner
+// Banner (admin)
 app.get('/api/admin/banner', adminAuth, (req, res) => res.json(readJSON('banner.json') || {}));
 app.post('/api/admin/banner', adminAuth, (req, res) => {
   writeJSON('banner.json', req.body);
@@ -541,7 +562,7 @@ app.post('/api/admin/banner', adminAuth, (req, res) => {
   res.json({ success: true });
 });
 
-// Popups
+// Popups (admin)
 app.get('/api/admin/popups', adminAuth, (req, res) => res.json(readJSON('popups.json')));
 app.post('/api/admin/popups', adminAuth, (req, res) => {
   const popups = readJSON('popups.json');
@@ -559,7 +580,7 @@ app.delete('/api/admin/popups/:id', adminAuth, (req, res) => {
   res.json({ success: true });
 });
 
-// WhatsApp (admin write)
+// WhatsApp (admin)
 app.get('/api/admin/wa', adminAuth, (req, res) => res.json(readJSON('whatsapp.json') || {}));
 app.post('/api/admin/wa', adminAuth, (req, res) => {
   writeJSON('whatsapp.json', req.body);
