@@ -108,6 +108,11 @@ if (DEMO_MODE) console.log('⚠️  DEMO MODE – payments will auto‑confirm a
 
 // ---------- PUBLIC ROUTES ----------
 
+// HEALTH CHECK (FIXED)
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', demo: DEMO_MODE });
+});
+
 app.post('/api/track-visit', (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
   const ua = req.headers['user-agent'] || '';
@@ -153,9 +158,7 @@ app.get('/api/stats', (req, res) => {
   });
 });
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok', demo: DEMO_MODE }));
-
-// ---------- PAYMENT ROUTES (FIXED SUCCESS DETECTION) ----------
+// ---------- PAYMENT ROUTES (FIXED) ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -225,12 +228,10 @@ app.post('/api/initiate-payment', async (req, res) => {
   }
 });
 
-// ----- IMPROVED STATUS CHECK THAT DETECTS SUCCESSFUL PAYMENTS -----
 app.get('/api/payment-status/:transactionId', async (req, res) => {
   const tx = transactions[req.params.transactionId];
   if (!tx) return res.status(404).json({ status: 'not_found' });
 
-  // Already finalised
   if (tx.status === 'success') {
     return res.json({ status: 'success', verificationToken: tx.verificationToken });
   }
@@ -256,15 +257,12 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
       return res.json({ status: 'pending' });
     }
 
-    // Paynecta sometimes wraps the real data inside `data`
     const inner = data.data || data;
     const status = inner.status;
-    // result_code can be number or string
     const resultCode = inner.result_code !== undefined ? String(inner.result_code) : null;
 
     console.log(`📊 Extracted status: ${status}, result_code: ${resultCode}`);
 
-    // Successful payment: status = 'completed' AND result_code = '0'
     if (status === 'completed' && resultCode === '0') {
       const vt = crypto.randomBytes(16).toString('hex');
       verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5 * 60 * 1000 };
@@ -286,7 +284,6 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
       return res.json({ status: 'success', verificationToken: vt });
     }
 
-    // Failed / cancelled / expired
     if (['failed', 'cancelled', 'expired'].includes(status)) {
       const failReason = inner.result_desc || 'Payment was cancelled or failed';
       transactions[req.params.transactionId].status = 'failed';
@@ -295,7 +292,6 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
       return res.json({ status: 'failed', message: failReason });
     }
 
-    // Still pending
     res.json({ status: 'pending' });
 
   } catch (err) {
@@ -341,8 +337,274 @@ app.get('/api/download/:token', (req, res) => {
   fs.createReadStream(dt.filePath).pipe(res);
 });
 
-// ---------- ADMIN ROUTES (unchanged from your working version) ----------
-// ... (all admin routes from your existing server.js remain exactly the same) ...
+// ---------- ADMIN ROUTES ----------
+
+app.post('/api/admin/login', (req, res) => {
+  const { password } = req.body;
+  const settings = readDB('settings', {});
+  if (password === settings.adminPassword) {
+    res.json({ token: password, ok: true });
+  } else {
+    res.status(401).json({ error: 'Wrong password' });
+  }
+});
+
+app.get('/api/admin/verify', adminAuth, (req, res) => res.json({ ok: true }));
+
+app.get('/api/admin/stats', adminAuth, (req, res) => {
+  const stats = readDB('stats', {});
+  const schemes = readDB('schemes');
+  const sales = readDB('sales');
+  const sessions = readDB('sessions', {});
+  const activeUsers = Object.values(sessions).filter(ts => Date.now() - ts < 60000).length;
+  res.json({
+    visits: stats.visits || 0,
+    downloads: stats.downloads || 0,
+    sales: stats.sales || 0,
+    schemes: schemes.length,
+    activeUsers,
+    recentSales: sales.slice(-10).reverse()
+  });
+});
+
+app.get('/api/admin/schemes', adminAuth, (req, res) => res.json(readDB('schemes')));
+
+app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), (req, res) => {
+  const { title, subject, grade, term, price, weeks, pages } = req.body;
+  if (!title || !subject || !grade || !term || !price || !req.files?.document) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  const docFile = req.files.document[0];
+  const coverFile = req.files.cover?.[0];
+  const scheme = {
+    id: crypto.randomUUID(),
+    title, subject, grade, term: Number(term),
+    price: Number(price),
+    weeks: weeks ? Number(weeks) : null,
+    pages: pages ? Number(pages) : null,
+    fileName: docFile.filename,
+    originalName: docFile.originalname,
+    coverImage: coverFile?.filename || null,
+    visible: true,
+    createdAt: new Date().toISOString()
+  };
+  const schemes = readDB('schemes');
+  schemes.push(scheme);
+  writeDB('schemes', schemes);
+  res.status(201).json(scheme);
+});
+
+app.patch('/api/admin/schemes/:id', adminAuth, (req, res) => {
+  const schemes = readDB('schemes');
+  const idx = schemes.findIndex(s => s.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Not found' });
+  const { price, weeks, visible } = req.body;
+  if (price !== undefined) schemes[idx].price = Number(price);
+  if (weeks !== undefined) schemes[idx].weeks = Number(weeks);
+  if (visible !== undefined) schemes[idx].visible = Boolean(visible);
+  writeDB('schemes', schemes);
+  res.json(schemes[idx]);
+});
+
+app.delete('/api/admin/schemes/:id', adminAuth, (req, res) => {
+  const schemes = readDB('schemes');
+  const scheme = schemes.find(s => s.id === req.params.id);
+  if (!scheme) return res.status(404).json({ error: 'Not found' });
+  [scheme.fileName && path.join(UPLOADS_DIR, scheme.fileName), scheme.coverImage && path.join(COVERS_DIR, scheme.coverImage)]
+    .filter(Boolean).forEach(f => { try { fs.unlinkSync(f); } catch {} });
+  writeDB('schemes', schemes.filter(s => s.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+// Learning Areas
+app.post('/api/admin/subjects', adminAuth, (req, res) => {
+  const { name } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+  const areas = readDB('areas');
+  if (areas.find(a => a.name.toLowerCase() === name.toLowerCase())) return res.status(409).json({ error: 'Already exists' });
+  const area = { id: crypto.randomUUID(), name: name.trim() };
+  areas.push(area);
+  writeDB('areas', areas);
+  res.status(201).json(area);
+});
+
+app.get('/api/admin/subjects', adminAuth, (req, res) => res.json(readDB('areas')));
+app.delete('/api/admin/subjects/:id', adminAuth, (req, res) => {
+  const areas = readDB('areas').filter(a => a.id !== req.params.id);
+  writeDB('areas', areas);
+  res.json({ ok: true });
+});
+
+// Grades
+app.get('/api/admin/grades', adminAuth, (req, res) => {
+  let grades = readDB('grades');
+  if (!grades.length) {
+    grades = Array.from({ length: 9 }, (_, i) => ({ id: crypto.randomUUID(), name: `Grade ${i+1}`, active: true }));
+    writeDB('grades', grades);
+  }
+  res.json(grades);
+});
+app.post('/api/admin/grades', adminAuth, (req, res) => {
+  const { name, active } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+  const grades = readDB('grades');
+  const grade = { id: crypto.randomUUID(), name: name.trim(), active: active !== false };
+  grades.push(grade);
+  writeDB('grades', grades);
+  res.status(201).json(grade);
+});
+app.delete('/api/admin/grades/:id', adminAuth, (req, res) => {
+  writeDB('grades', readDB('grades').filter(g => g.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+// Popups
+app.post('/api/admin/popups', adminAuth, (req, res) => {
+  const { question, options, trigger, collectWhatsapp } = req.body;
+  if (!question) return res.status(400).json({ error: 'Question required' });
+  const popup = { id: crypto.randomUUID(), question, options, trigger: trigger || 'onload', collectWhatsapp: Boolean(collectWhatsapp) };
+  const popups = readDB('popups');
+  popups.push(popup);
+  writeDB('popups', popups);
+  res.status(201).json(popup);
+});
+app.delete('/api/admin/popups/:id', adminAuth, (req, res) => {
+  writeDB('popups', readDB('popups').filter(p => p.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+// Banner
+app.get('/api/admin/banner', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  res.json({ text: s.bannerText || '', enabled: s.bannerEnabled || false });
+});
+app.post('/api/admin/banner', adminAuth, (req, res) => {
+  const settings = readDB('settings', {});
+  settings.bannerText = req.body.text || '';
+  settings.bannerEnabled = req.body.enabled || false;
+  writeDB('settings', settings);
+  res.json({ ok: true });
+});
+
+// WhatsApp
+app.get('/api/admin/whatsapp', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  res.json({ number: s.waNumber || '', message: s.waMessage || 'Hello', enabled: s.waEnabled || false });
+});
+app.post('/api/admin/whatsapp', adminAuth, (req, res) => {
+  const settings = readDB('settings', {});
+  settings.waNumber = req.body.number || '';
+  settings.waMessage = req.body.message || 'Hello';
+  settings.waEnabled = req.body.enabled || false;
+  writeDB('settings', settings);
+  res.json({ ok: true });
+});
+
+// Terms
+app.get('/api/admin/terms', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  res.json({ term1Enabled: s.term1Enabled, term2Enabled: s.term2Enabled, term3Enabled: s.term3Enabled, defaultTerm: s.defaultTerm });
+});
+app.post('/api/admin/terms', adminAuth, (req, res) => {
+  const settings = readDB('settings', {});
+  if (req.body.term1Enabled !== undefined) settings.term1Enabled = req.body.term1Enabled;
+  if (req.body.term2Enabled !== undefined) settings.term2Enabled = req.body.term2Enabled;
+  if (req.body.term3Enabled !== undefined) settings.term3Enabled = req.body.term3Enabled;
+  if (req.body.defaultTerm) settings.defaultTerm = req.body.defaultTerm;
+  writeDB('settings', settings);
+  res.json({ ok: true });
+});
+
+// Settings (general)
+app.patch('/api/admin/settings', adminAuth, (req, res) => {
+  const settings = readDB('settings', {});
+  Object.assign(settings, req.body);
+  writeDB('settings', settings);
+  res.json({ ok: true });
+});
+
+// Change password
+app.post('/api/admin/change-password', adminAuth, (req, res) => {
+  const { newPassword } = req.body;
+  if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Password too short' });
+  const settings = readDB('settings', {});
+  settings.adminPassword = newPassword;
+  writeDB('settings', settings);
+  res.json({ ok: true });
+});
+
+// Password reset (email)
+app.post('/api/admin/forgot-password', async (req, res) => {
+  const adminEmail = process.env.ADMIN_EMAIL || process.env.EMAIL_USER;
+  if (!adminEmail) return res.status(500).json({ error: 'Admin email not configured' });
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  const resetCodes = readDB('resetCodes', {});
+  resetCodes[adminEmail] = { code, expires: Date.now() + 15 * 60 * 1000 };
+  writeDB('resetCodes', resetCodes);
+  if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+    try {
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+      });
+      await transporter.sendMail({
+        from: `"SchemeVault" <${process.env.EMAIL_USER}>`,
+        to: adminEmail,
+        subject: 'Password Reset Code',
+        text: `Your reset code is: ${code}\nValid for 15 minutes.`
+      });
+    } catch (e) {}
+  }
+  res.json({ success: true, email: adminEmail, code: DEMO_MODE ? code : undefined });
+});
+
+app.post('/api/admin/reset-password', (req, res) => {
+  const { email, code, newPassword } = req.body;
+  const resetCodes = readDB('resetCodes', {});
+  const stored = resetCodes[email];
+  if (!stored || stored.code !== code || stored.expires < Date.now()) {
+    return res.status(400).json({ error: 'Invalid or expired code' });
+  }
+  const settings = readDB('settings', {});
+  settings.adminPassword = newPassword;
+  writeDB('settings', settings);
+  delete resetCodes[email];
+  writeDB('resetCodes', resetCodes);
+  res.json({ ok: true });
+});
+
+// Visitor logs
+app.get('/api/admin/visitors', adminAuth, (req, res) => res.json(readDB('visitors')));
+
+// Backup & Restore
+app.get('/api/admin/backup', adminAuth, (req, res) => {
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="schemevault-backup-${Date.now()}.zip"`);
+  const archive = archiver('zip', { zlib: { level: 6 } });
+  archive.pipe(res);
+  archive.directory(DATA_DIR, 'data');
+  archive.finalize();
+});
+
+app.post('/api/admin/restore', adminAuth, restoreStorage.single('backup'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    await extract(req.file.path, { dir: path.dirname(DATA_DIR) });
+    fs.unlinkSync(req.file.path);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Restore failed', details: err.message });
+  }
+});
+
+// 404 fallback
+app.use((req, res) => res.status(404).json({ error: 'Not found' }));
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: err.message });
+});
 
 app.listen(PORT, () => {
   console.log(`🚀 SchemeVault running on port ${PORT}`);
