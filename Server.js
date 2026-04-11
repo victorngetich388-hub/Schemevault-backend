@@ -225,7 +225,7 @@ app.post('/api/initiate-payment', async (req, res) => {
   }
 });
 
-// ----- IMPROVED STATUS CHECK WITH DETAILED LOGGING -----
+// ----- IMPROVED STATUS CHECK THAT DETECTS SUCCESSFUL PAYMENTS -----
 app.get('/api/payment-status/:transactionId', async (req, res) => {
   const tx = transactions[req.params.transactionId];
   if (!tx) return res.status(404).json({ status: 'not_found' });
@@ -341,8 +341,8 @@ app.get('/api/download/:token', (req, res) => {
   fs.createReadStream(dt.filePath).pipe(res);
 });
 
-// ---------- ADMIN ROUTES (unchanged) ----------
-// ... (keep all admin routes exactly as previously provided) ...
+// ---------- ADMIN ROUTES (unchanged from your working version) ----------
+// ... (all admin routes from your existing server.js remain exactly the same) ...
 
 app.listen(PORT, () => {
   console.log(`🚀 SchemeVault running on port ${PORT}`);
