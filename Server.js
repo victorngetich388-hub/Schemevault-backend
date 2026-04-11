@@ -194,6 +194,8 @@ app.post('/api/initiate-payment', async (req, res) => {
       amount: Number(amount || scheme.price)
     };
 
+    console.log(`📤 Initiating Paynecta payment:`, payload);
+
     const response = await fetch(`${PAYNECTA_API_URL}/payment/initialize`, {
       method: 'POST',
       headers: {
@@ -205,10 +207,12 @@ app.post('/api/initiate-payment', async (req, res) => {
     });
 
     const data = await response.json();
+    console.log(`📥 Paynecta init response:`, data);
+
     const reference = data.transaction_reference || data.checkout_request_id || data.data?.transaction_reference;
 
     if (!reference) {
-      console.error('Paynecta init error:', data);
+      console.error('❌ Paynecta init error: no reference');
       return res.status(502).json({ error: 'Payment gateway error', details: data });
     }
 
@@ -216,7 +220,7 @@ app.post('/api/initiate-payment', async (req, res) => {
     res.json({ transactionId });
 
   } catch (err) {
-    console.error('Paynecta network error:', err.message);
+    console.error('❌ Paynecta network error:', err.message);
     res.status(502).json({ error: 'Could not reach payment gateway' });
   }
 });
@@ -225,6 +229,7 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
   const tx = transactions[req.params.transactionId];
   if (!tx) return res.status(404).json({ status: 'not_found' });
 
+  // Already completed or failed – return immediately
   if (tx.status === 'success') {
     return res.json({ status: 'success', verificationToken: tx.verificationToken });
   }
@@ -235,14 +240,18 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
   if (DEMO_MODE) return res.json({ status: 'pending' });
 
   try {
+    console.log(`🔍 Checking Paynecta status for ref: ${tx.reference}`);
     const response = await fetch(`${PAYNECTA_API_URL}/payment/status?transaction_reference=${tx.reference}`, {
       headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL }
     });
     const data = await response.json();
+    console.log(`📡 Paynecta status response:`, JSON.stringify(data));
+
     const status = data.data?.status || data.status;
     const resultCode = data.data?.result_code ?? data.result_code;
 
     if (status === 'completed' && resultCode === 0) {
+      // Payment successful
       const vt = crypto.randomBytes(16).toString('hex');
       verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5 * 60 * 1000 };
       transactions[req.params.transactionId] = { ...tx, status: 'success', verificationToken: vt };
@@ -259,17 +268,23 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
       writeDB('sales', sales);
       incStat('sales');
 
+      console.log(`✅ Payment confirmed for ${req.params.transactionId}`);
       return res.json({ status: 'success', verificationToken: vt });
     }
 
     if (['failed', 'cancelled', 'expired'].includes(status)) {
+      const failReason = data.data?.result_desc || 'Payment was cancelled or failed';
       transactions[req.params.transactionId].status = 'failed';
-      transactions[req.params.transactionId].failReason = data.data?.result_desc || 'Payment not completed';
-      return res.json({ status: 'failed', message: data.data?.result_desc || 'Payment not completed' });
+      transactions[req.params.transactionId].failReason = failReason;
+      console.log(`❌ Payment failed: ${failReason}`);
+      return res.json({ status: 'failed', message: failReason });
     }
 
+    // Still pending
     res.json({ status: 'pending' });
+
   } catch (err) {
+    console.error(`⚠️ Status check error:`, err.message);
     res.json({ status: 'pending' });
   }
 });
@@ -580,7 +595,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message });
 });
 
-// Start server
 app.listen(PORT, () => {
   console.log(`🚀 SchemeVault running on port ${PORT}`);
   console.log(`📁 Data directory: ${DATA_DIR}`);
