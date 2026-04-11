@@ -10,15 +10,14 @@ const nodemailer = require('nodemailer');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── PERSISTENT DATA DIRECTORY ──────────────────────────────────────────────
+// ---------- Persistent Data Directory ----------
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const COVERS_DIR = path.join(DATA_DIR, 'covers');
 [DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
 
-// ─── JSON FILE HELPERS ───────────────────────────────────────────────────────
+// ---------- JSON Helpers ----------
 const dbFile = name => path.join(DATA_DIR, `${name}.json`);
-
 function readDB(name, def = []) {
   try { return JSON.parse(fs.readFileSync(dbFile(name), 'utf8')); }
   catch { return def; }
@@ -27,7 +26,7 @@ function writeDB(name, data) {
   fs.writeFileSync(dbFile(name), JSON.stringify(data, null, 2));
 }
 
-// ─── DEFAULTS ───────────────────────────────────────────────────────────────
+// ---------- Initialize Default Data ----------
 if (!fs.existsSync(dbFile('settings'))) {
   writeDB('settings', {
     adminPassword: process.env.ADMIN_PASSWORD || '0726019859',
@@ -40,7 +39,7 @@ if (!fs.existsSync(dbFile('settings'))) {
   if (!fs.existsSync(dbFile(n))) writeDB(n, []);
 });
 
-// ─── MULTER STORAGE ──────────────────────────────────────────────────────────
+// ---------- Multer Configuration ----------
 const docStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, file.fieldname === 'cover' ? COVERS_DIR : UPLOADS_DIR);
@@ -59,17 +58,15 @@ const upload = multer({
     else cb(new Error('File type not allowed'));
   }
 });
-
 const restoreStorage = multer({ dest: path.join(DATA_DIR, 'tmp') });
 
-// ─── MIDDLEWARE ──────────────────────────────────────────────────────────────
+// ---------- Middleware ----------
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use('/data/covers', express.static(COVERS_DIR));
 app.use('/data/uploads', express.static(UPLOADS_DIR));
-app.use(express.static(__dirname)); // serves index.html, admin.html
+app.use(express.static(__dirname));
 
-// CORS
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
@@ -78,7 +75,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Admin auth middleware
+// ---------- Admin Authentication ----------
 function adminAuth(req, res, next) {
   const token = req.headers['x-admin-token'] || req.query.token;
   const settings = readDB('settings', {});
@@ -88,30 +85,29 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// ─── STATS HELPERS ──────────────────────────────────────────────────────────
+// ---------- Stats Helpers ----------
 function incStat(key) {
   const stats = readDB('stats', { visits: 0, downloads: 0, sales: 0 });
   stats[key] = (stats[key] || 0) + 1;
   writeDB('stats', stats);
 }
 
-// ─── IN-MEMORY TRANSACTION STORE ────────────────────────────────────────────
+// ---------- In-Memory Transaction Store ----------
 const transactions = {};
 const verificationTokens = {};
 const downloadTokens = {};
 
-// ─── PAYNECTA CONFIG ─────────────────────────────────────────────────────────
+// ---------- Paynecta Configuration ----------
 const PAYNECTA_API_URL  = process.env.PAYNECTA_API_URL  || 'https://paynecta.co.ke/api/v1';
 const PAYNECTA_API_KEY  = process.env.PAYNECTA_API_KEY  || '';
 const PAYNECTA_EMAIL    = process.env.PAYNECTA_EMAIL    || '';
 const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE || '';
 const DEMO_MODE = !PAYNECTA_API_KEY;
 
-if (DEMO_MODE) console.log('⚠️  Paynecta env vars missing – running in DEMO MODE (auto-confirms after 10s)');
+if (DEMO_MODE) console.log('⚠️  DEMO MODE – payments will auto‑confirm after 10 seconds');
 
-// ─── PUBLIC ROUTES ───────────────────────────────────────────────────────────
+// ---------- PUBLIC ROUTES ----------
 
-// Visitor tracking
 app.post('/api/track-visit', (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
   const ua = req.headers['user-agent'] || '';
@@ -124,16 +120,13 @@ app.post('/api/track-visit', (req, res) => {
   res.json({ ok: true });
 });
 
-// Public schemes (visible only)
 app.get('/api/schemes', (req, res) => {
   const schemes = readDB('schemes').filter(s => s.visible !== false);
   res.json(schemes);
 });
 
-// Learning areas
 app.get('/api/areas', (req, res) => res.json(readDB('areas')));
 
-// Settings (public subset)
 app.get('/api/settings', (req, res) => {
   const s = readDB('settings', {});
   res.json({
@@ -146,10 +139,8 @@ app.get('/api/settings', (req, res) => {
   });
 });
 
-// Popups
 app.get('/api/popups', (req, res) => res.json(readDB('popups')));
 
-// Stats (public counts)
 app.get('/api/stats', (req, res) => {
   const stats = readDB('stats', {});
   const schemes = readDB('schemes');
@@ -162,8 +153,9 @@ app.get('/api/stats', (req, res) => {
   });
 });
 
-// ─── PAYMENT ROUTES ──────────────────────────────────────────────────────────
+app.get('/api/health', (req, res) => res.json({ status: 'ok', demo: DEMO_MODE }));
 
+// ---------- PAYMENT ROUTES (FIXED) ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -196,19 +188,33 @@ app.post('/api/initiate-payment', async (req, res) => {
   }
 
   try {
+    const payload = {
+      code: PAYNECTA_PAYMENT_CODE,
+      mobile_number: mobile,
+      amount: Number(amount || scheme.price)
+    };
+
     const response = await fetch(`${PAYNECTA_API_URL}/payment/initialize`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL },
-      body: JSON.stringify({ code: PAYNECTA_PAYMENT_CODE, mobile_number: mobile, amount: Number(amount || scheme.price) })
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': PAYNECTA_API_KEY,
+        'X-User-Email': PAYNECTA_EMAIL
+      },
+      body: JSON.stringify(payload)
     });
+
     const data = await response.json();
     const reference = data.transaction_reference || data.checkout_request_id || data.data?.transaction_reference;
+
     if (!reference) {
       console.error('Paynecta init error:', data);
       return res.status(502).json({ error: 'Payment gateway error', details: data });
     }
+
     transactions[transactionId] = { reference, productId, status: 'pending', phone: mobile };
     res.json({ transactionId });
+
   } catch (err) {
     console.error('Paynecta network error:', err.message);
     res.status(502).json({ error: 'Could not reach payment gateway' });
@@ -240,12 +246,19 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
       const vt = crypto.randomBytes(16).toString('hex');
       verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5 * 60 * 1000 };
       transactions[req.params.transactionId] = { ...tx, status: 'success', verificationToken: vt };
+
       const schemes = readDB('schemes');
       const scheme = schemes.find(s => s.id === tx.productId);
       const sales = readDB('sales');
-      sales.push({ title: scheme?.title || '—', phone: tx.phone, amount: scheme?.price || 0, date: new Date().toISOString() });
+      sales.push({
+        title: scheme?.title || '—',
+        phone: tx.phone,
+        amount: scheme?.price || 0,
+        date: new Date().toISOString()
+      });
       writeDB('sales', sales);
       incStat('sales');
+
       return res.json({ status: 'success', verificationToken: vt });
     }
 
@@ -267,6 +280,7 @@ app.post('/api/request-download', (req, res) => {
   if (!vt || vt.productId !== productId || Date.now() > vt.expiresAt) {
     return res.status(403).json({ error: 'Invalid or expired token' });
   }
+
   const schemes = readDB('schemes');
   const scheme = schemes.find(s => s.id === productId);
   if (!scheme || !scheme.fileName) return res.status(404).json({ error: 'File not found' });
@@ -287,13 +301,17 @@ app.get('/api/download/:token', (req, res) => {
   if (!fs.existsSync(dt.filePath)) return res.status(404).send('File not found');
 
   const ext = path.extname(dt.fileName).toLowerCase();
-  const mimeMap = { '.pdf': 'application/pdf', '.doc': 'application/msword', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
+  const mimeMap = {
+    '.pdf': 'application/pdf',
+    '.doc': 'application/msword',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  };
   res.setHeader('Content-Type', mimeMap[ext] || 'application/octet-stream');
   res.setHeader('Content-Disposition', `attachment; filename="${dt.fileName}"`);
   fs.createReadStream(dt.filePath).pipe(res);
 });
 
-// ─── ADMIN ROUTES ─────────────────────────────────────────────────────────────
+// ---------- ADMIN ROUTES ----------
 
 app.post('/api/admin/login', (req, res) => {
   const { password } = req.body;
@@ -311,11 +329,14 @@ app.get('/api/admin/stats', adminAuth, (req, res) => {
   const stats = readDB('stats', {});
   const schemes = readDB('schemes');
   const sales = readDB('sales');
+  const sessions = readDB('sessions', {});
+  const activeUsers = Object.values(sessions).filter(ts => Date.now() - ts < 60000).length;
   res.json({
     visits: stats.visits || 0,
     downloads: stats.downloads || 0,
     sales: stats.sales || 0,
     schemes: schemes.length,
+    activeUsers,
     recentSales: sales.slice(-10).reverse()
   });
 });
@@ -369,7 +390,8 @@ app.delete('/api/admin/schemes/:id', adminAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/admin/areas', adminAuth, (req, res) => {
+// Learning Areas
+app.post('/api/admin/subjects', adminAuth, (req, res) => {
   const { name } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
   const areas = readDB('areas');
@@ -380,29 +402,94 @@ app.post('/api/admin/areas', adminAuth, (req, res) => {
   res.status(201).json(area);
 });
 
-app.delete('/api/admin/areas/:id', adminAuth, (req, res) => {
+app.get('/api/admin/subjects', adminAuth, (req, res) => res.json(readDB('areas')));
+app.delete('/api/admin/subjects/:id', adminAuth, (req, res) => {
   const areas = readDB('areas').filter(a => a.id !== req.params.id);
   writeDB('areas', areas);
   res.json({ ok: true });
 });
 
+// Grades
+app.get('/api/admin/grades', adminAuth, (req, res) => {
+  let grades = readDB('grades');
+  if (!grades.length) {
+    grades = Array.from({ length: 9 }, (_, i) => ({ id: crypto.randomUUID(), name: `Grade ${i+1}`, active: true }));
+    writeDB('grades', grades);
+  }
+  res.json(grades);
+});
+app.post('/api/admin/grades', adminAuth, (req, res) => {
+  const { name, active } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+  const grades = readDB('grades');
+  const grade = { id: crypto.randomUUID(), name: name.trim(), active: active !== false };
+  grades.push(grade);
+  writeDB('grades', grades);
+  res.status(201).json(grade);
+});
+app.delete('/api/admin/grades/:id', adminAuth, (req, res) => {
+  writeDB('grades', readDB('grades').filter(g => g.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+// Popups
 app.post('/api/admin/popups', adminAuth, (req, res) => {
-  const { title, body, trigger, collectWhatsApp } = req.body;
-  if (!title || !body) return res.status(400).json({ error: 'Title and body required' });
-  const popup = { id: crypto.randomUUID(), title, body, trigger: trigger || 'onload', collectWhatsApp: Boolean(collectWhatsApp) };
+  const { question, options, trigger, collectWhatsapp } = req.body;
+  if (!question) return res.status(400).json({ error: 'Question required' });
+  const popup = { id: crypto.randomUUID(), question, options, trigger: trigger || 'onload', collectWhatsapp: Boolean(collectWhatsapp) };
   const popups = readDB('popups');
   popups.push(popup);
   writeDB('popups', popups);
   res.status(201).json(popup);
 });
-
 app.delete('/api/admin/popups/:id', adminAuth, (req, res) => {
   writeDB('popups', readDB('popups').filter(p => p.id !== req.params.id));
   res.json({ ok: true });
 });
 
-app.get('/api/admin/visitors', adminAuth, (req, res) => res.json(readDB('visitors')));
+// Banner
+app.get('/api/admin/banner', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  res.json({ text: s.bannerText || '', enabled: s.bannerEnabled || false });
+});
+app.post('/api/admin/banner', adminAuth, (req, res) => {
+  const settings = readDB('settings', {});
+  settings.bannerText = req.body.text || '';
+  settings.bannerEnabled = req.body.enabled || false;
+  writeDB('settings', settings);
+  res.json({ ok: true });
+});
 
+// WhatsApp
+app.get('/api/admin/whatsapp', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  res.json({ number: s.waNumber || '', message: s.waMessage || 'Hello', enabled: s.waEnabled || false });
+});
+app.post('/api/admin/whatsapp', adminAuth, (req, res) => {
+  const settings = readDB('settings', {});
+  settings.waNumber = req.body.number || '';
+  settings.waMessage = req.body.message || 'Hello';
+  settings.waEnabled = req.body.enabled || false;
+  writeDB('settings', settings);
+  res.json({ ok: true });
+});
+
+// Terms
+app.get('/api/admin/terms', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  res.json({ term1Enabled: s.term1Enabled, term2Enabled: s.term2Enabled, term3Enabled: s.term3Enabled, defaultTerm: s.defaultTerm });
+});
+app.post('/api/admin/terms', adminAuth, (req, res) => {
+  const settings = readDB('settings', {});
+  if (req.body.term1Enabled !== undefined) settings.term1Enabled = req.body.term1Enabled;
+  if (req.body.term2Enabled !== undefined) settings.term2Enabled = req.body.term2Enabled;
+  if (req.body.term3Enabled !== undefined) settings.term3Enabled = req.body.term3Enabled;
+  if (req.body.defaultTerm) settings.defaultTerm = req.body.defaultTerm;
+  writeDB('settings', settings);
+  res.json({ ok: true });
+});
+
+// Settings (general)
 app.patch('/api/admin/settings', adminAuth, (req, res) => {
   const settings = readDB('settings', {});
   Object.assign(settings, req.body);
@@ -410,6 +497,7 @@ app.patch('/api/admin/settings', adminAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// Change password
 app.post('/api/admin/change-password', adminAuth, (req, res) => {
   const { newPassword } = req.body;
   if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Password too short' });
@@ -419,6 +507,50 @@ app.post('/api/admin/change-password', adminAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// Password reset (email)
+app.post('/api/admin/forgot-password', async (req, res) => {
+  const adminEmail = process.env.ADMIN_EMAIL || process.env.EMAIL_USER;
+  if (!adminEmail) return res.status(500).json({ error: 'Admin email not configured' });
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  const resetCodes = readDB('resetCodes', {});
+  resetCodes[adminEmail] = { code, expires: Date.now() + 15 * 60 * 1000 };
+  writeDB('resetCodes', resetCodes);
+  if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+    try {
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+      });
+      await transporter.sendMail({
+        from: `"SchemeVault" <${process.env.EMAIL_USER}>`,
+        to: adminEmail,
+        subject: 'Password Reset Code',
+        text: `Your reset code is: ${code}\nValid for 15 minutes.`
+      });
+    } catch (e) {}
+  }
+  res.json({ success: true, email: adminEmail, code: DEMO_MODE ? code : undefined });
+});
+
+app.post('/api/admin/reset-password', (req, res) => {
+  const { email, code, newPassword } = req.body;
+  const resetCodes = readDB('resetCodes', {});
+  const stored = resetCodes[email];
+  if (!stored || stored.code !== code || stored.expires < Date.now()) {
+    return res.status(400).json({ error: 'Invalid or expired code' });
+  }
+  const settings = readDB('settings', {});
+  settings.adminPassword = newPassword;
+  writeDB('settings', settings);
+  delete resetCodes[email];
+  writeDB('resetCodes', resetCodes);
+  res.json({ ok: true });
+});
+
+// Visitor logs
+app.get('/api/admin/visitors', adminAuth, (req, res) => res.json(readDB('visitors')));
+
+// Backup & Restore
 app.get('/api/admin/backup', adminAuth, (req, res) => {
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename="schemevault-backup-${Date.now()}.zip"`);
@@ -439,16 +571,18 @@ app.post('/api/admin/restore', adminAuth, restoreStorage.single('backup'), async
   }
 });
 
+// 404 fallback
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
+// Error handler
 app.use((err, req, res, next) => {
-  console.error(err.message);
+  console.error(err);
   res.status(500).json({ error: err.message });
 });
 
+// Start server
 app.listen(PORT, () => {
-  console.log(`\n🚀 SchemeVault running on http://localhost:${PORT}`);
-  console.log(`   Admin portal : http://localhost:${PORT}/admin.html`);
-  console.log(`   Data dir     : ${DATA_DIR}`);
-  console.log(`   Demo mode    : ${DEMO_MODE ? 'YES (set Paynecta env vars to disable)' : 'NO – live payments'}\n`);
+  console.log(`🚀 SchemeVault running on port ${PORT}`);
+  console.log(`📁 Data directory: ${DATA_DIR}`);
+  console.log(`💰 Demo mode: ${DEMO_MODE ? 'ON' : 'OFF (live Paynecta)'}`);
 });
