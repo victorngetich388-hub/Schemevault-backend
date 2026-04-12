@@ -1,7 +1,7 @@
 {
   "name": "schemevault",
-  "version": "1.0.0",
-  "description": "Kenya CBC Schemes of Work – Digital Marketplace with M-Pesa / Paynecta integration",
+  "version": "2.0.0",
+  "description": "Kenya CBC Schemes of Work – Digital Marketplace",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -18,8 +18,5 @@
     "extract-zip": "^2.0.1",
     "multer": "^1.4.5-lts.1",
     "nodemailer": "^6.9.14"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.4"
   }
 }
