@@ -21,16 +21,5 @@
   },
   "devDependencies": {
     "nodemon": "^3.1.4"
-  },
-  "keywords": [
-    "kenya",
-    "cbc",
-    "schemes-of-work",
-    "mpesa",
-    "paynecta",
-    "education",
-    "marketplace"
-  ],
-  "author": "SchemeVault",
-  "license": "MIT"
+  }
 }
