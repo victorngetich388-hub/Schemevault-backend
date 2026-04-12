@@ -15,8 +15,8 @@ const PORT = process.env.PORT || 3000;
 
 // ---------- Persistent Data Directory (JSON databases only) ----------
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');  // kept for legacy migration
-const COVERS_DIR = path.join(DATA_DIR, 'covers');    // kept for legacy migration
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+const COVERS_DIR = path.join(DATA_DIR, 'covers');
 [DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
 
 // ---------- B2 Client Setup ----------
@@ -26,39 +26,57 @@ const B2_KEY_ID = process.env.B2_KEY_ID;
 const B2_APP_KEY = process.env.B2_APP_KEY;
 const B2_BUCKET_NAME = process.env.B2_BUCKET_NAME;
 
-const b2Client = new S3Client({
+// Log B2 configuration status on startup
+console.log('🔧 B2 Config:', {
+  endpoint: B2_ENDPOINT ? '✓ set' : '✗ missing',
+  region: B2_REGION ? '✓ set' : '✗ missing',
+  keyId: B2_KEY_ID ? '✓ set' : '✗ missing',
+  appKey: B2_APP_KEY ? '✓ set' : '✗ missing',
+  bucket: B2_BUCKET_NAME ? '✓ set' : '✗ missing'
+});
+
+let b2Client = null;
+if (B2_ENDPOINT && B2_KEY_ID && B2_APP_KEY && B2_BUCKET_NAME) {
+  b2Client = new S3Client({
     endpoint: B2_ENDPOINT,
     region: B2_REGION,
     credentials: {
-        accessKeyId: B2_KEY_ID,
-        secretAccessKey: B2_APP_KEY,
+      accessKeyId: B2_KEY_ID,
+      secretAccessKey: B2_APP_KEY,
     },
     forcePathStyle: true,
-});
+  });
+  console.log('✅ B2 client initialized');
+} else {
+  console.warn('⚠️  B2 credentials missing – file uploads will FAIL. Set B2_* env vars.');
+}
 
 async function uploadBufferToB2(buffer, fileName, mimeType, folder = 'schemes') {
-    const key = `${folder}/${Date.now()}_${fileName.replace(/\s+/g, '_')}`;
-    const command = new PutObjectCommand({
-        Bucket: B2_BUCKET_NAME,
-        Key: key,
-        Body: buffer,
-        ContentType: mimeType,
-        ContentDisposition: `attachment; filename="${fileName}"`,
-    });
-    await b2Client.send(command);
-    console.log(`✅ Uploaded to B2: ${key}`);
-    return key;
+  if (!b2Client) throw new Error('B2 client not configured');
+  const safeName = fileName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '');
+  const key = `${folder}/${Date.now()}_${safeName}`;
+  const command = new PutObjectCommand({
+    Bucket: B2_BUCKET_NAME,
+    Key: key,
+    Body: buffer,
+    ContentType: mimeType,
+    ContentDisposition: `attachment; filename="${fileName}"`,
+  });
+  await b2Client.send(command);
+  console.log(`✅ Uploaded to B2: ${key}`);
+  return key;
 }
 
 async function streamFileFromB2(key, res) {
-    const command = new GetObjectCommand({
-        Bucket: B2_BUCKET_NAME,
-        Key: key,
-    });
-    const response = await b2Client.send(command);
-    res.setHeader('Content-Type', response.ContentType);
-    res.setHeader('Content-Disposition', response.ContentDisposition || 'attachment');
-    response.Body.pipe(res);
+  if (!b2Client) throw new Error('B2 client not configured');
+  const command = new GetObjectCommand({
+    Bucket: B2_BUCKET_NAME,
+    Key: key,
+  });
+  const response = await b2Client.send(command);
+  res.setHeader('Content-Type', response.ContentType);
+  res.setHeader('Content-Disposition', response.ContentDisposition || 'attachment');
+  response.Body.pipe(res);
 }
 
 // ---------- JSON Helpers ----------
@@ -396,7 +414,6 @@ app.get('/api/download/:token', async (req, res) => {
 });
 
 // ---------- ADMIN ROUTES ----------
-
 app.post('/api/admin/login', (req, res) => {
   const { password } = req.body;
   const settings = readDB('settings', {});
@@ -473,7 +490,7 @@ app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document', max
     res.status(201).json(scheme);
   } catch (err) {
     console.error('Upload failed:', err);
-    res.status(500).json({ error: 'File upload failed' });
+    res.status(500).json({ error: 'File upload failed: ' + err.message });
   }
 });
 
