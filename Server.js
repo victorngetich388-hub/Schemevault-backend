@@ -7,14 +7,59 @@ const archiver = require('archiver');
 const extract = require('extract-zip');
 const nodemailer = require('nodemailer');
 
+// AWS SDK for Backblaze B2 (S3 compatible)
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---------- Persistent Data Directory ----------
+// ---------- Persistent Data Directory (JSON databases only) ----------
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
-const COVERS_DIR = path.join(DATA_DIR, 'covers');
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');  // kept for legacy migration
+const COVERS_DIR = path.join(DATA_DIR, 'covers');    // kept for legacy migration
 [DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
+
+// ---------- B2 Client Setup ----------
+const B2_ENDPOINT = process.env.B2_ENDPOINT;
+const B2_REGION = process.env.B2_REGION || "us-west-004";
+const B2_KEY_ID = process.env.B2_KEY_ID;
+const B2_APP_KEY = process.env.B2_APP_KEY;
+const B2_BUCKET_NAME = process.env.B2_BUCKET_NAME;
+
+const b2Client = new S3Client({
+    endpoint: B2_ENDPOINT,
+    region: B2_REGION,
+    credentials: {
+        accessKeyId: B2_KEY_ID,
+        secretAccessKey: B2_APP_KEY,
+    },
+    forcePathStyle: true,
+});
+
+async function uploadBufferToB2(buffer, fileName, mimeType, folder = 'schemes') {
+    const key = `${folder}/${Date.now()}_${fileName.replace(/\s+/g, '_')}`;
+    const command = new PutObjectCommand({
+        Bucket: B2_BUCKET_NAME,
+        Key: key,
+        Body: buffer,
+        ContentType: mimeType,
+        ContentDisposition: `attachment; filename="${fileName}"`,
+    });
+    await b2Client.send(command);
+    console.log(`✅ Uploaded to B2: ${key}`);
+    return key;
+}
+
+async function streamFileFromB2(key, res) {
+    const command = new GetObjectCommand({
+        Bucket: B2_BUCKET_NAME,
+        Key: key,
+    });
+    const response = await b2Client.send(command);
+    res.setHeader('Content-Type', response.ContentType);
+    res.setHeader('Content-Disposition', response.ContentDisposition || 'attachment');
+    response.Body.pipe(res);
+}
 
 // ---------- JSON Helpers ----------
 const dbFile = name => path.join(DATA_DIR, `${name}.json`);
@@ -35,22 +80,13 @@ if (!fs.existsSync(dbFile('settings'))) {
     bannerEnabled: false, bannerText: '', bannerStart: '', bannerEnd: ''
   });
 }
-['schemes', 'areas', 'visitors', 'sales', 'popups'].forEach(n => {
+['schemes', 'areas', 'visitors', 'sales', 'popups', 'grades', 'sessions', 'stats', 'resetCodes'].forEach(n => {
   if (!fs.existsSync(dbFile(n))) writeDB(n, []);
 });
 
-// ---------- Multer Configuration ----------
-const docStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, file.fieldname === 'cover' ? COVERS_DIR : UPLOADS_DIR);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`);
-  }
-});
+// ---------- Multer Configuration (Memory Storage) ----------
 const upload = multer({
-  storage: docStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ['.pdf', '.doc', '.docx', '.jpg', '.jpeg', '.png', '.webp'];
@@ -63,11 +99,8 @@ const restoreStorage = multer({ dest: path.join(DATA_DIR, 'tmp') });
 // ---------- Middleware ----------
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use('/data/covers', express.static(COVERS_DIR));
-app.use('/data/uploads', express.static(UPLOADS_DIR));
 app.use(express.static(__dirname));
 
-// CORS – allow all origins (adjust for production)
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
@@ -76,7 +109,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- Admin Authentication ----------
 function adminAuth(req, res, next) {
   const token = req.headers['x-admin-token'] || req.query.token;
   const settings = readDB('settings', {});
@@ -86,29 +118,24 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// ---------- Stats Helpers ----------
 function incStat(key) {
   const stats = readDB('stats', { visits: 0, downloads: 0, sales: 0 });
   stats[key] = (stats[key] || 0) + 1;
   writeDB('stats', stats);
 }
 
-// ---------- In-Memory Transaction Store ----------
 const transactions = {};
 const verificationTokens = {};
 const downloadTokens = {};
 
-// ---------- Paynecta Configuration ----------
 const PAYNECTA_API_URL  = process.env.PAYNECTA_API_URL  || 'https://paynecta.co.ke/api/v1';
 const PAYNECTA_API_KEY  = process.env.PAYNECTA_API_KEY  || '';
 const PAYNECTA_EMAIL    = process.env.PAYNECTA_EMAIL    || '';
 const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE || '';
 const DEMO_MODE = !PAYNECTA_API_KEY;
-
 if (DEMO_MODE) console.log('⚠️  DEMO MODE – payments will auto‑confirm after 10 seconds');
 
 // ---------- PUBLIC ROUTES ----------
-
 app.get('/health', (req, res) => res.json({ status: 'ok', demo: DEMO_MODE }));
 
 app.post('/api/track-visit', (req, res) => {
@@ -156,7 +183,22 @@ app.get('/api/stats', (req, res) => {
   });
 });
 
-// ---------- PAYMENT ROUTES (FIXED) ----------
+// Cover image proxy route (from B2)
+app.get('/api/cover/:schemeId', async (req, res) => {
+  const schemes = readDB('schemes');
+  const scheme = schemes.find(s => s.id === req.params.schemeId);
+  if (!scheme || !scheme.coverKey) return res.status(404).send('No cover');
+
+  try {
+    await streamFileFromB2(scheme.coverKey, res);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+  } catch (err) {
+    console.error('Error streaming cover:', err);
+    res.status(404).send('Cover not found');
+  }
+});
+
+// ---------- PAYMENT ROUTES ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -327,32 +369,30 @@ app.post('/api/request-download', (req, res) => {
 
   const schemes = readDB('schemes');
   const scheme = schemes.find(s => s.id === productId);
-  if (!scheme || !scheme.fileName) return res.status(404).json({ error: 'File not found' });
+  if (!scheme || !scheme.fileKey) return res.status(404).json({ error: 'File not found' });
 
   const dt = crypto.randomBytes(16).toString('hex');
-  const filePath = path.join(UPLOADS_DIR, scheme.fileName);
-  downloadTokens[dt] = { filePath, fileName: scheme.originalName || scheme.fileName, expiresAt: Date.now() + 2 * 60 * 1000 };
+  downloadTokens[dt] = {
+    key: scheme.fileKey,
+    fileName: scheme.originalName || 'document',
+    expiresAt: Date.now() + 2 * 60 * 1000
+  };
   delete verificationTokens[verificationToken];
   incStat('downloads');
   res.json({ downloadToken: dt });
 });
 
-app.get('/api/download/:token', (req, res) => {
+app.get('/api/download/:token', async (req, res) => {
   const dt = downloadTokens[req.params.token];
   if (!dt || Date.now() > dt.expiresAt) return res.status(403).send('Download link expired');
   delete downloadTokens[req.params.token];
 
-  if (!fs.existsSync(dt.filePath)) return res.status(404).send('File not found');
-
-  const ext = path.extname(dt.fileName).toLowerCase();
-  const mimeMap = {
-    '.pdf': 'application/pdf',
-    '.doc': 'application/msword',
-    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-  };
-  res.setHeader('Content-Type', mimeMap[ext] || 'application/octet-stream');
-  res.setHeader('Content-Disposition', `attachment; filename="${dt.fileName}"`);
-  fs.createReadStream(dt.filePath).pipe(res);
+  try {
+    await streamFileFromB2(dt.key, res);
+  } catch (err) {
+    console.error('B2 download error:', err);
+    res.status(404).send('File not found');
+  }
 });
 
 // ---------- ADMIN ROUTES ----------
@@ -387,29 +427,54 @@ app.get('/api/admin/stats', adminAuth, (req, res) => {
 
 app.get('/api/admin/schemes', adminAuth, (req, res) => res.json(readDB('schemes')));
 
-app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), (req, res) => {
-  const { title, subject, grade, term, price, weeks, pages } = req.body;
+app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
+  const { title, subject, grade, term, price, weeks, pages, visible } = req.body;
   if (!title || !subject || !grade || !term || !price || !req.files?.document) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
+
   const docFile = req.files.document[0];
   const coverFile = req.files.cover?.[0];
-  const scheme = {
-    id: crypto.randomUUID(),
-    title, subject, grade, term: Number(term),
-    price: Number(price),
-    weeks: weeks ? Number(weeks) : null,
-    pages: pages ? Number(pages) : null,
-    fileName: docFile.filename,
-    originalName: docFile.originalname,
-    coverImage: coverFile?.filename || null,
-    visible: true,
-    createdAt: new Date().toISOString()
-  };
-  const schemes = readDB('schemes');
-  schemes.push(scheme);
-  writeDB('schemes', schemes);
-  res.status(201).json(scheme);
+
+  try {
+    const docKey = await uploadBufferToB2(
+      docFile.buffer,
+      docFile.originalname,
+      docFile.mimetype,
+      'schemes'
+    );
+
+    let coverKey = null;
+    if (coverFile) {
+      coverKey = await uploadBufferToB2(
+        coverFile.buffer,
+        coverFile.originalname,
+        coverFile.mimetype,
+        'covers'
+      );
+    }
+
+    const scheme = {
+      id: crypto.randomUUID(),
+      title, subject, grade, term: Number(term),
+      price: Number(price),
+      weeks: weeks ? Number(weeks) : null,
+      pages: pages ? Number(pages) : null,
+      fileKey: docKey,
+      originalName: docFile.originalname,
+      coverKey: coverKey,
+      visible: visible !== 'false',
+      createdAt: new Date().toISOString()
+    };
+
+    const schemes = readDB('schemes');
+    schemes.push(scheme);
+    writeDB('schemes', schemes);
+    res.status(201).json(scheme);
+  } catch (err) {
+    console.error('Upload failed:', err);
+    res.status(500).json({ error: 'File upload failed' });
+  }
 });
 
 app.patch('/api/admin/schemes/:id', adminAuth, (req, res) => {
@@ -428,8 +493,7 @@ app.delete('/api/admin/schemes/:id', adminAuth, (req, res) => {
   const schemes = readDB('schemes');
   const scheme = schemes.find(s => s.id === req.params.id);
   if (!scheme) return res.status(404).json({ error: 'Not found' });
-  [scheme.fileName && path.join(UPLOADS_DIR, scheme.fileName), scheme.coverImage && path.join(COVERS_DIR, scheme.coverImage)]
-    .filter(Boolean).forEach(f => { try { fs.unlinkSync(f); } catch {} });
+  // Note: Deleting from B2 requires extra permissions; we skip for now.
   writeDB('schemes', schemes.filter(s => s.id !== req.params.id));
   res.json({ ok: true });
 });
@@ -582,7 +646,6 @@ app.post('/api/admin/reset-password', (req, res) => {
   res.json({ ok: true });
 });
 
-// Temporary password reset (recovery)
 app.post('/api/admin/reset-password-default', (req, res) => {
   const { secret } = req.body;
   if (secret !== 'override') return res.status(403).json({ error: 'Forbidden' });
@@ -612,6 +675,41 @@ app.post('/api/admin/restore', adminAuth, restoreStorage.single('backup'), async
   } catch (err) {
     res.status(500).json({ error: 'Restore failed', details: err.message });
   }
+});
+
+// Optional migration route – run once then remove
+app.get('/api/admin/migrate-to-b2', adminAuth, async (req, res) => {
+  const schemes = readDB('schemes');
+  const updated = [];
+  for (let scheme of schemes) {
+    if (scheme.fileName && !scheme.fileKey) {
+      const localPath = path.join(UPLOADS_DIR, scheme.fileName);
+      if (fs.existsSync(localPath)) {
+        const buffer = fs.readFileSync(localPath);
+        const mime = scheme.fileName.endsWith('.pdf') ? 'application/pdf' :
+                     scheme.fileName.endsWith('.docx') ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' :
+                     'application/msword';
+        const key = await uploadBufferToB2(buffer, scheme.originalName || scheme.fileName, mime, 'schemes');
+        scheme.fileKey = key;
+        delete scheme.fileName;
+        updated.push(scheme.id);
+      }
+    }
+    if (scheme.coverImage && !scheme.coverKey) {
+      const localPath = path.join(COVERS_DIR, scheme.coverImage);
+      if (fs.existsSync(localPath)) {
+        const buffer = fs.readFileSync(localPath);
+        const ext = path.extname(scheme.coverImage).toLowerCase();
+        const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+        const key = await uploadBufferToB2(buffer, scheme.coverImage, mime, 'covers');
+        scheme.coverKey = key;
+        delete scheme.coverImage;
+        if (!updated.includes(scheme.id)) updated.push(scheme.id);
+      }
+    }
+  }
+  writeDB('schemes', schemes);
+  res.json({ migrated: updated.length, schemes });
 });
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
