@@ -17,6 +17,7 @@
     "express": "^4.19.2",
     "extract-zip": "^2.0.1",
     "multer": "^1.4.5-lts.1",
-    "nodemailer": "^6.9.14"
+    "nodemailer": "^6.9.14",
+    "node-cron": "^3.0.3"
   }
 }
