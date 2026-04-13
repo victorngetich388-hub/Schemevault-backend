@@ -16,11 +16,7 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const COVERS_DIR = path.join(DATA_DIR, 'covers');
-
-[DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(d => {
-  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-});
-
+[DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 console.log(`📂 Data directory: ${DATA_DIR}`);
 
 // ---------- B2 Client Setup ----------
@@ -47,7 +43,7 @@ if (B2_ENDPOINT && B2_KEY_ID && B2_APP_KEY && B2_BUCKET_NAME) {
 }
 
 async function uploadBufferToB2(buffer, fileName, mimeType, folder = 'schemes') {
-  if (!b2Client) throw new Error('B2 not configured');
+  if (!b2Client) throw new Error('B2 storage not configured');
   const safeName = fileName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '');
   const key = `${folder}/${Date.now()}_${safeName}`;
   const command = new PutObjectCommand({
@@ -63,7 +59,7 @@ async function uploadBufferToB2(buffer, fileName, mimeType, folder = 'schemes') 
 }
 
 async function streamFileFromB2(key, res) {
-  if (!b2Client) throw new Error('B2 not configured');
+  if (!b2Client) throw new Error('B2 storage not configured');
   const command = new GetObjectCommand({ Bucket: B2_BUCKET_NAME, Key: key });
   const response = await b2Client.send(command);
   res.setHeader('Content-Type', response.ContentType);
@@ -90,31 +86,12 @@ if (B2_ENABLED) verifyB2Connectivity();
 
 // ---------- JSON Helpers ----------
 const dbFile = name => path.join(DATA_DIR, `${name}.json`);
-
 function readDB(name, def = []) {
-  const filePath = dbFile(name);
-  try {
-    if (!fs.existsSync(filePath)) {
-      writeDB(name, def);
-      return def;
-    }
-    const data = fs.readFileSync(filePath, 'utf8');
-    return JSON.parse(data);
-  } catch (err) {
-    console.error(`❌ Error reading ${name}.json:`, err.message);
-    return def;
-  }
+  try { return JSON.parse(fs.readFileSync(dbFile(name), 'utf8')); }
+  catch { return def; }
 }
-
 function writeDB(name, data) {
-  const filePath = dbFile(name);
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-    return true;
-  } catch (err) {
-    console.error(`❌ Error writing ${name}.json:`, err.message);
-    return false;
-  }
+  fs.writeFileSync(dbFile(name), JSON.stringify(data, null, 2));
 }
 
 // Initialize defaults
@@ -138,9 +115,7 @@ if (!fs.existsSync(dbFile('settings'))) {
 let grades = readDB('grades');
 if (!grades.length) {
   grades = Array.from({ length: 9 }, (_, i) => ({
-    id: crypto.randomUUID(),
-    name: `Grade ${i+1}`,
-    active: true
+    id: crypto.randomUUID(), name: `Grade ${i+1}`, active: true
   }));
   writeDB('grades', grades);
 }
@@ -153,16 +128,12 @@ cron.schedule('* * * * *', () => {
   schemes.forEach(s => {
     if (s.publishAt && typeof s.publishAt === 'string' && s.publishAt.length > 10) {
       if (s.publishAt <= now && s.visible === false) {
-        s.visible = true;
-        s.publishAt = null;
-        changed = true;
+        s.visible = true; s.publishAt = null; changed = true;
       }
     }
     if (s.unpublishAt && typeof s.unpublishAt === 'string' && s.unpublishAt.length > 10) {
       if (s.unpublishAt <= now && s.visible === true) {
-        s.visible = false;
-        s.unpublishAt = null;
-        changed = true;
+        s.visible = false; s.unpublishAt = null; changed = true;
       }
     }
   });
@@ -197,9 +168,7 @@ app.use((req, res, next) => {
 function adminAuth(req, res, next) {
   const token = req.headers['x-admin-token'] || req.query.token;
   const settings = readDB('settings', {});
-  if (!token || token !== settings.adminPassword) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (!token || token !== settings.adminPassword) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
@@ -231,7 +200,6 @@ const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL || '';
 const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE || '';
 const DEMO_MODE = !PAYNECTA_API_KEY;
 if (DEMO_MODE) console.log('⚠️ DEMO MODE – payments auto‑confirm after 5s');
-else console.log('💰 Paynecta LIVE mode enabled');
 
 async function sendSaleNotification(scheme, phone, amount) {
   const settings = readDB('settings', {});
@@ -252,12 +220,7 @@ async function sendSaleNotification(scheme, phone, amount) {
 }
 
 // ---------- PUBLIC ROUTES ----------
-app.get('/health', (req, res) => res.json({ 
-  status: 'ok', 
-  demo: DEMO_MODE, 
-  b2: B2_ENABLED ? 'enabled' : 'disabled',
-  persistent: fs.existsSync(DATA_DIR) ? 'ready' : 'missing'
-}));
+app.get('/health', (req, res) => res.json({ status: 'ok', demo: DEMO_MODE, b2: B2_ENABLED }));
 
 app.post('/api/track-visit', (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
@@ -326,7 +289,7 @@ app.get('/api/grades/available', (req, res) => {
   res.json(filtered);
 });
 
-// ---------- PAYMENT ROUTES (FIXED – FAST CONFIRMATION) ----------
+// ---------- PAYMENT ROUTES (FIXED) ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -457,8 +420,11 @@ app.get('/api/admin/stats', adminAuth, (req, res) => {
 });
 app.get('/api/admin/schemes', adminAuth, (req, res) => res.json(readDB('schemes')));
 
+// UPLOAD ROUTE – WITH B2 SAFEGUARD
 app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document' }, { name: 'cover' }]), async (req, res) => {
-  if (!B2_ENABLED || !b2Client) return res.status(503).json({ error: 'Storage unavailable. Check B2 config.' });
+  if (!B2_ENABLED || !b2Client) {
+    return res.status(503).json({ error: 'Storage service unavailable. Check B2 configuration.' });
+  }
   try {
     const { title, subject, grade, term, price, weeks, pages, visible, publishAt, unpublishAt } = req.body;
     if (!title || !subject || !grade || !term || !price || !req.files?.document) {
@@ -466,7 +432,9 @@ app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document' }, {
     }
     const docKey = await uploadBufferToB2(req.files.document[0].buffer, req.files.document[0].originalname, req.files.document[0].mimetype, 'schemes');
     let coverKey = null;
-    if (req.files.cover) coverKey = await uploadBufferToB2(req.files.cover[0].buffer, req.files.cover[0].originalname, req.files.cover[0].mimetype, 'covers');
+    if (req.files.cover) {
+      coverKey = await uploadBufferToB2(req.files.cover[0].buffer, req.files.cover[0].originalname, req.files.cover[0].mimetype, 'covers');
+    }
     const scheme = {
       id: crypto.randomUUID(), title, subject, grade, term: Number(term), price: Number(price),
       weeks: weeks?Number(weeks):null, pages: pages?Number(pages):null,
@@ -478,7 +446,7 @@ app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document' }, {
     res.status(201).json(scheme);
   } catch (err) {
     console.error('Upload error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message || 'Upload failed' });
   }
 });
 
@@ -620,6 +588,13 @@ app.post('/api/admin/restore', adminAuth, restoreStorage.single('backup'), async
   if (!req.file) return res.status(400).json({ error: 'No file' });
   try { await extract(req.file.path, { dir: path.dirname(DATA_DIR) }); fs.unlinkSync(req.file.path); res.json({ ok: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('🔥 Server error:', err);
+  if (err instanceof multer.MulterError) return res.status(400).json({ error: err.message });
+  res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
