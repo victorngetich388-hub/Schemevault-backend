@@ -118,38 +118,26 @@ if (!grades.length) {
   writeDB('grades', grades);
 }
 
-// ---------- Scheduled Publishing (STRICT – only acts on valid dates) ----------
+// ---------- Scheduled Publishing (STRICT) ----------
 cron.schedule('* * * * *', () => {
   const now = new Date().toISOString();
   const schemes = readDB('schemes');
   let changed = false;
-  
   schemes.forEach(s => {
-    // Auto-publish ONLY if publishAt is a valid ISO string and time has come
     if (s.publishAt && typeof s.publishAt === 'string' && s.publishAt.length > 10) {
       if (s.publishAt <= now && s.visible === false) {
-        s.visible = true;
-        s.publishAt = null;
-        changed = true;
-        console.log(`📅 Auto-published: ${s.title}`);
+        s.visible = true; s.publishAt = null; changed = true;
       }
     }
-    
-    // Auto-unpublish ONLY if unpublishAt is a valid ISO string and time has come
     if (s.unpublishAt && typeof s.unpublishAt === 'string' && s.unpublishAt.length > 10) {
       if (s.unpublishAt <= now && s.visible === true) {
-        s.visible = false;
-        s.unpublishAt = null;
-        changed = true;
-        console.log(`📅 Auto-unpublished: ${s.title}`);
+        s.visible = false; s.unpublishAt = null; changed = true;
       }
     }
   });
-  
   if (changed) writeDB('schemes', schemes);
 });
-
-console.log('⏰ Scheduled publishing active (strict – only valid dates)');
+console.log('⏰ Scheduled publishing active (strict)');
 
 // ---------- Multer ----------
 const upload = multer({
@@ -292,16 +280,14 @@ app.get('/api/grades/available', (req, res) => {
     grades = Array.from({ length: 9 }, (_, i) => ({ id: crypto.randomUUID(), name: `Grade ${i+1}`, active: true }));
     writeDB('grades', grades);
   }
-  if (settings.showAllGrades) {
-    return res.json(grades.filter(g => g.active));
-  }
+  if (settings.showAllGrades) return res.json(grades.filter(g => g.active));
   const gradeSet = new Set();
   schemes.forEach(s => { if (s.grade) gradeSet.add(s.grade); });
   const filtered = Array.from(gradeSet).sort().map(name => grades.find(g => g.name === name) || { name, active: true });
   res.json(filtered);
 });
 
-// ---------- PAYMENT ROUTES (FIXED) ----------
+// ---------- PAYMENT ROUTES (ROBUST) ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -318,12 +304,14 @@ app.post('/api/initiate-payment', async (req, res) => {
   const transactionId = crypto.randomBytes(10).toString('hex');
 
   if (DEMO_MODE) {
+    console.log(`🟡 DEMO: Init ${mobile} amount ${scheme.price}`);
     transactions[transactionId] = { status: 'pending', productId, phone: mobile };
     setTimeout(() => {
       if (transactions[transactionId]?.status === 'pending') {
         const vt = crypto.randomBytes(16).toString('hex');
         verificationTokens[vt] = { productId, expiresAt: Date.now() + 5*60*1000 };
         transactions[transactionId] = { status: 'success', productId, verificationToken: vt };
+        console.log(`🟢 DEMO: Confirmed ${transactionId}`);
       }
     }, 5000);
     return res.json({ transactionId, demo: true });
@@ -337,11 +325,13 @@ app.post('/api/initiate-payment', async (req, res) => {
       headers: { 'Content-Type': 'application/json', 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL },
       body: JSON.stringify(payload)
     });
-    const data = await response.json();
+    const raw = await response.text();
+    console.log(`📥 Init response:`, raw);
+    const data = JSON.parse(raw);
     const ref = data.transaction_reference || data.data?.transaction_reference;
-    if (!ref) throw new Error('No reference');
+    if (!ref) throw new Error('No transaction_reference');
     transactions[transactionId] = { transactionRef: ref, productId, status: 'pending', phone: mobile };
-    console.log(`✅ Initiated, ref: ${ref}`);
+    console.log(`✅ Initiated ref: ${ref}`);
     res.json({ transactionId });
   } catch (err) {
     console.error('Init error:', err);
@@ -357,13 +347,18 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
   if (DEMO_MODE) return res.json({ status: 'pending' });
 
   try {
-    const response = await fetch(`${PAYNECTA_API_URL}/payment/status?transaction_reference=${tx.transactionRef}`, {
+    console.log(`🔍 Checking status for ref: ${tx.transactionRef}`);
+    const response = await fetch(`${PAYNECTA_API_URL}/payment/status?transaction_reference=${encodeURIComponent(tx.transactionRef)}`, {
       headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL }
     });
-    const data = await response.json();
+    const raw = await response.text();
+    console.log(`📡 Status response:`, raw);
+    const data = JSON.parse(raw);
     const inner = data.data || data;
-    console.log(`📡 Status: ${inner.status}, result_code: ${inner.result_code}`);
-    if (inner.status === 'completed' && (inner.result_code === 0 || inner.result_code === '0')) {
+    const status = inner.status;
+    const resultCode = inner.result_code;
+
+    if (status === 'completed' && (resultCode === 0 || resultCode === '0')) {
       const vt = crypto.randomBytes(16).toString('hex');
       verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5*60*1000 };
       transactions[req.params.transactionId] = { ...tx, status: 'success', verificationToken: vt };
@@ -373,15 +368,20 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
       writeDB('sales', sales);
       incStat('sales');
       if (scheme) sendSaleNotification(scheme, tx.phone, scheme.price);
-      console.log(`✅ Payment confirmed`);
+      console.log(`✅ Payment confirmed! Receipt: ${inner.mpesa_receipt_number}`);
       return res.json({ status: 'success', verificationToken: vt });
     }
-    if (['failed', 'cancelled'].includes(inner.status)) {
+
+    if (['failed', 'cancelled', 'expired'].includes(status)) {
       transactions[req.params.transactionId].status = 'failed';
-      return res.json({ status: 'failed', message: inner.result_description });
+      return res.json({ status: 'failed', message: inner.result_description || 'Payment failed' });
     }
+
     res.json({ status: 'pending' });
-  } catch { res.json({ status: 'pending' }); }
+  } catch (err) {
+    console.error('Status check error:', err);
+    res.json({ status: 'pending' });
+  }
 });
 
 app.post('/api/request-download', (req, res) => {
@@ -405,7 +405,7 @@ app.get('/api/download/:token', async (req, res) => {
   catch { res.status(404).send('File not found'); }
 });
 
-// ---------- ADMIN ROUTES ----------
+// ---------- ADMIN ROUTES (all original) ----------
 app.post('/api/admin/login', (req, res) => {
   const settings = readDB('settings', {});
   if (req.body.password === settings.adminPassword) res.json({ token: settings.adminPassword, ok: true });
@@ -429,7 +429,7 @@ app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document' }, {
       weeks: weeks?Number(weeks):null, pages: pages?Number(pages):null,
       fileKey: docKey, originalName: req.files.document[0].originalname,
       coverKey, visible: visible!=='false', createdAt: new Date().toISOString(),
-      publishAt: publishAt || null, unpublishAt: unpublishAt || null
+      publishAt: publishAt||null, unpublishAt: unpublishAt||null
     };
     const schemes = readDB('schemes'); schemes.push(scheme); writeDB('schemes', schemes);
     res.status(201).json(scheme);
@@ -514,7 +514,6 @@ app.get('/api/admin/health', adminAuth, async (req, res) => {
   const b2 = B2_ENABLED ? await verifyB2Connectivity() : { status: 'disabled' };
   res.json({ b2, database: { schemes: readDB('schemes').length, subjects: readDB('areas').length } });
 });
-// Subjects
 app.get('/api/admin/subjects', adminAuth, (req, res) => res.json(readDB('areas')));
 app.post('/api/admin/subjects', adminAuth, (req, res) => {
   const { name } = req.body; if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
@@ -524,7 +523,6 @@ app.post('/api/admin/subjects', adminAuth, (req, res) => {
 app.delete('/api/admin/subjects/:id', adminAuth, (req, res) => {
   writeDB('areas', readDB('areas').filter(a=>a.id!==req.params.id)); res.json({ ok: true });
 });
-// Grades
 app.get('/api/admin/grades', adminAuth, (req, res) => res.json(readDB('grades')));
 app.post('/api/admin/grades', adminAuth, (req, res) => {
   const { name } = req.body; if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
@@ -533,19 +531,14 @@ app.post('/api/admin/grades', adminAuth, (req, res) => {
 app.delete('/api/admin/grades/:id', adminAuth, (req, res) => {
   writeDB('grades', readDB('grades').filter(g=>g.id!==req.params.id)); res.json({ ok: true });
 });
-// Visitors
 app.get('/api/admin/visitors', adminAuth, (req, res) => res.json(readDB('visitors')));
 app.delete('/api/admin/visitors/clear', adminAuth, (req, res) => { writeDB('visitors', []); res.json({ ok: true }); });
-// Banner
 app.get('/api/admin/banner', adminAuth, (req, res) => { const s=readDB('settings',{}); res.json({ text: s.bannerText||'', enabled: s.bannerEnabled||false }); });
 app.post('/api/admin/banner', adminAuth, (req, res) => { const s=readDB('settings',{}); s.bannerText=req.body.text||''; s.bannerEnabled=req.body.enabled||false; writeDB('settings',s); res.json({ ok: true }); });
-// WhatsApp
 app.get('/api/admin/whatsapp', adminAuth, (req, res) => { const s=readDB('settings',{}); res.json({ number: s.waNumber||'', message: s.waMessage||'Hello', enabled: s.waEnabled||false }); });
 app.post('/api/admin/whatsapp', adminAuth, (req, res) => { const s=readDB('settings',{}); s.waNumber=req.body.number||''; s.waMessage=req.body.message||'Hello'; s.waEnabled=req.body.enabled||false; writeDB('settings',s); res.json({ ok: true }); });
-// Terms
 app.get('/api/admin/terms', adminAuth, (req, res) => { const s=readDB('settings',{}); res.json({ term1Enabled: s.term1Enabled!==false, term2Enabled: s.term2Enabled!==false, term3Enabled: s.term3Enabled!==false, defaultTerm: s.defaultTerm||'1' }); });
 app.post('/api/admin/terms', adminAuth, (req, res) => { const s=readDB('settings',{}); if (req.body.term1Enabled!==undefined) s.term1Enabled=req.body.term1Enabled; if (req.body.term2Enabled!==undefined) s.term2Enabled=req.body.term2Enabled; if (req.body.term3Enabled!==undefined) s.term3Enabled=req.body.term3Enabled; if (req.body.defaultTerm) s.defaultTerm=req.body.defaultTerm; writeDB('settings',s); res.json({ ok: true }); });
-// Popups
 app.get('/api/admin/popups', adminAuth, (req, res) => res.json(readDB('popups')));
 app.post('/api/admin/popups', adminAuth, (req, res) => {
   const { question, options, trigger, collectWhatsapp, delay, delayUnit } = req.body;
@@ -554,7 +547,6 @@ app.post('/api/admin/popups', adminAuth, (req, res) => {
   popups.push({ id: crypto.randomUUID(), question, options, trigger: trigger||'onload', collectWhatsapp: !!collectWhatsapp, delay: delay?Number(delay):0, delayUnit: delayUnit||'seconds' });
   writeDB('popups', popups); res.status(201).json({ ok: true });
 });
-// Password
 app.post('/api/admin/change-password', adminAuth, (req, res) => {
   const { newPassword } = req.body; if (!newPassword||newPassword.length<6) return res.status(400).json({ error: 'Too short' });
   const s=readDB('settings',{}); s.adminPassword=newPassword; writeDB('settings',s); res.json({ ok: true });
@@ -567,7 +559,6 @@ app.post('/api/admin/reset-password', (req, res) => {
   if (!stored||stored.code!==code||stored.expires<Date.now()) return res.status(400).json({ error: 'Invalid or expired' });
   const s=readDB('settings',{}); s.adminPassword=newPassword; writeDB('settings',s); writeDB('resetCodes',{}); res.json({ ok: true });
 });
-// Backup/Restore
 app.get('/api/admin/backup', adminAuth, (req, res) => {
   res.setHeader('Content-Type', 'application/zip'); res.setHeader('Content-Disposition', `attachment; filename="backup-${Date.now()}.zip"`);
   const archive = archiver('zip', { zlib: { level: 6 } }); archive.pipe(res); archive.directory(DATA_DIR, 'data'); archive.finalize();
