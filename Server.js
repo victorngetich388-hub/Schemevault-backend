@@ -16,11 +16,7 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const COVERS_DIR = path.join(DATA_DIR, 'covers');
-
-[DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(d => {
-  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-});
-
+[DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 console.log(`📂 Data directory: ${DATA_DIR}`);
 
 // ---------- B2 Client Setup ----------
@@ -32,7 +28,6 @@ const B2_BUCKET_NAME = process.env.B2_BUCKET_NAME;
 
 let b2Client = null;
 let B2_ENABLED = false;
-
 if (B2_ENDPOINT && B2_KEY_ID && B2_APP_KEY && B2_BUCKET_NAME) {
   b2Client = new S3Client({
     endpoint: B2_ENDPOINT,
@@ -43,7 +38,7 @@ if (B2_ENDPOINT && B2_KEY_ID && B2_APP_KEY && B2_BUCKET_NAME) {
   B2_ENABLED = true;
   console.log('✅ B2 client initialized');
 } else {
-  console.warn('⚠️ B2 credentials missing – uploads will FAIL. Set B2_* env vars.');
+  console.warn('⚠️ B2 credentials missing – uploads will FAIL');
 }
 
 async function uploadBufferToB2(buffer, fileName, mimeType, folder = 'schemes') {
@@ -118,9 +113,7 @@ if (!fs.existsSync(dbFile('settings'))) {
 let grades = readDB('grades');
 if (!grades.length) {
   grades = Array.from({ length: 9 }, (_, i) => ({
-    id: crypto.randomUUID(),
-    name: `Grade ${i+1}`,
-    active: true
+    id: crypto.randomUUID(), name: `Grade ${i+1}`, active: true
   }));
   writeDB('grades', grades);
 }
@@ -168,9 +161,7 @@ app.use((req, res, next) => {
 function adminAuth(req, res, next) {
   const token = req.headers['x-admin-token'] || req.query.token;
   const settings = readDB('settings', {});
-  if (!token || token !== settings.adminPassword) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (!token || token !== settings.adminPassword) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
@@ -201,7 +192,7 @@ const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY || '';
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL || '';
 const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE || '';
 const DEMO_MODE = !PAYNECTA_API_KEY;
-if (DEMO_MODE) console.log('⚠️ DEMO MODE');
+if (DEMO_MODE) console.log('⚠️ DEMO MODE – payments auto‑confirm after 5s');
 
 async function sendSaleNotification(scheme, phone, amount) {
   const settings = readDB('settings', {});
@@ -269,15 +260,12 @@ app.get('/api/cover/:schemeId', async (req, res) => {
   catch { res.status(404).send('Cover not found'); }
 });
 
-// Fixed: Grades available with proper seed
 app.get('/api/grades/available', (req, res) => {
   const settings = readDB('settings', {});
   const schemes = readDB('schemes').filter(s => s.visible !== false);
   let grades = readDB('grades');
   if (!grades.length) {
-    grades = Array.from({ length: 9 }, (_, i) => ({
-      id: crypto.randomUUID(), name: `Grade ${i+1}`, active: true
-    }));
+    grades = Array.from({ length: 9 }, (_, i) => ({ id: crypto.randomUUID(), name: `Grade ${i+1}`, active: true }));
     writeDB('grades', grades);
   }
   if (settings.showAllGrades) {
@@ -289,7 +277,7 @@ app.get('/api/grades/available', (req, res) => {
   res.json(filtered);
 });
 
-// Payment routes (unchanged, working)
+// ---------- PAYMENT ROUTES (FIXED) ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -313,22 +301,26 @@ app.post('/api/initiate-payment', async (req, res) => {
         verificationTokens[vt] = { productId, expiresAt: Date.now() + 5*60*1000 };
         transactions[transactionId] = { status: 'success', productId, verificationToken: vt };
       }
-    }, 10000);
+    }, 5000);
     return res.json({ transactionId, demo: true });
   }
 
   try {
+    const payload = { code: PAYNECTA_PAYMENT_CODE, mobile_number: mobile, amount: Number(amount || scheme.price) };
+    console.log(`📤 Paynecta init:`, payload);
     const response = await fetch(`${PAYNECTA_API_URL}/payment/initialize`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL },
-      body: JSON.stringify({ code: PAYNECTA_PAYMENT_CODE, mobile_number: mobile, amount: Number(amount || scheme.price) })
+      body: JSON.stringify(payload)
     });
     const data = await response.json();
     const ref = data.transaction_reference || data.data?.transaction_reference;
     if (!ref) throw new Error('No reference');
     transactions[transactionId] = { transactionRef: ref, productId, status: 'pending', phone: mobile };
+    console.log(`✅ Initiated, ref: ${ref}`);
     res.json({ transactionId });
   } catch (err) {
+    console.error('Init error:', err);
     res.status(502).json({ error: 'Payment gateway error' });
   }
 });
@@ -346,16 +338,18 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
     });
     const data = await response.json();
     const inner = data.data || data;
+    console.log(`📡 Status: ${inner.status}, result_code: ${inner.result_code}`);
     if (inner.status === 'completed' && (inner.result_code === 0 || inner.result_code === '0')) {
       const vt = crypto.randomBytes(16).toString('hex');
       verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5*60*1000 };
       transactions[req.params.transactionId] = { ...tx, status: 'success', verificationToken: vt };
       const scheme = readDB('schemes').find(s => s.id === tx.productId);
       const sales = readDB('sales');
-      sales.push({ title: scheme?.title, grade: scheme?.grade, subject: scheme?.subject, phone: tx.phone, amount: scheme?.price, date: new Date().toISOString() });
+      sales.push({ title: scheme?.title, grade: scheme?.grade, phone: tx.phone, amount: scheme?.price, date: new Date().toISOString() });
       writeDB('sales', sales);
       incStat('sales');
       if (scheme) sendSaleNotification(scheme, tx.phone, scheme.price);
+      console.log(`✅ Payment confirmed`);
       return res.json({ status: 'success', verificationToken: vt });
     }
     if (['failed', 'cancelled'].includes(inner.status)) {
@@ -369,9 +363,7 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
 app.post('/api/request-download', (req, res) => {
   const { verificationToken, productId } = req.body;
   const vt = verificationTokens[verificationToken];
-  if (!vt || vt.productId !== productId || Date.now() > vt.expiresAt) {
-    return res.status(403).json({ error: 'Invalid token' });
-  }
+  if (!vt || vt.productId !== productId || Date.now() > vt.expiresAt) return res.status(403).json({ error: 'Invalid token' });
   const scheme = readDB('schemes').find(s => s.id === productId);
   if (!scheme || !scheme.fileKey) return res.status(404).json({ error: 'File not found' });
   const dt = crypto.randomBytes(16).toString('hex');
@@ -389,348 +381,177 @@ app.get('/api/download/:token', async (req, res) => {
   catch { res.status(404).send('File not found'); }
 });
 
-// ---------- ADMIN ROUTES (all original + new) ----------
+// ---------- ADMIN ROUTES (all included) ----------
 app.post('/api/admin/login', (req, res) => {
   const settings = readDB('settings', {});
-  if (req.body.password === settings.adminPassword) {
-    res.json({ token: settings.adminPassword, ok: true });
-  } else {
-    res.status(401).json({ error: 'Wrong password' });
-  }
+  if (req.body.password === settings.adminPassword) res.json({ token: settings.adminPassword, ok: true });
+  else res.status(401).json({ error: 'Wrong password' });
 });
-
 app.get('/api/admin/verify', adminAuth, (req, res) => res.json({ ok: true }));
-
 app.get('/api/admin/stats', adminAuth, (req, res) => {
   const stats = readDB('stats', {});
-  res.json({
-    visits: stats.visits || 0,
-    downloads: stats.downloads || 0,
-    sales: stats.sales || 0,
-    schemes: readDB('schemes').length,
-    activeUsers: Object.keys(userSessions).length
-  });
+  res.json({ visits: stats.visits||0, downloads: stats.downloads||0, sales: stats.sales||0, schemes: readDB('schemes').length, activeUsers: Object.keys(userSessions).length });
 });
-
 app.get('/api/admin/schemes', adminAuth, (req, res) => res.json(readDB('schemes')));
-
 app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document' }, { name: 'cover' }]), async (req, res) => {
   try {
     const { title, subject, grade, term, price, weeks, pages, visible, publishAt, unpublishAt } = req.body;
-    if (!title || !subject || !grade || !term || !price || !req.files?.document) {
-      return res.status(400).json({ error: 'Missing fields' });
-    }
+    if (!title || !subject || !grade || !term || !price || !req.files?.document) return res.status(400).json({ error: 'Missing fields' });
     const docKey = await uploadBufferToB2(req.files.document[0].buffer, req.files.document[0].originalname, req.files.document[0].mimetype, 'schemes');
     let coverKey = null;
-    if (req.files.cover) {
-      coverKey = await uploadBufferToB2(req.files.cover[0].buffer, req.files.cover[0].originalname, req.files.cover[0].mimetype, 'covers');
-    }
+    if (req.files.cover) coverKey = await uploadBufferToB2(req.files.cover[0].buffer, req.files.cover[0].originalname, req.files.cover[0].mimetype, 'covers');
     const scheme = {
-      id: crypto.randomUUID(),
-      title, subject, grade, term: Number(term), price: Number(price),
-      weeks: weeks ? Number(weeks) : null,
-      pages: pages ? Number(pages) : null,
+      id: crypto.randomUUID(), title, subject, grade, term: Number(term), price: Number(price),
+      weeks: weeks?Number(weeks):null, pages: pages?Number(pages):null,
       fileKey: docKey, originalName: req.files.document[0].originalname,
-      coverKey, visible: visible !== 'false', createdAt: new Date().toISOString(),
-      publishAt: publishAt || null, unpublishAt: unpublishAt || null
+      coverKey, visible: visible!=='false', createdAt: new Date().toISOString(),
+      publishAt: publishAt||null, unpublishAt: unpublishAt||null
     };
-    const schemes = readDB('schemes');
-    schemes.push(scheme);
-    writeDB('schemes', schemes);
+    const schemes = readDB('schemes'); schemes.push(scheme); writeDB('schemes', schemes);
     res.status(201).json(scheme);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
 app.patch('/api/admin/schemes/:id', adminAuth, (req, res) => {
-  const schemes = readDB('schemes');
-  const idx = schemes.findIndex(s => s.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
+  const schemes = readDB('schemes'); const idx = schemes.findIndex(s=>s.id===req.params.id);
+  if (idx===-1) return res.status(404).json({ error: 'Not found' });
   const { price, weeks, visible, publishAt, unpublishAt } = req.body;
-  if (price !== undefined) schemes[idx].price = Number(price);
-  if (weeks !== undefined) schemes[idx].weeks = Number(weeks) || null;
-  if (visible !== undefined) schemes[idx].visible = Boolean(visible);
-  if (publishAt !== undefined) schemes[idx].publishAt = publishAt || null;
-  if (unpublishAt !== undefined) schemes[idx].unpublishAt = unpublishAt || null;
-  writeDB('schemes', schemes);
-  res.json(schemes[idx]);
+  if (price!==undefined) schemes[idx].price=Number(price);
+  if (weeks!==undefined) schemes[idx].weeks=Number(weeks)||null;
+  if (visible!==undefined) schemes[idx].visible=Boolean(visible);
+  if (publishAt!==undefined) schemes[idx].publishAt=publishAt||null;
+  if (unpublishAt!==undefined) schemes[idx].unpublishAt=unpublishAt||null;
+  writeDB('schemes', schemes); res.json(schemes[idx]);
 });
-
 app.post('/api/admin/schemes/:id/cover', adminAuth, upload.single('cover'), async (req, res) => {
-  const schemes = readDB('schemes');
-  const scheme = schemes.find(s => s.id === req.params.id);
+  const schemes = readDB('schemes'); const scheme = schemes.find(s=>s.id===req.params.id);
   if (!scheme) return res.status(404).json({ error: 'Not found' });
   if (!req.file) return res.status(400).json({ error: 'No file' });
-  try {
-    scheme.coverKey = await uploadBufferToB2(req.file.buffer, req.file.originalname, req.file.mimetype, 'covers');
-    writeDB('schemes', schemes);
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  try { scheme.coverKey = await uploadBufferToB2(req.file.buffer, req.file.originalname, req.file.mimetype, 'covers'); writeDB('schemes', schemes); res.json({ ok: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
-
 app.delete('/api/admin/schemes/:id', adminAuth, (req, res) => {
-  writeDB('schemes', readDB('schemes').filter(s => s.id !== req.params.id));
-  res.json({ ok: true });
+  writeDB('schemes', readDB('schemes').filter(s=>s.id!==req.params.id)); res.json({ ok: true });
 });
-
 app.post('/api/admin/schemes/bulk', adminAuth, upload.fields([{ name: 'documents' }, { name: 'covers' }]), async (req, res) => {
   const { title, subject, grade, term, price, weeks, pages, visible } = req.body;
-  if (!title || !subject || !grade || !term || !price || !req.files?.documents) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
-  const docs = req.files.documents;
-  const covers = req.files.covers || [];
-  const schemes = readDB('schemes');
-  const created = [];
-  for (let i = 0; i < docs.length; i++) {
+  if (!title||!subject||!grade||!term||!price||!req.files?.documents) return res.status(400).json({ error: 'Missing fields' });
+  const docs = req.files.documents; const covers = req.files.covers || []; const schemes = readDB('schemes'); const created = [];
+  for (let i=0; i<docs.length; i++) {
     try {
       const docKey = await uploadBufferToB2(docs[i].buffer, docs[i].originalname, docs[i].mimetype, 'schemes');
-      let coverKey = null;
-      if (covers[i]) coverKey = await uploadBufferToB2(covers[i].buffer, covers[i].originalname, covers[i].mimetype, 'covers');
+      let coverKey = null; if (covers[i]) coverKey = await uploadBufferToB2(covers[i].buffer, covers[i].originalname, covers[i].mimetype, 'covers');
       const scheme = {
-        id: crypto.randomUUID(),
-        title: docs.length > 1 ? `${title} (${i+1})` : title,
-        subject, grade, term: Number(term), price: Number(price),
-        weeks: weeks ? Number(weeks) : null, pages: pages ? Number(pages) : null,
-        fileKey: docKey, originalName: docs[i].originalname,
-        coverKey, visible: visible !== 'false', createdAt: new Date().toISOString()
+        id: crypto.randomUUID(), title: docs.length>1?`${title} (${i+1})`:title, subject, grade, term: Number(term), price: Number(price),
+        weeks: weeks?Number(weeks):null, pages: pages?Number(pages):null,
+        fileKey: docKey, originalName: docs[i].originalname, coverKey, visible: visible!=='false', createdAt: new Date().toISOString()
       };
-      schemes.push(scheme);
-      created.push(scheme);
+      schemes.push(scheme); created.push(scheme);
     } catch (e) {}
   }
-  writeDB('schemes', schemes);
-  res.status(201).json({ created: created.length });
+  writeDB('schemes', schemes); res.status(201).json({ created: created.length });
 });
-
 app.post('/api/admin/schemes/bulk-price', adminAuth, (req, res) => {
-  const { schemeIds, price, operation = 'set' } = req.body;
-  const schemes = readDB('schemes');
-  let updated = 0;
-  schemes.forEach(s => {
-    if (schemeIds.includes(s.id)) {
-      if (operation === 'set') s.price = Number(price);
-      else if (operation === 'increase') s.price = Math.max(0, s.price + Number(price));
-      else if (operation === 'decrease') s.price = Math.max(0, s.price - Number(price));
-      updated++;
-    }
-  });
-  writeDB('schemes', schemes);
-  res.json({ ok: true, updated });
+  const { schemeIds, price, operation='set' } = req.body;
+  const schemes = readDB('schemes'); let updated=0;
+  schemes.forEach(s => { if (schemeIds.includes(s.id)) {
+    if (operation==='set') s.price=Number(price);
+    else if (operation==='increase') s.price=Math.max(0, s.price+Number(price));
+    else if (operation==='decrease') s.price=Math.max(0, s.price-Number(price));
+    updated++;
+  }});
+  writeDB('schemes', schemes); res.json({ ok: true, updated });
 });
-
 app.post('/api/admin/schemes/bulk-visibility', adminAuth, (req, res) => {
-  const { schemeIds, visible } = req.body;
-  const schemes = readDB('schemes');
-  let updated = 0;
-  schemes.forEach(s => { if (schemeIds.includes(s.id)) { s.visible = Boolean(visible); updated++; } });
-  writeDB('schemes', schemes);
-  res.json({ ok: true, updated });
+  const { schemeIds, visible } = req.body; const schemes = readDB('schemes'); let updated=0;
+  schemes.forEach(s => { if (schemeIds.includes(s.id)) { s.visible=Boolean(visible); updated++; } });
+  writeDB('schemes', schemes); res.json({ ok: true, updated });
 });
-
-app.get('/api/admin/schemes/featured', adminAuth, (req, res) => {
-  res.json({ featuredSchemeIds: readDB('settings', {}).featuredSchemeIds || [] });
-});
+app.get('/api/admin/schemes/featured', adminAuth, (req, res) => res.json({ featuredSchemeIds: readDB('settings',{}).featuredSchemeIds||[] }));
 app.post('/api/admin/schemes/featured', adminAuth, (req, res) => {
-  const settings = readDB('settings', {});
-  settings.featuredSchemeIds = req.body.schemeIds || [];
-  writeDB('settings', settings);
-  res.json({ ok: true });
+  const settings = readDB('settings',{}); settings.featuredSchemeIds = req.body.schemeIds||[]; writeDB('settings', settings); res.json({ ok: true });
 });
-
 app.patch('/api/admin/settings/grade-display', adminAuth, (req, res) => {
-  const settings = readDB('settings', {});
-  settings.showAllGrades = req.body.showAllGrades !== false;
-  writeDB('settings', settings);
-  res.json({ ok: true });
+  const settings = readDB('settings',{}); settings.showAllGrades = req.body.showAllGrades!==false; writeDB('settings', settings); res.json({ ok: true });
 });
-
 app.patch('/api/admin/settings/email-notifications', adminAuth, (req, res) => {
-  const settings = readDB('settings', {});
-  settings.emailNotifications = req.body.enabled !== false;
-  writeDB('settings', settings);
-  res.json({ ok: true });
+  const settings = readDB('settings',{}); settings.emailNotifications = req.body.enabled!==false; writeDB('settings', settings); res.json({ ok: true });
 });
-
 app.get('/api/admin/analytics/downloads', adminAuth, (req, res) => {
-  const schemes = readDB('schemes');
-  const sales = readDB('sales');
-  const counts = {};
-  sales.forEach(sale => { counts[sale.title] = (counts[sale.title] || 0) + 1; });
-  res.json(schemes.map(s => ({
-    id: s.id, title: s.title, grade: s.grade, subject: s.subject,
-    downloads: counts[s.title] || 0, revenue: (counts[s.title] || 0) * s.price
-  })).sort((a,b) => b.downloads - a.downloads));
+  const schemes = readDB('schemes'); const sales = readDB('sales'); const counts = {};
+  sales.forEach(s => { counts[s.title] = (counts[s.title]||0)+1; });
+  res.json(schemes.map(s => ({ id: s.id, title: s.title, grade: s.grade, downloads: counts[s.title]||0, revenue: (counts[s.title]||0)*s.price })).sort((a,b)=>b.downloads-a.downloads));
 });
-
 app.get('/api/admin/sales/export', adminAuth, (req, res) => {
-  const sales = readDB('sales');
-  let csv = 'Date,Title,Grade,Subject,Phone,Amount\n';
-  sales.forEach(s => { csv += `${s.date},${s.title},${s.grade||''},${s.subject||''},${s.phone},${s.amount}\n`; });
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', 'attachment; filename="sales.csv"');
-  res.send(csv);
+  const sales = readDB('sales'); let csv = 'Date,Title,Grade,Phone,Amount\n';
+  sales.forEach(s => { csv += `${s.date},${s.title},${s.grade||''},${s.phone},${s.amount}\n`; });
+  res.setHeader('Content-Type', 'text/csv'); res.setHeader('Content-Disposition', 'attachment; filename="sales.csv"'); res.send(csv);
 });
-
 app.get('/api/admin/health', adminAuth, async (req, res) => {
   const b2 = B2_ENABLED ? await verifyB2Connectivity() : { status: 'disabled' };
   res.json({ b2, database: { schemes: readDB('schemes').length, subjects: readDB('areas').length } });
 });
-
 // Subjects
 app.get('/api/admin/subjects', adminAuth, (req, res) => res.json(readDB('areas')));
 app.post('/api/admin/subjects', adminAuth, (req, res) => {
-  const { name } = req.body;
-  if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
-  const areas = readDB('areas');
-  if (areas.find(a => a.name.toLowerCase() === name.trim().toLowerCase())) return res.status(409).json({ error: 'Exists' });
-  areas.push({ id: crypto.randomUUID(), name: name.trim() });
-  writeDB('areas', areas);
-  res.status(201).json({ ok: true });
+  const { name } = req.body; if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+  const areas = readDB('areas'); if (areas.find(a=>a.name.toLowerCase()===name.trim().toLowerCase())) return res.status(409).json({ error: 'Exists' });
+  areas.push({ id: crypto.randomUUID(), name: name.trim() }); writeDB('areas', areas); res.status(201).json({ ok: true });
 });
 app.delete('/api/admin/subjects/:id', adminAuth, (req, res) => {
-  writeDB('areas', readDB('areas').filter(a => a.id !== req.params.id));
-  res.json({ ok: true });
+  writeDB('areas', readDB('areas').filter(a=>a.id!==req.params.id)); res.json({ ok: true });
 });
-
 // Grades
 app.get('/api/admin/grades', adminAuth, (req, res) => res.json(readDB('grades')));
 app.post('/api/admin/grades', adminAuth, (req, res) => {
-  const { name } = req.body;
-  if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
-  const grades = readDB('grades');
-  grades.push({ id: crypto.randomUUID(), name: name.trim(), active: true });
-  writeDB('grades', grades);
-  res.status(201).json({ ok: true });
+  const { name } = req.body; if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+  const grades = readDB('grades'); grades.push({ id: crypto.randomUUID(), name: name.trim(), active: true }); writeDB('grades', grades); res.status(201).json({ ok: true });
 });
 app.delete('/api/admin/grades/:id', adminAuth, (req, res) => {
-  writeDB('grades', readDB('grades').filter(g => g.id !== req.params.id));
-  res.json({ ok: true });
+  writeDB('grades', readDB('grades').filter(g=>g.id!==req.params.id)); res.json({ ok: true });
 });
-
 // Visitors
 app.get('/api/admin/visitors', adminAuth, (req, res) => res.json(readDB('visitors')));
-app.delete('/api/admin/visitors/clear', adminAuth, (req, res) => {
-  writeDB('visitors', []);
-  res.json({ ok: true });
-});
-
+app.delete('/api/admin/visitors/clear', adminAuth, (req, res) => { writeDB('visitors', []); res.json({ ok: true }); });
 // Banner
-app.get('/api/admin/banner', adminAuth, (req, res) => {
-  const s = readDB('settings', {});
-  res.json({ text: s.bannerText || '', enabled: s.bannerEnabled || false });
-});
-app.post('/api/admin/banner', adminAuth, (req, res) => {
-  const s = readDB('settings', {});
-  s.bannerText = req.body.text || '';
-  s.bannerEnabled = req.body.enabled || false;
-  writeDB('settings', s);
-  res.json({ ok: true });
-});
-
+app.get('/api/admin/banner', adminAuth, (req, res) => { const s=readDB('settings',{}); res.json({ text: s.bannerText||'', enabled: s.bannerEnabled||false }); });
+app.post('/api/admin/banner', adminAuth, (req, res) => { const s=readDB('settings',{}); s.bannerText=req.body.text||''; s.bannerEnabled=req.body.enabled||false; writeDB('settings',s); res.json({ ok: true }); });
 // WhatsApp
-app.get('/api/admin/whatsapp', adminAuth, (req, res) => {
-  const s = readDB('settings', {});
-  res.json({ number: s.waNumber || '', message: s.waMessage || 'Hello', enabled: s.waEnabled || false });
-});
-app.post('/api/admin/whatsapp', adminAuth, (req, res) => {
-  const s = readDB('settings', {});
-  s.waNumber = req.body.number || '';
-  s.waMessage = req.body.message || 'Hello';
-  s.waEnabled = req.body.enabled || false;
-  writeDB('settings', s);
-  res.json({ ok: true });
-});
-
+app.get('/api/admin/whatsapp', adminAuth, (req, res) => { const s=readDB('settings',{}); res.json({ number: s.waNumber||'', message: s.waMessage||'Hello', enabled: s.waEnabled||false }); });
+app.post('/api/admin/whatsapp', adminAuth, (req, res) => { const s=readDB('settings',{}); s.waNumber=req.body.number||''; s.waMessage=req.body.message||'Hello'; s.waEnabled=req.body.enabled||false; writeDB('settings',s); res.json({ ok: true }); });
 // Terms
-app.get('/api/admin/terms', adminAuth, (req, res) => {
-  const s = readDB('settings', {});
-  res.json({
-    term1Enabled: s.term1Enabled !== false,
-    term2Enabled: s.term2Enabled !== false,
-    term3Enabled: s.term3Enabled !== false,
-    defaultTerm: s.defaultTerm || '1'
-  });
-});
-app.post('/api/admin/terms', adminAuth, (req, res) => {
-  const s = readDB('settings', {});
-  if (req.body.term1Enabled !== undefined) s.term1Enabled = req.body.term1Enabled;
-  if (req.body.term2Enabled !== undefined) s.term2Enabled = req.body.term2Enabled;
-  if (req.body.term3Enabled !== undefined) s.term3Enabled = req.body.term3Enabled;
-  if (req.body.defaultTerm) s.defaultTerm = req.body.defaultTerm;
-  writeDB('settings', s);
-  res.json({ ok: true });
-});
-
-// Popups (with delay)
+app.get('/api/admin/terms', adminAuth, (req, res) => { const s=readDB('settings',{}); res.json({ term1Enabled: s.term1Enabled!==false, term2Enabled: s.term2Enabled!==false, term3Enabled: s.term3Enabled!==false, defaultTerm: s.defaultTerm||'1' }); });
+app.post('/api/admin/terms', adminAuth, (req, res) => { const s=readDB('settings',{}); if (req.body.term1Enabled!==undefined) s.term1Enabled=req.body.term1Enabled; if (req.body.term2Enabled!==undefined) s.term2Enabled=req.body.term2Enabled; if (req.body.term3Enabled!==undefined) s.term3Enabled=req.body.term3Enabled; if (req.body.defaultTerm) s.defaultTerm=req.body.defaultTerm; writeDB('settings',s); res.json({ ok: true }); });
+// Popups
 app.get('/api/admin/popups', adminAuth, (req, res) => res.json(readDB('popups')));
 app.post('/api/admin/popups', adminAuth, (req, res) => {
   const { question, options, trigger, collectWhatsapp, delay, delayUnit } = req.body;
   if (!question) return res.status(400).json({ error: 'Question required' });
   const popups = readDB('popups');
-  popups.push({
-    id: crypto.randomUUID(),
-    question,
-    options,
-    trigger: trigger || 'onload',
-    collectWhatsapp: !!collectWhatsapp,
-    delay: delay ? Number(delay) : 0,
-    delayUnit: delayUnit || 'seconds'
-  });
-  writeDB('popups', popups);
-  res.status(201).json({ ok: true });
+  popups.push({ id: crypto.randomUUID(), question, options, trigger: trigger||'onload', collectWhatsapp: !!collectWhatsapp, delay: delay?Number(delay):0, delayUnit: delayUnit||'seconds' });
+  writeDB('popups', popups); res.status(201).json({ ok: true });
 });
-
 // Password
 app.post('/api/admin/change-password', adminAuth, (req, res) => {
-  const { newPassword } = req.body;
-  if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Too short' });
-  const s = readDB('settings', {});
-  s.adminPassword = newPassword;
-  writeDB('settings', s);
-  res.json({ ok: true });
+  const { newPassword } = req.body; if (!newPassword||newPassword.length<6) return res.status(400).json({ error: 'Too short' });
+  const s=readDB('settings',{}); s.adminPassword=newPassword; writeDB('settings',s); res.json({ ok: true });
 });
 app.post('/api/admin/forgot-password', async (req, res) => {
-  const code = Math.floor(100000 + Math.random() * 900000).toString();
-  const resetCodes = readDB('resetCodes', {});
-  resetCodes['admin'] = { code, expires: Date.now() + 15*60*1000 };
-  writeDB('resetCodes', resetCodes);
-  res.json({ success: true, demoCode: DEMO_MODE ? code : undefined });
+  const code = Math.floor(100000+Math.random()*900000).toString(); const resetCodes=readDB('resetCodes',{}); resetCodes['admin']={ code, expires: Date.now()+15*60*1000 }; writeDB('resetCodes',resetCodes); res.json({ success: true, demoCode: DEMO_MODE?code:undefined });
 });
 app.post('/api/admin/reset-password', (req, res) => {
-  const { code, newPassword } = req.body;
-  const stored = readDB('resetCodes', {})['admin'];
-  if (!stored || stored.code !== code || stored.expires < Date.now()) {
-    return res.status(400).json({ error: 'Invalid or expired' });
-  }
-  const s = readDB('settings', {});
-  s.adminPassword = newPassword;
-  writeDB('settings', s);
-  writeDB('resetCodes', {});
-  res.json({ ok: true });
+  const { code, newPassword } = req.body; const stored=readDB('resetCodes',{})['admin'];
+  if (!stored||stored.code!==code||stored.expires<Date.now()) return res.status(400).json({ error: 'Invalid or expired' });
+  const s=readDB('settings',{}); s.adminPassword=newPassword; writeDB('settings',s); writeDB('resetCodes',{}); res.json({ ok: true });
 });
-
 // Backup/Restore
 app.get('/api/admin/backup', adminAuth, (req, res) => {
-  res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="backup-${Date.now()}.zip"`);
-  const archive = archiver('zip', { zlib: { level: 6 } });
-  archive.pipe(res);
-  archive.directory(DATA_DIR, 'data');
-  archive.finalize();
+  res.setHeader('Content-Type', 'application/zip'); res.setHeader('Content-Disposition', `attachment; filename="backup-${Date.now()}.zip"`);
+  const archive = archiver('zip', { zlib: { level: 6 } }); archive.pipe(res); archive.directory(DATA_DIR, 'data'); archive.finalize();
 });
 app.post('/api/admin/restore', adminAuth, restoreStorage.single('backup'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
-  try {
-    await extract(req.file.path, { dir: path.dirname(DATA_DIR) });
-    fs.unlinkSync(req.file.path);
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  try { await extract(req.file.path, { dir: path.dirname(DATA_DIR) }); fs.unlinkSync(req.file.path); res.json({ ok: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
