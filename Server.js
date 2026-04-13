@@ -28,6 +28,7 @@ const B2_BUCKET_NAME = process.env.B2_BUCKET_NAME;
 
 let b2Client = null;
 let B2_ENABLED = false;
+
 if (B2_ENDPOINT && B2_KEY_ID && B2_APP_KEY && B2_BUCKET_NAME) {
   b2Client = new S3Client({
     endpoint: B2_ENDPOINT,
@@ -36,13 +37,18 @@ if (B2_ENDPOINT && B2_KEY_ID && B2_APP_KEY && B2_BUCKET_NAME) {
     forcePathStyle: true,
   });
   B2_ENABLED = true;
-  console.log('✅ B2 client initialized');
+  console.log('✅ B2 client initialized with bucket:', B2_BUCKET_NAME);
 } else {
-  console.warn('⚠️ B2 credentials missing – uploads will FAIL');
+  console.warn('⚠️ B2 credentials missing:',
+    'ENDPOINT:', !!B2_ENDPOINT,
+    'KEY_ID:', !!B2_KEY_ID,
+    'APP_KEY:', !!B2_APP_KEY,
+    'BUCKET:', !!B2_BUCKET_NAME
+  );
 }
 
 async function uploadBufferToB2(buffer, fileName, mimeType, folder = 'schemes') {
-  if (!b2Client) throw new Error('B2 not configured');
+  if (!b2Client) throw new Error('B2 storage not configured');
   const safeName = fileName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '');
   const key = `${folder}/${Date.now()}_${safeName}`;
   const command = new PutObjectCommand({
@@ -53,11 +59,12 @@ async function uploadBufferToB2(buffer, fileName, mimeType, folder = 'schemes') 
     ContentDisposition: `attachment; filename="${fileName}"`,
   });
   await b2Client.send(command);
+  console.log(`📤 Uploaded to B2: ${key}`);
   return key;
 }
 
 async function streamFileFromB2(key, res) {
-  if (!b2Client) throw new Error('B2 not configured');
+  if (!b2Client) throw new Error('B2 storage not configured');
   const command = new GetObjectCommand({ Bucket: B2_BUCKET_NAME, Key: key });
   const response = await b2Client.send(command);
   res.setHeader('Content-Type', response.ContentType);
@@ -405,7 +412,7 @@ app.get('/api/download/:token', async (req, res) => {
   catch { res.status(404).send('File not found'); }
 });
 
-// ---------- ADMIN ROUTES (all original) ----------
+// ---------- ADMIN ROUTES ----------
 app.post('/api/admin/login', (req, res) => {
   const settings = readDB('settings', {});
   if (req.body.password === settings.adminPassword) res.json({ token: settings.adminPassword, ok: true });
@@ -417,13 +424,22 @@ app.get('/api/admin/stats', adminAuth, (req, res) => {
   res.json({ visits: stats.visits||0, downloads: stats.downloads||0, sales: stats.sales||0, schemes: readDB('schemes').length, activeUsers: Object.keys(userSessions).length });
 });
 app.get('/api/admin/schemes', adminAuth, (req, res) => res.json(readDB('schemes')));
+
+// UPLOAD ROUTE WITH B2 SAFEGUARD
 app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document' }, { name: 'cover' }]), async (req, res) => {
+  if (!B2_ENABLED || !b2Client) {
+    return res.status(503).json({ error: 'Storage service unavailable. Check B2 configuration.' });
+  }
   try {
     const { title, subject, grade, term, price, weeks, pages, visible, publishAt, unpublishAt } = req.body;
-    if (!title || !subject || !grade || !term || !price || !req.files?.document) return res.status(400).json({ error: 'Missing fields' });
+    if (!title || !subject || !grade || !term || !price || !req.files?.document) {
+      return res.status(400).json({ error: 'Missing fields' });
+    }
     const docKey = await uploadBufferToB2(req.files.document[0].buffer, req.files.document[0].originalname, req.files.document[0].mimetype, 'schemes');
     let coverKey = null;
-    if (req.files.cover) coverKey = await uploadBufferToB2(req.files.cover[0].buffer, req.files.cover[0].originalname, req.files.cover[0].mimetype, 'covers');
+    if (req.files.cover) {
+      coverKey = await uploadBufferToB2(req.files.cover[0].buffer, req.files.cover[0].originalname, req.files.cover[0].mimetype, 'covers');
+    }
     const scheme = {
       id: crypto.randomUUID(), title, subject, grade, term: Number(term), price: Number(price),
       weeks: weeks?Number(weeks):null, pages: pages?Number(pages):null,
@@ -433,8 +449,12 @@ app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document' }, {
     };
     const schemes = readDB('schemes'); schemes.push(scheme); writeDB('schemes', schemes);
     res.status(201).json(scheme);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ error: err.message || 'Upload failed' });
+  }
 });
+
 app.patch('/api/admin/schemes/:id', adminAuth, (req, res) => {
   const schemes = readDB('schemes'); const idx = schemes.findIndex(s=>s.id===req.params.id);
   if (idx===-1) return res.status(404).json({ error: 'Not found' });
@@ -446,17 +466,23 @@ app.patch('/api/admin/schemes/:id', adminAuth, (req, res) => {
   if (unpublishAt!==undefined) schemes[idx].unpublishAt=unpublishAt||null;
   writeDB('schemes', schemes); res.json(schemes[idx]);
 });
+
 app.post('/api/admin/schemes/:id/cover', adminAuth, upload.single('cover'), async (req, res) => {
+  if (!B2_ENABLED || !b2Client) return res.status(503).json({ error: 'Storage unavailable' });
   const schemes = readDB('schemes'); const scheme = schemes.find(s=>s.id===req.params.id);
   if (!scheme) return res.status(404).json({ error: 'Not found' });
   if (!req.file) return res.status(400).json({ error: 'No file' });
   try { scheme.coverKey = await uploadBufferToB2(req.file.buffer, req.file.originalname, req.file.mimetype, 'covers'); writeDB('schemes', schemes); res.json({ ok: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 app.delete('/api/admin/schemes/:id', adminAuth, (req, res) => {
   writeDB('schemes', readDB('schemes').filter(s=>s.id!==req.params.id)); res.json({ ok: true });
 });
+
+// BULK UPLOAD WITH SAFEGUARD
 app.post('/api/admin/schemes/bulk', adminAuth, upload.fields([{ name: 'documents' }, { name: 'covers' }]), async (req, res) => {
+  if (!B2_ENABLED || !b2Client) return res.status(503).json({ error: 'Storage unavailable' });
   const { title, subject, grade, term, price, weeks, pages, visible } = req.body;
   if (!title||!subject||!grade||!term||!price||!req.files?.documents) return res.status(400).json({ error: 'Missing fields' });
   const docs = req.files.documents; const covers = req.files.covers || []; const schemes = readDB('schemes'); const created = [];
@@ -470,10 +496,11 @@ app.post('/api/admin/schemes/bulk', adminAuth, upload.fields([{ name: 'documents
         fileKey: docKey, originalName: docs[i].originalname, coverKey, visible: visible!=='false', createdAt: new Date().toISOString()
       };
       schemes.push(scheme); created.push(scheme);
-    } catch (e) {}
+    } catch (e) { console.error('Bulk item failed:', e); }
   }
   writeDB('schemes', schemes); res.status(201).json({ created: created.length });
 });
+
 app.post('/api/admin/schemes/bulk-price', adminAuth, (req, res) => {
   const { schemeIds, price, operation='set' } = req.body;
   const schemes = readDB('schemes'); let updated=0;
@@ -567,6 +594,17 @@ app.post('/api/admin/restore', adminAuth, restoreStorage.single('backup'), async
   if (!req.file) return res.status(400).json({ error: 'No file' });
   try { await extract(req.file.path, { dir: path.dirname(DATA_DIR) }); fs.unlinkSync(req.file.path); res.json({ ok: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Error handling middleware (MUST be after all routes)
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({ error: err.message });
+  } else if (err) {
+    console.error('Server error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+  next();
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
