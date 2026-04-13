@@ -105,7 +105,7 @@ if (!fs.existsSync(dbFile('settings'))) {
     emailNotifications: true
   });
 }
-['schemes', 'areas', 'visitors', 'sales', 'popups', 'grades', 'stats', 'resetCodes'].forEach(n => {
+['schemes', 'areas', 'visitors', 'sales', 'popups', 'grades', 'stats', 'resetCodes', 'transactions'].forEach(n => {
   if (!fs.existsSync(dbFile(n))) writeDB(n, []);
 });
 
@@ -182,10 +182,29 @@ app.use((req, res, next) => {
   next();
 });
 
-// Payment state
-const transactions = {};
+// Payment state (in-memory for speed, backed by persistent store)
 const verificationTokens = {};
 const downloadTokens = {};
+
+// Load persistent transactions on startup
+let transactions = {};
+const persistentTx = readDB('transactions', {});
+Object.assign(transactions, persistentTx);
+console.log(`📦 Loaded ${Object.keys(transactions).length} persisted transactions`);
+
+function saveTransaction(id, data) {
+  transactions[id] = data;
+  const allTx = readDB('transactions', {});
+  allTx[id] = data;
+  writeDB('transactions', allTx);
+}
+
+function removeTransaction(id) {
+  delete transactions[id];
+  const allTx = readDB('transactions', {});
+  delete allTx[id];
+  writeDB('transactions', allTx);
+}
 
 const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY || '';
@@ -284,7 +303,7 @@ app.get('/api/grades/available', (req, res) => {
   res.json(filtered);
 });
 
-// ---------- PAYMENT ROUTES (FIXED - PAYNECTA CONFIRMATION) ----------
+// ---------- PAYMENT ROUTES (FIXED WITH PERSISTENCE) ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -301,13 +320,15 @@ app.post('/api/initiate-payment', async (req, res) => {
   const transactionId = crypto.randomBytes(10).toString('hex');
 
   if (DEMO_MODE) {
-    transactions[transactionId] = { status: 'pending', productId, phone: mobile };
+    const txData = { status: 'pending', productId, phone: mobile };
+    saveTransaction(transactionId, txData);
     setTimeout(() => {
-      if (transactions[transactionId]?.status === 'pending') {
+      const current = transactions[transactionId];
+      if (current && current.status === 'pending') {
         const vt = crypto.randomBytes(16).toString('hex');
         verificationTokens[vt] = { productId, expiresAt: Date.now() + 5*60*1000 };
-        transactions[transactionId] = { status: 'success', productId, verificationToken: vt };
-        console.log(`🟢 DEMO: Payment confirmed`);
+        saveTransaction(transactionId, { ...current, status: 'success', verificationToken: vt });
+        console.log(`🟢 DEMO: Payment confirmed for ${transactionId}`);
       }
     }, 5000);
     return res.json({ transactionId, demo: true });
@@ -321,14 +342,18 @@ app.post('/api/initiate-payment', async (req, res) => {
       headers: { 'Content-Type': 'application/json', 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL },
       body: JSON.stringify(payload)
     });
-    const data = await response.json();
+    const rawText = await response.text();
+    console.log(`📥 Init response:`, rawText);
+    let data;
+    try { data = JSON.parse(rawText); } catch (e) { return res.status(502).json({ error: 'Invalid JSON from Paynecta' }); }
     const ref = data.transaction_reference || data.data?.transaction_reference;
     if (!ref) {
       console.error('❌ No reference in response:', data);
       return res.status(502).json({ error: 'Payment gateway error: No reference' });
     }
-    transactions[transactionId] = { transactionRef: ref, productId, status: 'pending', phone: mobile };
-    console.log(`✅ Initiated, ref: ${ref}`);
+    const txData = { transactionRef: ref, productId, status: 'pending', phone: mobile };
+    saveTransaction(transactionId, txData);
+    console.log(`✅ Initiated, ref: ${ref}, id: ${transactionId}`);
     res.json({ transactionId });
   } catch (err) {
     console.error('Init error:', err);
@@ -349,26 +374,22 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
       headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL }
     });
     const rawText = await response.text();
-    console.log(`📡 Paynecta raw status:`, rawText);
-    
+    console.log(`📡 Status response:`, rawText);
     let data;
     try { data = JSON.parse(rawText); } catch (e) { return res.json({ status: 'pending' }); }
-    
     const inner = data.data || data;
     const status = inner.status;
     const resultCode = inner.result_code;
     
-    console.log(`📊 Status: ${status}, result_code: ${resultCode}`);
-    
-    // SUCCESS: status is 'completed' AND result_code is 0 (number or string)
     if (status === 'completed' && (resultCode === 0 || resultCode === '0')) {
       const vt = crypto.randomBytes(16).toString('hex');
       verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5*60*1000 };
-      transactions[req.params.transactionId] = { ...tx, status: 'success', verificationToken: vt };
+      const updatedTx = { ...tx, status: 'success', verificationToken: vt };
+      saveTransaction(req.params.transactionId, updatedTx);
       
       const scheme = readDB('schemes').find(s => s.id === tx.productId);
       const sales = readDB('sales');
-      sales.push({ title: scheme?.title, grade: scheme?.grade, phone: tx.phone, amount: scheme?.price, date: new Date().toISOString() });
+      sales.push({ title: scheme?.title, grade: scheme?.grade, phone: tx.phone, amount: scheme?.price, date: new Date().toISOString(), mpesaReceipt: inner.mpesa_receipt_number });
       writeDB('sales', sales);
       incStat('sales');
       if (scheme) sendSaleNotification(scheme, tx.phone, scheme.price);
@@ -376,16 +397,13 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
       return res.json({ status: 'success', verificationToken: vt });
     }
     
-    // FAILED or CANCELLED
     if (['failed', 'cancelled', 'expired'].includes(status)) {
-      const failReason = inner.result_description || inner.failure_reason || 'Payment was cancelled or failed';
-      transactions[req.params.transactionId].status = 'failed';
-      transactions[req.params.transactionId].failReason = failReason;
+      const failReason = inner.result_description || inner.failure_reason || 'Payment failed';
+      saveTransaction(req.params.transactionId, { ...tx, status: 'failed', failReason });
       console.log(`❌ Payment failed: ${failReason}`);
       return res.json({ status: 'failed', message: failReason });
     }
     
-    // Still pending/processing
     res.json({ status: 'pending' });
   } catch (err) {
     console.error(`⚠️ Status check error:`, err.message);
@@ -414,7 +432,7 @@ app.get('/api/download/:token', async (req, res) => {
   catch { res.status(404).send('File not found'); }
 });
 
-// ---------- ADMIN ROUTES ----------
+// ---------- ADMIN ROUTES (all included) ----------
 app.post('/api/admin/login', (req, res) => {
   const settings = readDB('settings', {});
   if (req.body.password === settings.adminPassword) res.json({ token: settings.adminPassword, ok: true });
@@ -515,8 +533,8 @@ app.get('/api/admin/analytics/downloads', adminAuth, (req, res) => {
   res.json(schemes.map(s => ({ id: s.id, title: s.title, grade: s.grade, downloads: counts[s.title]||0, revenue: (counts[s.title]||0)*s.price })).sort((a,b)=>b.downloads-a.downloads));
 });
 app.get('/api/admin/sales/export', adminAuth, (req, res) => {
-  const sales = readDB('sales'); let csv = 'Date,Title,Grade,Phone,Amount\n';
-  sales.forEach(s => { csv += `${s.date},${s.title},${s.grade||''},${s.phone},${s.amount}\n`; });
+  const sales = readDB('sales'); let csv = 'Date,Title,Grade,Phone,Amount,M-Pesa Receipt\n';
+  sales.forEach(s => { csv += `${s.date},${s.title},${s.grade||''},${s.phone},${s.amount},${s.mpesaReceipt||''}\n`; });
   res.setHeader('Content-Type', 'text/csv'); res.setHeader('Content-Disposition', 'attachment; filename="sales.csv"'); res.send(csv);
 });
 app.get('/api/admin/health', adminAuth, async (req, res) => {
