@@ -13,10 +13,21 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ---------- Persistent Data Directory ----------
+// On Render, this should be mounted as a persistent disk at /opt/render/project/src/data
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const COVERS_DIR = path.join(DATA_DIR, 'covers');
-[DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
+
+// Create directories if they don't exist
+[DATA_DIR, UPLOADS_DIR, COVERS_DIR].forEach(d => {
+  if (!fs.existsSync(d)) {
+    fs.mkdirSync(d, { recursive: true });
+    console.log(`📁 Created directory: ${d}`);
+  }
+});
+
+console.log(`📂 Data directory: ${DATA_DIR}`);
+console.log(`💾 Persistent storage: ${fs.existsSync(DATA_DIR) ? 'READY' : 'MISSING'}`);
 
 // ---------- B2 Client Setup ----------
 const B2_ENDPOINT = process.env.B2_ENDPOINT;
@@ -26,6 +37,8 @@ const B2_APP_KEY = process.env.B2_APP_KEY;
 const B2_BUCKET_NAME = process.env.B2_BUCKET_NAME;
 
 let b2Client = null;
+let B2_ENABLED = false;
+
 if (B2_ENDPOINT && B2_KEY_ID && B2_APP_KEY && B2_BUCKET_NAME) {
   b2Client = new S3Client({
     endpoint: B2_ENDPOINT,
@@ -33,9 +46,10 @@ if (B2_ENDPOINT && B2_KEY_ID && B2_APP_KEY && B2_BUCKET_NAME) {
     credentials: { accessKeyId: B2_KEY_ID, secretAccessKey: B2_APP_KEY },
     forcePathStyle: true,
   });
+  B2_ENABLED = true;
   console.log('✅ B2 client initialized');
 } else {
-  console.warn('⚠️ B2 credentials missing – uploads will FAIL');
+  console.warn('⚠️ B2 credentials missing – uploads will FAIL. Set B2_* env vars.');
 }
 
 async function uploadBufferToB2(buffer, fileName, mimeType, folder = 'schemes') {
@@ -50,6 +64,7 @@ async function uploadBufferToB2(buffer, fileName, mimeType, folder = 'schemes') 
     ContentDisposition: `attachment; filename="${fileName}"`,
   });
   await b2Client.send(command);
+  console.log(`📤 Uploaded to B2: ${key}`);
   return key;
 }
 
@@ -62,7 +77,7 @@ async function streamFileFromB2(key, res) {
   response.Body.pipe(res);
 }
 
-// Auto-sync on startup
+// Auto-sync on startup - verifies B2 and checks data integrity
 async function verifyB2Connectivity() {
   if (!b2Client) {
     console.warn('⚠️ B2 not configured – skipping sync');
@@ -80,6 +95,7 @@ async function verifyB2Connectivity() {
     
     console.log(`✅ B2 connected – ${fileCount} objects, ${(totalSize / 1024 / 1024).toFixed(2)} MB`);
     
+    // Check for orphaned schemes (fileKey exists but file missing in B2)
     const schemes = readDB('schemes');
     let missingCount = 0;
     for (const scheme of schemes) {
@@ -93,6 +109,10 @@ async function verifyB2Connectivity() {
       }
     }
     
+    if (missingCount > 0) {
+      console.log(`📦 ${missingCount} schemes have missing files – consider re-uploading`);
+    }
+    
     return { status: 'connected', fileCount, totalSize, missingFiles: missingCount };
   } catch (err) {
     console.error('❌ B2 connectivity check failed:', err.message);
@@ -100,19 +120,44 @@ async function verifyB2Connectivity() {
   }
 }
 
-if (b2Client) verifyB2Connectivity();
+// Verify B2 on startup
+if (B2_ENABLED) {
+  verifyB2Connectivity().then(status => {
+    console.log(`🔍 B2 health check: ${status.status}`);
+  });
+}
 
-// ---------- JSON Helpers ----------
+// ---------- JSON Helpers (Persistent Data) ----------
 const dbFile = name => path.join(DATA_DIR, `${name}.json`);
+
 function readDB(name, def = []) {
-  try { return JSON.parse(fs.readFileSync(dbFile(name), 'utf8')); }
-  catch { return def; }
-}
-function writeDB(name, data) {
-  fs.writeFileSync(dbFile(name), JSON.stringify(data, null, 2));
+  const filePath = dbFile(name);
+  try {
+    if (!fs.existsSync(filePath)) {
+      console.log(`📄 Creating new database: ${name}.json`);
+      writeDB(name, def);
+      return def;
+    }
+    const data = fs.readFileSync(filePath, 'utf8');
+    return JSON.parse(data);
+  } catch (err) {
+    console.error(`❌ Error reading ${name}.json:`, err.message);
+    return def;
+  }
 }
 
-// Initialize defaults with new settings
+function writeDB(name, data) {
+  const filePath = dbFile(name);
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    return true;
+  } catch (err) {
+    console.error(`❌ Error writing ${name}.json:`, err.message);
+    return false;
+  }
+}
+
+// Initialize defaults with all settings
 if (!fs.existsSync(dbFile('settings'))) {
   writeDB('settings', {
     adminPassword: process.env.ADMIN_PASSWORD || '0726019859',
@@ -124,10 +169,24 @@ if (!fs.existsSync(dbFile('settings'))) {
     featuredSchemeIds: [],
     emailNotifications: true
   });
+  console.log('📄 Created default settings.json');
 }
+
+// Initialize all databases
 ['schemes', 'areas', 'visitors', 'sales', 'popups', 'grades', 'stats', 'resetCodes'].forEach(n => {
-  if (!fs.existsSync(dbFile(n))) writeDB(n, []);
+  if (!fs.existsSync(dbFile(n))) {
+    writeDB(n, []);
+    console.log(`📄 Created ${n}.json`);
+  }
 });
+
+// Log database stats on startup
+console.log('📊 Database stats:');
+console.log(`   - Schemes: ${readDB('schemes').length}`);
+console.log(`   - Subjects: ${readDB('areas').length}`);
+console.log(`   - Grades: ${readDB('grades').length}`);
+console.log(`   - Sales: ${readDB('sales').length}`);
+console.log(`   - Visitors: ${readDB('visitors').length}`);
 
 // ---------- Scheduled Publishing (Cron) ----------
 cron.schedule('* * * * *', () => {
@@ -150,8 +209,13 @@ cron.schedule('* * * * *', () => {
     }
   });
   
-  if (changed) writeDB('schemes', schemes);
+  if (changed) {
+    writeDB('schemes', schemes);
+    console.log('💾 Saved scheduled publishing changes');
+  }
 });
+
+console.log('⏰ Scheduled publishing cron job started (runs every minute)');
 
 // ---------- Multer ----------
 const upload = multer({
@@ -206,7 +270,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Payment state
+// Payment state (in-memory only - transactions don't need persistence)
 const transactions = {};
 const verificationTokens = {};
 const downloadTokens = {};
@@ -217,6 +281,7 @@ const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL || '';
 const PAYNECTA_PAYMENT_CODE = process.env.PAYNECTA_PAYMENT_CODE || '';
 const DEMO_MODE = !PAYNECTA_API_KEY;
 if (DEMO_MODE) console.log('⚠️ DEMO MODE – payments auto‑confirm after 10s');
+else console.log('💰 Paynecta LIVE mode enabled');
 
 // Email notification helper
 async function sendSaleNotification(scheme, phone, amount) {
@@ -242,7 +307,12 @@ async function sendSaleNotification(scheme, phone, amount) {
 }
 
 // ---------- PUBLIC ROUTES ----------
-app.get('/health', (req, res) => res.json({ status: 'ok', demo: DEMO_MODE }));
+app.get('/health', (req, res) => res.json({ 
+  status: 'ok', 
+  demo: DEMO_MODE, 
+  b2: B2_ENABLED ? 'enabled' : 'disabled',
+  persistent: fs.existsSync(DATA_DIR) ? 'ready' : 'missing'
+}));
 
 app.post('/api/track-visit', (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
@@ -310,7 +380,7 @@ app.get('/api/grades/available', (req, res) => {
   res.json(grades);
 });
 
-// ---------- PAYMENT ROUTES ----------
+// ---------- PAYMENT ROUTES (FIXED FOR PAYNECTA) ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -323,81 +393,177 @@ app.post('/api/initiate-payment', async (req, res) => {
   const schemes = readDB('schemes');
   const scheme = schemes.find(s => s.id === productId);
   if (!scheme) return res.status(404).json({ error: 'Product not found' });
+  
   const mobile = normalisePhone(phone);
-  if (!mobile) return res.status(400).json({ error: 'Invalid phone' });
+  if (!mobile) return res.status(400).json({ error: 'Invalid phone number. Use format 07XXXXXXXX' });
+
   const transactionId = crypto.randomBytes(10).toString('hex');
 
   if (DEMO_MODE) {
+    console.log(`🟡 DEMO: Init payment for ${mobile}, amount ${scheme.price}`);
     transactions[transactionId] = { status: 'pending', productId, phone: mobile };
     setTimeout(() => {
       if (transactions[transactionId] && transactions[transactionId].status === 'pending') {
         const vt = crypto.randomBytes(16).toString('hex');
         verificationTokens[vt] = { productId, expiresAt: Date.now() + 5 * 60 * 1000 };
         transactions[transactionId] = { status: 'success', productId, verificationToken: vt };
+        console.log(`🟢 DEMO: Payment confirmed for ${transactionId}`);
       }
     }, 10000);
     return res.json({ transactionId, demo: true });
   }
 
   try {
-    const payload = { code: PAYNECTA_PAYMENT_CODE, mobile_number: mobile, amount: Number(amount || scheme.price) };
+    const payload = {
+      code: PAYNECTA_PAYMENT_CODE,
+      mobile_number: mobile,
+      amount: Number(amount || scheme.price)
+    };
+
+    console.log(`📤 Paynecta initialize:`, JSON.stringify(payload));
+
     const response = await fetch(`${PAYNECTA_API_URL}/payment/initialize`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': PAYNECTA_API_KEY,
+        'X-User-Email': PAYNECTA_EMAIL
+      },
       body: JSON.stringify(payload)
     });
-    const data = await response.json();
-    const ref = data.transaction_reference || data.data?.transaction_reference;
-    if (!ref) throw new Error('No transaction reference');
-    transactions[transactionId] = { transactionRef: ref, productId, status: 'pending', phone: mobile };
+
+    const rawText = await response.text();
+    console.log(`📥 Paynecta initialize response:`, rawText);
+
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (e) {
+      console.error('❌ Failed to parse Paynecta response');
+      return res.status(502).json({ error: 'Invalid response from payment gateway' });
+    }
+
+    const transactionRef = data.transaction_reference || data.data?.transaction_reference;
+    
+    if (!transactionRef) {
+      console.error('❌ No transaction_reference in response:', data);
+      const errorMsg = data.message || data.error || 'Unknown error';
+      return res.status(502).json({ error: `Payment gateway error: ${errorMsg}` });
+    }
+
+    transactions[transactionId] = { 
+      transactionRef, 
+      productId, 
+      status: 'pending', 
+      phone: mobile 
+    };
+    
+    console.log(`✅ Payment initiated, ref: ${transactionRef}`);
     res.json({ transactionId });
+
   } catch (err) {
-    res.status(502).json({ error: 'Payment gateway error' });
+    console.error('❌ Paynecta network error:', err.message);
+    res.status(502).json({ error: 'Could not reach payment gateway' });
   }
 });
 
 app.get('/api/payment-status/:transactionId', async (req, res) => {
   const tx = transactions[req.params.transactionId];
   if (!tx) return res.status(404).json({ status: 'not_found' });
-  if (tx.status === 'success') return res.json({ status: 'success', verificationToken: tx.verificationToken });
-  if (tx.status === 'failed') return res.json({ status: 'failed', message: tx.failReason });
-  if (DEMO_MODE) return res.json({ status: 'pending' });
+
+  if (tx.status === 'success') {
+    return res.json({ status: 'success', verificationToken: tx.verificationToken });
+  }
+  
+  if (tx.status === 'failed') {
+    return res.json({ status: 'failed', message: tx.failReason || 'Payment failed' });
+  }
+
+  if (DEMO_MODE) {
+    return res.json({ status: 'pending' });
+  }
 
   try {
-    const response = await fetch(`${PAYNECTA_API_URL}/payment/status?transaction_reference=${tx.transactionRef}`, {
-      headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL }
-    });
-    const data = await response.json();
-    const inner = data.data || data;
+    console.log(`🔍 Checking Paynecta status for ref: ${tx.transactionRef}`);
     
-    if (inner.status === 'completed' && (inner.result_code === 0 || inner.result_code === '0')) {
+    const response = await fetch(`${PAYNECTA_API_URL}/payment/status?transaction_reference=${encodeURIComponent(tx.transactionRef)}`, {
+      method: 'GET',
+      headers: {
+        'X-API-Key': PAYNECTA_API_KEY,
+        'X-User-Email': PAYNECTA_EMAIL
+      }
+    });
+
+    const rawText = await response.text();
+    console.log(`📡 Paynecta status response:`, rawText);
+
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (e) {
+      console.error('❌ Failed to parse status response');
+      return res.json({ status: 'pending' });
+    }
+
+    const inner = data.data || data;
+    const status = inner.status;
+    const resultCode = inner.result_code !== undefined ? Number(inner.result_code) : null;
+
+    console.log(`📊 Status: ${status}, result_code: ${resultCode}`);
+
+    if (status === 'completed' && (resultCode === 0 || resultCode === '0')) {
       const vt = crypto.randomBytes(16).toString('hex');
-      verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5 * 60 * 1000 };
-      transactions[req.params.transactionId] = { ...tx, status: 'success', verificationToken: vt };
-      
+      verificationTokens[vt] = { 
+        productId: tx.productId, 
+        expiresAt: Date.now() + 5 * 60 * 1000 
+      };
+      transactions[req.params.transactionId] = { 
+        ...tx, 
+        status: 'success', 
+        verificationToken: vt 
+      };
+
       const scheme = readDB('schemes').find(s => s.id === tx.productId);
       const sales = readDB('sales');
-      sales.push({ title: scheme?.title, grade: scheme?.grade, subject: scheme?.subject, phone: tx.phone, amount: scheme?.price, date: new Date().toISOString() });
+      sales.push({
+        title: scheme?.title || '—',
+        grade: scheme?.grade || '',
+        subject: scheme?.subject || '',
+        phone: tx.phone,
+        amount: scheme?.price || 0,
+        date: new Date().toISOString(),
+        mpesaReceipt: inner.mpesa_receipt_number || ''
+      });
       writeDB('sales', sales);
       incStat('sales');
-      
-      sendSaleNotification(scheme, tx.phone, scheme.price);
-      
+
+      if (scheme) sendSaleNotification(scheme, tx.phone, scheme.price);
+
+      console.log(`✅ Payment confirmed! Receipt: ${inner.mpesa_receipt_number}`);
       return res.json({ status: 'success', verificationToken: vt });
     }
-    if (['failed', 'cancelled'].includes(inner.status)) {
+
+    if (['failed', 'cancelled', 'expired'].includes(status)) {
+      const failReason = inner.result_description || inner.failure_reason || 'Payment was cancelled or failed';
       transactions[req.params.transactionId].status = 'failed';
-      return res.json({ status: 'failed', message: inner.result_description });
+      transactions[req.params.transactionId].failReason = failReason;
+      console.log(`❌ Payment failed: ${failReason}`);
+      return res.json({ status: 'failed', message: failReason });
     }
+
     res.json({ status: 'pending' });
-  } catch { res.json({ status: 'pending' }); }
+
+  } catch (err) {
+    console.error(`⚠️ Status check error:`, err.message);
+    res.json({ status: 'pending' });
+  }
 });
 
 app.post('/api/request-download', (req, res) => {
   const { verificationToken, productId } = req.body;
   const vt = verificationTokens[verificationToken];
   if (!vt || vt.productId !== productId || Date.now() > vt.expiresAt) {
-    return res.status(403).json({ error: 'Invalid token' });
+    return res.status(403).json({ error: 'Invalid or expired token' });
   }
   const scheme = readDB('schemes').find(s => s.id === productId);
   if (!scheme || !scheme.fileKey) return res.status(404).json({ error: 'File not found' });
@@ -631,10 +797,10 @@ app.get('/api/admin/sales/export', adminAuth, (req, res) => {
   const sales = readDB('sales');
   const schemes = readDB('schemes');
   
-  let csv = 'Date,Title,Grade,Subject,Phone,Amount (KES)\n';
+  let csv = 'Date,Title,Grade,Subject,Phone,Amount (KES),M-Pesa Receipt\n';
   sales.forEach(sale => {
     const scheme = schemes.find(s => s.title === sale.title);
-    csv += `${sale.date},${sale.title},${scheme?.grade || ''},${scheme?.subject || ''},${sale.phone},${sale.amount}\n`;
+    csv += `${sale.date},${sale.title},${scheme?.grade || ''},${scheme?.subject || ''},${sale.phone},${sale.amount},${sale.mpesaReceipt || ''}\n`;
   });
   
   res.setHeader('Content-Type', 'text/csv');
@@ -643,7 +809,7 @@ app.get('/api/admin/sales/export', adminAuth, (req, res) => {
 });
 
 app.get('/api/admin/health', adminAuth, async (req, res) => {
-  const b2Status = await verifyB2Connectivity();
+  const b2Status = B2_ENABLED ? await verifyB2Connectivity() : { status: 'disabled' };
   const schemes = readDB('schemes');
   const stats = readDB('stats', {});
   const sales = readDB('sales');
@@ -663,6 +829,7 @@ app.get('/api/admin/health', adminAuth, async (req, res) => {
       downloads: stats.downloads || 0,
       totalRevenue: sales.reduce((sum, s) => sum + (s.amount || 0), 0)
     },
+    persistent: fs.existsSync(DATA_DIR) ? 'ready' : 'missing',
     memory: process.memoryUsage(),
     uptime: process.uptime()
   });
@@ -838,7 +1005,7 @@ app.post('/api/admin/reset-password', (req, res) => {
 // ---------- BACKUP & RESTORE ----------
 app.get('/api/admin/backup', adminAuth, (req, res) => {
   res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="backup-${Date.now()}.zip"`);
+  res.setHeader('Content-Disposition', `attachment; filename="schemevault-backup-${Date.now()}.zip"`);
   const archive = archiver('zip', { zlib: { level: 6 } });
   archive.pipe(res);
   archive.directory(DATA_DIR, 'data');
@@ -857,4 +1024,10 @@ app.post('/api/admin/restore', adminAuth, restoreStorage.single('backup'), async
 });
 
 // ---------- START SERVER ----------
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 SchemeVault running on port ${PORT}`);
+  console.log(`📁 Data directory: ${DATA_DIR}`);
+  console.log(`💾 Persistent storage: ${fs.existsSync(DATA_DIR) ? 'READY' : 'MISSING'}`);
+  console.log(`💰 Payment mode: ${DEMO_MODE ? 'DEMO' : 'LIVE'}`);
+  console.log(`☁️ B2 Storage: ${B2_ENABLED ? 'ENABLED' : 'DISABLED'}`);
+});
