@@ -227,7 +227,6 @@ app.post('/api/track-visit', (req, res) => {
 
 app.get('/api/schemes', (req, res) => {
   const schemes = readDB('schemes').filter(s => s.visible !== false);
-  // Sort: Grade descending (9→1), then subject alphabetically
   const sorted = schemes.sort((a, b) => {
     const gradeA = parseInt(a.grade?.match(/\d+/)?.[0] || '0');
     const gradeB = parseInt(b.grade?.match(/\d+/)?.[0] || '0');
@@ -285,7 +284,7 @@ app.get('/api/grades/available', (req, res) => {
   res.json(filtered);
 });
 
-// ---------- PAYMENT ROUTES (FIXED) ----------
+// ---------- PAYMENT ROUTES (FIXED - PAYNECTA CONFIRMATION) ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -308,6 +307,7 @@ app.post('/api/initiate-payment', async (req, res) => {
         const vt = crypto.randomBytes(16).toString('hex');
         verificationTokens[vt] = { productId, expiresAt: Date.now() + 5*60*1000 };
         transactions[transactionId] = { status: 'success', productId, verificationToken: vt };
+        console.log(`🟢 DEMO: Payment confirmed`);
       }
     }, 5000);
     return res.json({ transactionId, demo: true });
@@ -323,13 +323,16 @@ app.post('/api/initiate-payment', async (req, res) => {
     });
     const data = await response.json();
     const ref = data.transaction_reference || data.data?.transaction_reference;
-    if (!ref) throw new Error('No reference');
+    if (!ref) {
+      console.error('❌ No reference in response:', data);
+      return res.status(502).json({ error: 'Payment gateway error: No reference' });
+    }
     transactions[transactionId] = { transactionRef: ref, productId, status: 'pending', phone: mobile };
     console.log(`✅ Initiated, ref: ${ref}`);
     res.json({ transactionId });
   } catch (err) {
     console.error('Init error:', err);
-    res.status(502).json({ error: 'Payment gateway error' });
+    res.status(502).json({ error: 'Could not reach payment gateway' });
   }
 });
 
@@ -341,31 +344,53 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
   if (DEMO_MODE) return res.json({ status: 'pending' });
 
   try {
-    const response = await fetch(`${PAYNECTA_API_URL}/payment/status?transaction_reference=${tx.transactionRef}`, {
+    console.log(`🔍 Checking status for ref: ${tx.transactionRef}`);
+    const response = await fetch(`${PAYNECTA_API_URL}/payment/status?transaction_reference=${encodeURIComponent(tx.transactionRef)}`, {
       headers: { 'X-API-Key': PAYNECTA_API_KEY, 'X-User-Email': PAYNECTA_EMAIL }
     });
-    const data = await response.json();
+    const rawText = await response.text();
+    console.log(`📡 Paynecta raw status:`, rawText);
+    
+    let data;
+    try { data = JSON.parse(rawText); } catch (e) { return res.json({ status: 'pending' }); }
+    
     const inner = data.data || data;
-    console.log(`📡 Status: ${inner.status}, result_code: ${inner.result_code}`);
-    if (inner.status === 'completed' && (inner.result_code === 0 || inner.result_code === '0')) {
+    const status = inner.status;
+    const resultCode = inner.result_code;
+    
+    console.log(`📊 Status: ${status}, result_code: ${resultCode}`);
+    
+    // SUCCESS: status is 'completed' AND result_code is 0 (number or string)
+    if (status === 'completed' && (resultCode === 0 || resultCode === '0')) {
       const vt = crypto.randomBytes(16).toString('hex');
       verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5*60*1000 };
       transactions[req.params.transactionId] = { ...tx, status: 'success', verificationToken: vt };
+      
       const scheme = readDB('schemes').find(s => s.id === tx.productId);
       const sales = readDB('sales');
       sales.push({ title: scheme?.title, grade: scheme?.grade, phone: tx.phone, amount: scheme?.price, date: new Date().toISOString() });
       writeDB('sales', sales);
       incStat('sales');
       if (scheme) sendSaleNotification(scheme, tx.phone, scheme.price);
-      console.log(`✅ Payment confirmed`);
+      console.log(`✅ Payment confirmed! Receipt: ${inner.mpesa_receipt_number}`);
       return res.json({ status: 'success', verificationToken: vt });
     }
-    if (['failed', 'cancelled'].includes(inner.status)) {
+    
+    // FAILED or CANCELLED
+    if (['failed', 'cancelled', 'expired'].includes(status)) {
+      const failReason = inner.result_description || inner.failure_reason || 'Payment was cancelled or failed';
       transactions[req.params.transactionId].status = 'failed';
-      return res.json({ status: 'failed', message: inner.result_description });
+      transactions[req.params.transactionId].failReason = failReason;
+      console.log(`❌ Payment failed: ${failReason}`);
+      return res.json({ status: 'failed', message: failReason });
     }
+    
+    // Still pending/processing
     res.json({ status: 'pending' });
-  } catch { res.json({ status: 'pending' }); }
+  } catch (err) {
+    console.error(`⚠️ Status check error:`, err.message);
+    res.json({ status: 'pending' });
+  }
 });
 
 app.post('/api/request-download', (req, res) => {
@@ -389,7 +414,7 @@ app.get('/api/download/:token', async (req, res) => {
   catch { res.status(404).send('File not found'); }
 });
 
-// ---------- ADMIN ROUTES (all included, identical to previous working version) ----------
+// ---------- ADMIN ROUTES ----------
 app.post('/api/admin/login', (req, res) => {
   const settings = readDB('settings', {});
   if (req.body.password === settings.adminPassword) res.json({ token: settings.adminPassword, ok: true });
