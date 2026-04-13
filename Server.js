@@ -58,7 +58,16 @@ async function uploadBufferToB2(buffer, fileName, mimeType, folder = 'schemes') 
     ContentType: mimeType,
     ContentDisposition: `attachment; filename="${fileName}"`,
   });
-  await b2Client.send(command);
+  // Add timeout using AbortController
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000); // 30 seconds
+  try {
+    await b2Client.send(command, { abortSignal: controller.signal });
+    clearTimeout(timeout);
+  } catch (e) {
+    clearTimeout(timeout);
+    throw e;
+  }
   console.log(`📤 Uploaded to B2: ${key}`);
   return key;
 }
@@ -162,18 +171,24 @@ const restoreStorage = multer({ dest: path.join(DATA_DIR, 'tmp') });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(__dirname));
+
+// Explicit CORS for all routes
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Admin-Token');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
   next();
 });
 
 function adminAuth(req, res, next) {
   const token = req.headers['x-admin-token'] || req.query.token;
   const settings = readDB('settings', {});
-  if (!token || token !== settings.adminPassword) return res.status(401).json({ error: 'Unauthorized' });
+  if (!token || token !== settings.adminPassword) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   next();
 }
 
@@ -425,19 +440,23 @@ app.get('/api/admin/stats', adminAuth, (req, res) => {
 });
 app.get('/api/admin/schemes', adminAuth, (req, res) => res.json(readDB('schemes')));
 
-// UPLOAD ROUTE WITH B2 SAFEGUARD
+// UPLOAD ROUTE WITH B2 SAFEGUARD AND FULL ERROR LOGGING
 app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document' }, { name: 'cover' }]), async (req, res) => {
+  console.log('📤 Upload request received. B2 enabled:', B2_ENABLED);
   if (!B2_ENABLED || !b2Client) {
+    console.error('❌ B2 not configured');
     return res.status(503).json({ error: 'Storage service unavailable. Check B2 configuration.' });
   }
   try {
     const { title, subject, grade, term, price, weeks, pages, visible, publishAt, unpublishAt } = req.body;
     if (!title || !subject || !grade || !term || !price || !req.files?.document) {
-      return res.status(400).json({ error: 'Missing fields' });
+      return res.status(400).json({ error: 'Missing required fields' });
     }
+    console.log(`📄 Uploading document: ${req.files.document[0].originalname} (${req.files.document[0].size} bytes)`);
     const docKey = await uploadBufferToB2(req.files.document[0].buffer, req.files.document[0].originalname, req.files.document[0].mimetype, 'schemes');
     let coverKey = null;
     if (req.files.cover) {
+      console.log(`🖼️ Uploading cover: ${req.files.cover[0].originalname}`);
       coverKey = await uploadBufferToB2(req.files.cover[0].buffer, req.files.cover[0].originalname, req.files.cover[0].mimetype, 'covers');
     }
     const scheme = {
@@ -448,9 +467,10 @@ app.post('/api/admin/schemes', adminAuth, upload.fields([{ name: 'document' }, {
       publishAt: publishAt||null, unpublishAt: unpublishAt||null
     };
     const schemes = readDB('schemes'); schemes.push(scheme); writeDB('schemes', schemes);
+    console.log(`✅ Scheme saved: ${scheme.id}`);
     res.status(201).json(scheme);
   } catch (err) {
-    console.error('Upload error:', err);
+    console.error('❌ Upload error:', err);
     res.status(500).json({ error: err.message || 'Upload failed' });
   }
 });
@@ -596,15 +616,13 @@ app.post('/api/admin/restore', adminAuth, restoreStorage.single('backup'), async
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Error handling middleware (MUST be after all routes)
+// Error handling middleware
 app.use((err, req, res, next) => {
+  console.error('🔥 Server error:', err);
   if (err instanceof multer.MulterError) {
     return res.status(400).json({ error: err.message });
-  } else if (err) {
-    console.error('Server error:', err);
-    return res.status(500).json({ error: err.message });
   }
-  next();
+  res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
