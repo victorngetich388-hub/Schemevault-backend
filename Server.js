@@ -226,7 +226,15 @@ app.post('/api/track-visit', (req, res) => {
 });
 
 app.get('/api/schemes', (req, res) => {
-  res.json(readDB('schemes').filter(s => s.visible !== false));
+  const schemes = readDB('schemes').filter(s => s.visible !== false);
+  // Sort: Grade descending (9→1), then subject alphabetically
+  const sorted = schemes.sort((a, b) => {
+    const gradeA = parseInt(a.grade?.match(/\d+/)?.[0] || '0');
+    const gradeB = parseInt(b.grade?.match(/\d+/)?.[0] || '0');
+    if (gradeB !== gradeA) return gradeB - gradeA;
+    return (a.subject || '').localeCompare(b.subject || '');
+  });
+  res.json(sorted);
 });
 
 app.get('/api/areas', (req, res) => res.json(readDB('areas')));
@@ -381,7 +389,7 @@ app.get('/api/download/:token', async (req, res) => {
   catch { res.status(404).send('File not found'); }
 });
 
-// ---------- ADMIN ROUTES (all included) ----------
+// ---------- ADMIN ROUTES (all included, identical to previous working version) ----------
 app.post('/api/admin/login', (req, res) => {
   const settings = readDB('settings', {});
   if (req.body.password === settings.adminPassword) res.json({ token: settings.adminPassword, ok: true });
