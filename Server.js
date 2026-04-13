@@ -241,7 +241,7 @@ async function sendSaleNotification(scheme, phone, amount) {
   }
 }
 
-// ---------- PUBLIC ROUTES (UNCHANGED) ----------
+// ---------- PUBLIC ROUTES ----------
 app.get('/health', (req, res) => res.json({ status: 'ok', demo: DEMO_MODE }));
 
 app.post('/api/track-visit', (req, res) => {
@@ -295,7 +295,6 @@ app.get('/api/cover/:schemeId', async (req, res) => {
   } catch { res.status(404).send('Cover not found'); }
 });
 
-// Smart Grade Display (public)
 app.get('/api/grades/available', (req, res) => {
   const settings = readDB('settings', {});
   const schemes = readDB('schemes').filter(s => s.visible !== false);
@@ -311,7 +310,7 @@ app.get('/api/grades/available', (req, res) => {
   res.json(grades);
 });
 
-// Payment routes (initiate, status, request-download, download) - unchanged
+// ---------- PAYMENT ROUTES ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -541,7 +540,6 @@ app.post('/api/admin/schemes/bulk', adminAuth, upload.fields([{ name: 'documents
   res.status(201).json({ created: created.length });
 });
 
-// Bulk Price Update
 app.post('/api/admin/schemes/bulk-price', adminAuth, (req, res) => {
   const { schemeIds, price, operation = 'set' } = req.body;
   if (!schemeIds || !Array.isArray(schemeIds) || price === undefined) {
@@ -561,7 +559,6 @@ app.post('/api/admin/schemes/bulk-price', adminAuth, (req, res) => {
   res.json({ ok: true, updated });
 });
 
-// Bulk Visibility Toggle
 app.post('/api/admin/schemes/bulk-visibility', adminAuth, (req, res) => {
   const { schemeIds, visible } = req.body;
   if (!schemeIds || !Array.isArray(schemeIds)) {
@@ -579,7 +576,6 @@ app.post('/api/admin/schemes/bulk-visibility', adminAuth, (req, res) => {
   res.json({ ok: true, updated });
 });
 
-// Featured Schemes
 app.get('/api/admin/schemes/featured', adminAuth, (req, res) => {
   const settings = readDB('settings', {});
   res.json({ featuredSchemeIds: settings.featuredSchemeIds || [] });
@@ -593,7 +589,6 @@ app.post('/api/admin/schemes/featured', adminAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// Grade Display Setting
 app.patch('/api/admin/settings/grade-display', adminAuth, (req, res) => {
   const settings = readDB('settings', {});
   settings.showAllGrades = req.body.showAllGrades !== false;
@@ -601,7 +596,6 @@ app.patch('/api/admin/settings/grade-display', adminAuth, (req, res) => {
   res.json({ ok: true, showAllGrades: settings.showAllGrades });
 });
 
-// Email Notifications Toggle
 app.patch('/api/admin/settings/email-notifications', adminAuth, (req, res) => {
   const settings = readDB('settings', {});
   settings.emailNotifications = req.body.enabled !== false;
@@ -609,7 +603,6 @@ app.patch('/api/admin/settings/email-notifications', adminAuth, (req, res) => {
   res.json({ ok: true, emailNotifications: settings.emailNotifications });
 });
 
-// Download Analytics
 app.get('/api/admin/analytics/downloads', adminAuth, (req, res) => {
   const schemes = readDB('schemes');
   const sales = readDB('sales');
@@ -634,7 +627,6 @@ app.get('/api/admin/analytics/downloads', adminAuth, (req, res) => {
   res.json(analytics);
 });
 
-// Export Sales CSV
 app.get('/api/admin/sales/export', adminAuth, (req, res) => {
   const sales = readDB('sales');
   const schemes = readDB('schemes');
@@ -650,7 +642,6 @@ app.get('/api/admin/sales/export', adminAuth, (req, res) => {
   res.send(csv);
 });
 
-// System Health Check
 app.get('/api/admin/health', adminAuth, async (req, res) => {
   const b2Status = await verifyB2Connectivity();
   const schemes = readDB('schemes');
@@ -677,7 +668,193 @@ app.get('/api/admin/health', adminAuth, async (req, res) => {
   });
 });
 
-// Subjects, Grades, Banner, WhatsApp, Terms, Popups, Password, Backup, Restore routes unchanged
-// (Include all the existing admin routes from previous version)
+// ---------- LEARNING AREAS (SUBJECTS) ----------
+app.get('/api/admin/subjects', adminAuth, (req, res) => {
+  const areas = readDB('areas');
+  res.json(areas);
+});
 
+app.post('/api/admin/subjects', adminAuth, (req, res) => {
+  const { name } = req.body;
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'Subject name is required' });
+  }
+  const trimmed = name.trim();
+  const areas = readDB('areas');
+  if (areas.find(a => a.name.toLowerCase() === trimmed.toLowerCase())) {
+    return res.status(409).json({ error: 'Subject already exists' });
+  }
+  const newArea = { id: crypto.randomUUID(), name: trimmed };
+  areas.push(newArea);
+  writeDB('areas', areas);
+  res.status(201).json(newArea);
+});
+
+app.delete('/api/admin/subjects/:id', adminAuth, (req, res) => {
+  const areas = readDB('areas');
+  const filtered = areas.filter(a => a.id !== req.params.id);
+  if (filtered.length === areas.length) {
+    return res.status(404).json({ error: 'Subject not found' });
+  }
+  writeDB('areas', filtered);
+  res.json({ ok: true });
+});
+
+// ---------- GRADES ----------
+app.get('/api/admin/grades', adminAuth, (req, res) => {
+  let grades = readDB('grades');
+  if (!grades.length) {
+    grades = Array.from({ length: 9 }, (_, i) => ({
+      id: crypto.randomUUID(),
+      name: `Grade ${i+1}`,
+      active: true
+    }));
+    writeDB('grades', grades);
+  }
+  res.json(grades);
+});
+
+app.post('/api/admin/grades', adminAuth, (req, res) => {
+  const { name } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+  const grades = readDB('grades');
+  grades.push({ id: crypto.randomUUID(), name: name.trim(), active: true });
+  writeDB('grades', grades);
+  res.status(201).json({ ok: true });
+});
+
+app.delete('/api/admin/grades/:id', adminAuth, (req, res) => {
+  const grades = readDB('grades').filter(g => g.id !== req.params.id);
+  writeDB('grades', grades);
+  res.json({ ok: true });
+});
+
+// ---------- VISITORS ----------
+app.get('/api/admin/visitors', adminAuth, (req, res) => {
+  res.json(readDB('visitors'));
+});
+
+app.delete('/api/admin/visitors/clear', adminAuth, (req, res) => {
+  writeDB('visitors', []);
+  res.json({ ok: true });
+});
+
+// ---------- BANNER ----------
+app.get('/api/admin/banner', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  res.json({ text: s.bannerText || '', enabled: s.bannerEnabled || false });
+});
+
+app.post('/api/admin/banner', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  s.bannerText = req.body.text || '';
+  s.bannerEnabled = req.body.enabled || false;
+  writeDB('settings', s);
+  res.json({ ok: true });
+});
+
+// ---------- WHATSAPP ----------
+app.get('/api/admin/whatsapp', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  res.json({ number: s.waNumber || '', message: s.waMessage || 'Hello', enabled: s.waEnabled || false });
+});
+
+app.post('/api/admin/whatsapp', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  s.waNumber = req.body.number || '';
+  s.waMessage = req.body.message || 'Hello';
+  s.waEnabled = req.body.enabled || false;
+  writeDB('settings', s);
+  res.json({ ok: true });
+});
+
+// ---------- TERMS ----------
+app.get('/api/admin/terms', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  res.json({
+    term1Enabled: s.term1Enabled !== false,
+    term2Enabled: s.term2Enabled !== false,
+    term3Enabled: s.term3Enabled !== false,
+    defaultTerm: s.defaultTerm || '1'
+  });
+});
+
+app.post('/api/admin/terms', adminAuth, (req, res) => {
+  const s = readDB('settings', {});
+  if (req.body.term1Enabled !== undefined) s.term1Enabled = req.body.term1Enabled;
+  if (req.body.term2Enabled !== undefined) s.term2Enabled = req.body.term2Enabled;
+  if (req.body.term3Enabled !== undefined) s.term3Enabled = req.body.term3Enabled;
+  if (req.body.defaultTerm) s.defaultTerm = req.body.defaultTerm;
+  writeDB('settings', s);
+  res.json({ ok: true });
+});
+
+// ---------- POPUPS ----------
+app.get('/api/admin/popups', adminAuth, (req, res) => res.json(readDB('popups')));
+
+app.post('/api/admin/popups', adminAuth, (req, res) => {
+  const { question, options, trigger, collectWhatsapp } = req.body;
+  if (!question) return res.status(400).json({ error: 'Question required' });
+  const popups = readDB('popups');
+  popups.push({ id: crypto.randomUUID(), question, options, trigger: trigger || 'onload', collectWhatsapp: !!collectWhatsapp });
+  writeDB('popups', popups);
+  res.status(201).json({ ok: true });
+});
+
+// ---------- CHANGE PASSWORD ----------
+app.post('/api/admin/change-password', adminAuth, (req, res) => {
+  const { newPassword } = req.body;
+  if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Too short' });
+  const s = readDB('settings', {});
+  s.adminPassword = newPassword;
+  writeDB('settings', s);
+  res.json({ ok: true });
+});
+
+// ---------- FORGOT/RESET PASSWORD ----------
+app.post('/api/admin/forgot-password', async (req, res) => {
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  const resetCodes = readDB('resetCodes', {});
+  resetCodes['admin'] = { code, expires: Date.now() + 15*60*1000 };
+  writeDB('resetCodes', resetCodes);
+  res.json({ success: true, demoCode: DEMO_MODE ? code : undefined });
+});
+
+app.post('/api/admin/reset-password', (req, res) => {
+  const { code, newPassword } = req.body;
+  const resetCodes = readDB('resetCodes', {});
+  const stored = resetCodes['admin'];
+  if (!stored || stored.code !== code || stored.expires < Date.now()) {
+    return res.status(400).json({ error: 'Invalid or expired code' });
+  }
+  const s = readDB('settings', {});
+  s.adminPassword = newPassword;
+  writeDB('settings', s);
+  delete resetCodes['admin'];
+  writeDB('resetCodes', resetCodes);
+  res.json({ ok: true });
+});
+
+// ---------- BACKUP & RESTORE ----------
+app.get('/api/admin/backup', adminAuth, (req, res) => {
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="backup-${Date.now()}.zip"`);
+  const archive = archiver('zip', { zlib: { level: 6 } });
+  archive.pipe(res);
+  archive.directory(DATA_DIR, 'data');
+  archive.finalize();
+});
+
+app.post('/api/admin/restore', adminAuth, restoreStorage.single('backup'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file' });
+  try {
+    await extract(req.file.path, { dir: path.dirname(DATA_DIR) });
+    fs.unlinkSync(req.file.path);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- START SERVER ----------
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
