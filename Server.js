@@ -106,7 +106,7 @@ app.get('/api/popups', (r,res) => res.json(readDB('popups')));
 app.get('/api/cover/:id', async (r,res) => { const s = readDB('schemes').find(s=>s.id===r.params.id); if (!s?.coverKey) return res.status(404).send('No cover'); try { await streamFileFromB2(s.coverKey, res); } catch { res.status(404).send('Cover not found'); } });
 app.get('/api/grades/available', (r,res) => { const set = readDB('settings',{}), schemes = readDB('schemes').filter(s=>s.visible!==false); let grades = readDB('grades'); if(!grades.length){ grades = Array.from({length:9}, (_,i)=>({id:crypto.randomUUID(), name:`Grade ${i+1}`, active:true})); writeDB('grades',grades); } if(set.showAllGrades) return res.json(grades.filter(g=>g.active)); const gradeSet = new Set(); schemes.forEach(s=>{ if(s.grade) gradeSet.add(s.grade); }); res.json(Array.from(gradeSet).sort().map(n=> grades.find(g=>g.name===n)||{name:n,active:true})); });
 
-// ---------- PAYMENT ROUTES (FIXED) ----------
+// ---------- PAYMENT ROUTES (FIXED – VERIFICATION TOKEN STORED FIRST) ----------
 function normalisePhone(raw) { let p = String(raw).replace(/\D/g,''); if(p.startsWith('0')&&p.length===10) p='254'+p.slice(1); if(p.startsWith('7')&&p.length===9) p='254'+p; return (p.startsWith('254')&&p.length===12)?p:null; }
 
 app.post('/api/initiate-payment', async (r,res) => {
@@ -161,19 +161,30 @@ app.get('/api/payment-status/:id', async (r,res) => {
     const receipt = inner.mpesa_receipt_number;
 
     if (status === 'completed' && receipt) {
+      // ✅ STORE VERIFICATION TOKEN FIRST
       const vt = crypto.randomBytes(16).toString('hex');
-      verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now()+5*60*1000 };
+      verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5 * 60 * 1000 };
+      
+      // Update transaction
       transactions[r.params.id] = { ...tx, status: 'success', verificationToken: vt, mpesaReceipt: receipt };
       saveTx();
-      const scheme = readDB('schemes').find(s=>s.id===tx.productId);
+      
+      // Record sale (non-blocking)
+      const scheme = readDB('schemes').find(s => s.id === tx.productId);
       if (scheme) {
-        const sales = readDB('sales'); sales.push({ title: scheme.title, grade: scheme.grade, phone: tx.phone, amount: scheme.price, date: new Date().toISOString(), mpesaReceipt: receipt }); writeDB('sales', sales); incStat('sales');
+        const sales = readDB('sales');
+        sales.push({ title: scheme.title, grade: scheme.grade, phone: tx.phone, amount: scheme.price, date: new Date().toISOString(), mpesaReceipt: receipt });
+        writeDB('sales', sales);
+        incStat('sales');
         sendSaleNotification(scheme, tx.phone, scheme.price);
       }
+      
       return res.json({ status: 'success', verificationToken: vt });
     }
     if (['failed','cancelled','expired'].includes(status)) {
-      transactions[r.params.id].status = 'failed'; transactions[r.params.id].failReason = inner.result_description || 'Payment failed'; saveTx();
+      transactions[r.params.id].status = 'failed';
+      transactions[r.params.id].failReason = inner.result_description || 'Payment failed';
+      saveTx();
       return res.json({ status: 'failed', message: transactions[r.params.id].failReason });
     }
     res.json({ status: 'pending' });
