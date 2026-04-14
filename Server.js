@@ -189,10 +189,21 @@ app.use((req, res, next) => {
   next();
 });
 
-// Payment state
-const transactions = {};
+// Payment state (in-memory for speed, backed by persistent store)
 const verificationTokens = {};
 const downloadTokens = {};
+
+// Persistent transactions
+const TRANSACTIONS_FILE = path.join(DATA_DIR, 'transactions.json');
+function loadTransactions() {
+  try { return JSON.parse(fs.readFileSync(TRANSACTIONS_FILE, 'utf8')); }
+  catch { return {}; }
+}
+function saveTransactions(data) {
+  fs.writeFileSync(TRANSACTIONS_FILE, JSON.stringify(data, null, 2));
+}
+let transactions = loadTransactions();
+console.log(`📦 Loaded ${Object.keys(transactions).length} persisted transactions`);
 
 const PAYNECTA_API_URL = process.env.PAYNECTA_API_URL || 'https://paynecta.co.ke/api/v1';
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY || '';
@@ -289,7 +300,7 @@ app.get('/api/grades/available', (req, res) => {
   res.json(filtered);
 });
 
-// ---------- PAYMENT ROUTES (FIXED) ----------
+// ---------- PAYMENT ROUTES (PERSISTENT + FAST) ----------
 function normalisePhone(raw) {
   let p = String(raw).replace(/\D/g, '');
   if (p.startsWith('0') && p.length === 10) p = '254' + p.slice(1);
@@ -308,11 +319,13 @@ app.post('/api/initiate-payment', async (req, res) => {
   if (DEMO_MODE) {
     console.log(`🟡 DEMO: Init ${mobile} amount ${scheme.price}`);
     transactions[transactionId] = { status: 'pending', productId, phone: mobile };
+    saveTransactions(transactions);
     setTimeout(() => {
       if (transactions[transactionId]?.status === 'pending') {
         const vt = crypto.randomBytes(16).toString('hex');
         verificationTokens[vt] = { productId, expiresAt: Date.now() + 5*60*1000 };
         transactions[transactionId] = { status: 'success', productId, verificationToken: vt };
+        saveTransactions(transactions);
         console.log(`🟢 DEMO: Confirmed ${transactionId}`);
       }
     }, 5000);
@@ -333,6 +346,7 @@ app.post('/api/initiate-payment', async (req, res) => {
     const ref = data.transaction_reference || data.data?.transaction_reference;
     if (!ref) throw new Error('No transaction_reference');
     transactions[transactionId] = { transactionRef: ref, productId, status: 'pending', phone: mobile };
+    saveTransactions(transactions);
     console.log(`✅ Initiated ref: ${ref}`);
     res.json({ transactionId });
   } catch (err) {
@@ -364,6 +378,7 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
       const vt = crypto.randomBytes(16).toString('hex');
       verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5*60*1000 };
       transactions[req.params.transactionId] = { ...tx, status: 'success', verificationToken: vt };
+      saveTransactions(transactions);
       const scheme = readDB('schemes').find(s => s.id === tx.productId);
       const sales = readDB('sales');
       sales.push({ title: scheme?.title, grade: scheme?.grade, phone: tx.phone, amount: scheme?.price, date: new Date().toISOString() });
@@ -376,6 +391,7 @@ app.get('/api/payment-status/:transactionId', async (req, res) => {
 
     if (['failed', 'cancelled', 'expired'].includes(status)) {
       transactions[req.params.transactionId].status = 'failed';
+      saveTransactions(transactions);
       return res.json({ status: 'failed', message: inner.result_description || 'Payment failed' });
     }
 
