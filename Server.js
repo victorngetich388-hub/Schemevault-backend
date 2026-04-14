@@ -68,7 +68,7 @@ const restoreStorage = multer({ dest: path.join(DATA_DIR, 'tmp') });
 // ---------- Middleware ----------
 app.use(express.json()); app.use(express.urlencoded({ extended: true })); app.use(express.static(__dirname));
 app.use((r,res,next) => { res.setHeader('Access-Control-Allow-Origin','*'); res.setHeader('Access-Control-Allow-Methods','GET,POST,PUT,PATCH,DELETE,OPTIONS'); res.setHeader('Access-Control-Allow-Headers','Content-Type,X-Admin-Token'); if (r.method==='OPTIONS') return res.sendStatus(200); next(); });
-function adminAuth(r,res,next) { const t = r.headers['x-admin-token']||r.query.token; if (!t||t!==readDB('settings',{}).adminPassword) return res.status(401).json({error:'Unauthorized'}); next(); }
+function adminAuth(r,res,next) { const t = r.headers['x-admin-token']||r.query.token; const s=readDB('settings',{}); if (!t||t!==s.adminPassword) return res.status(401).json({error:'Unauthorized'}); next(); }
 function incStat(k) { const s = readDB('stats',{visits:0,downloads:0,sales:0}); s[k]=(s[k]||0)+1; writeDB('stats',s); }
 const userSessions = {};
 app.use((r,res,next) => { const ip = r.headers['x-forwarded-for']?.split(',')[0]||r.socket.remoteAddress; if(ip) { userSessions[ip]=Date.now(); Object.keys(userSessions).forEach(k=>{ if(Date.now()-userSessions[k]>300000) delete userSessions[k]; }); } next(); });
@@ -110,7 +110,6 @@ app.get('/api/grades/available', (r,res) => { const set = readDB('settings',{}),
 function normalisePhone(raw) { let p = String(raw).replace(/\D/g,''); if(p.startsWith('0')&&p.length===10) p='254'+p.slice(1); if(p.startsWith('7')&&p.length===9) p='254'+p; return (p.startsWith('254')&&p.length===12)?p:null; }
 
 app.post('/api/initiate-payment', async (r,res) => {
-  console.log('\n========== PAYMENT INITIATED ==========');
   const { phone, amount, productId } = r.body;
   const scheme = readDB('schemes').find(s=>s.id===productId);
   if (!scheme) return res.status(404).json({ error: 'Product not found' });
@@ -119,7 +118,6 @@ app.post('/api/initiate-payment', async (r,res) => {
   const txId = crypto.randomBytes(10).toString('hex');
 
   if (DEMO_MODE) {
-    console.log(`🟡 DEMO: Init ${mobile} amount ${scheme.price}`);
     transactions[txId] = { status: 'pending', productId, phone: mobile };
     saveTx();
     setTimeout(() => {
@@ -128,7 +126,6 @@ app.post('/api/initiate-payment', async (r,res) => {
         verificationTokens[vt] = { productId, expiresAt: Date.now()+5*60*1000 };
         transactions[txId] = { status: 'success', productId, verificationToken: vt };
         saveTx();
-        console.log(`🟢 DEMO: Confirmed ${txId}`);
       }
     }, 5000);
     return res.json({ transactionId: txId, demo: true });
@@ -136,23 +133,19 @@ app.post('/api/initiate-payment', async (r,res) => {
 
   try {
     const payload = { code: PAYNECTA_PAYMENT_CODE, mobile_number: mobile, amount: Number(amount||scheme.price) };
-    console.log('📤 Payload:', JSON.stringify(payload));
     const resp = await fetch(`${PAYNECTA_API_URL}/payment/initialize`, { method:'POST', headers:{'Content-Type':'application/json','X-API-Key':PAYNECTA_API_KEY,'X-User-Email':PAYNECTA_EMAIL}, body:JSON.stringify(payload) });
     const raw = await resp.text();
-    console.log('📥 Paynecta RAW:', raw);
     const data = JSON.parse(raw);
     const ref = data.transaction_reference || data.data?.transaction_reference;
     if (!ref) throw new Error('No transaction_reference');
     transactions[txId] = { transactionRef: ref, productId, status: 'pending', phone: mobile };
     saveTx();
-    console.log(`✅ Initiated ref: ${ref}, id: ${txId}`);
     res.json({ transactionId: txId });
-  } catch (e) { console.error('Init error:', e); res.status(502).json({ error: 'Payment gateway error' }); }
+  } catch (e) { res.status(502).json({ error: 'Payment gateway error' }); }
 });
 
 app.get('/api/payment-status/:id', async (r,res) => {
-  const { id } = r.params;
-  const tx = transactions[id];
+  const tx = transactions[r.params.id];
   if (!tx) return res.status(404).json({ status: 'not_found' });
   if (tx.status === 'success') return res.json({ status: 'success', verificationToken: tx.verificationToken });
   if (tx.status === 'failed') return res.json({ status: 'failed', message: tx.failReason });
@@ -162,17 +155,15 @@ app.get('/api/payment-status/:id', async (r,res) => {
     const url = `${PAYNECTA_API_URL}/payment/status?transaction_reference=${encodeURIComponent(tx.transactionRef)}`;
     const resp = await fetch(url, { headers:{'X-API-Key':PAYNECTA_API_KEY,'X-User-Email':PAYNECTA_EMAIL} });
     const raw = await resp.text();
-    console.log('📡 Status RAW:', raw);
     const data = JSON.parse(raw);
     const inner = data.data || data;
     const status = inner.status;
     const receipt = inner.mpesa_receipt_number;
 
     if (status === 'completed' && receipt) {
-      console.log('🎉 SUCCESS! Receipt:', receipt);
       const vt = crypto.randomBytes(16).toString('hex');
       verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now()+5*60*1000 };
-      transactions[id] = { ...tx, status: 'success', verificationToken: vt, mpesaReceipt: receipt };
+      transactions[r.params.id] = { ...tx, status: 'success', verificationToken: vt, mpesaReceipt: receipt };
       saveTx();
       const scheme = readDB('schemes').find(s=>s.id===tx.productId);
       if (scheme) {
@@ -182,22 +173,22 @@ app.get('/api/payment-status/:id', async (r,res) => {
       return res.json({ status: 'success', verificationToken: vt });
     }
     if (['failed','cancelled','expired'].includes(status)) {
-      transactions[id].status = 'failed'; transactions[id].failReason = inner.result_description || 'Payment failed'; saveTx();
-      return res.json({ status: 'failed', message: transactions[id].failReason });
+      transactions[r.params.id].status = 'failed'; transactions[r.params.id].failReason = inner.result_description || 'Payment failed'; saveTx();
+      return res.json({ status: 'failed', message: transactions[r.params.id].failReason });
     }
     res.json({ status: 'pending' });
-  } catch (e) { console.error('Status error:', e); res.json({ status: 'pending' }); }
+  } catch (e) { res.json({ status: 'pending' }); }
 });
 
 app.post('/api/request-download', (r,res) => { const { verificationToken, productId } = r.body; const vt = verificationTokens[verificationToken]; if (!vt||vt.productId!==productId||Date.now()>vt.expiresAt) return res.status(403).json({error:'Invalid token'}); const scheme = readDB('schemes').find(s=>s.id===productId); if (!scheme?.fileKey) return res.status(404).json({error:'File not found'}); const dt = crypto.randomBytes(16).toString('hex'); downloadTokens[dt] = { key: scheme.fileKey, fileName: scheme.originalName, expiresAt: Date.now()+2*60*1000 }; delete verificationTokens[verificationToken]; incStat('downloads'); res.json({ downloadToken: dt }); });
 app.get('/api/download/:token', async (r,res) => { const dt = downloadTokens[r.params.token]; if (!dt||Date.now()>dt.expiresAt) return res.status(403).send('Expired'); delete downloadTokens[r.params.token]; try { await streamFileFromB2(dt.key, res); } catch { res.status(404).send('File not found'); } });
 
-// ---------- ADMIN ROUTES (COMPLETE) ----------
-app.post('/api/admin/login', (r,res) => { const s=readDB('settings',{}); if(r.body.password===s.adminPassword) res.json({token:s.adminPassword,ok:true}); else res.status(401).json({error:'Wrong password'}); });
+// ---------- ADMIN ROUTES (ORIGINAL, FULLY FUNCTIONAL) ----------
+app.post('/api/admin/login', (r,res) => { const { password } = r.body; const s=readDB('settings',{}); if(password===s.adminPassword) res.json({token:password,ok:true}); else res.status(401).json({error:'Wrong password'}); });
 app.get('/api/admin/verify', adminAuth, (r,res) => res.json({ok:true}));
 app.get('/api/admin/stats', adminAuth, (r,res) => { const s=readDB('stats',{}); res.json({ visits:s.visits||0, downloads:s.downloads||0, sales:s.sales||0, schemes:readDB('schemes').length, activeUsers:Object.keys(userSessions).length }); });
 app.get('/api/admin/schemes', adminAuth, (r,res) => res.json(readDB('schemes')));
-app.post('/api/admin/schemes', adminAuth, upload.fields([{name:'document'},{name:'cover'}]), async (r,res) => { if(!B2_ENABLED) return res.status(503).json({error:'B2 unavailable'}); try { const {title,subject,grade,term,price,weeks,pages,visible,publishAt,unpublishAt}=r.body; if(!title||!subject||!grade||!term||!price||!r.files?.document) return res.status(400).json({error:'Missing fields'}); const docKey = await uploadBufferToB2(r.files.document[0].buffer, r.files.document[0].originalname, r.files.document[0].mimetype, 'schemes'); let coverKey=null; if(r.files.cover) coverKey = await uploadBufferToB2(r.files.cover[0].buffer, r.files.cover[0].originalname, r.files.cover[0].mimetype, 'covers'); const scheme = { id:crypto.randomUUID(), title, subject, grade, term:Number(term), price:Number(price), weeks:weeks?Number(weeks):null, pages:pages?Number(pages):null, fileKey:docKey, originalName:r.files.document[0].originalname, coverKey, visible:visible!=='false', createdAt:new Date().toISOString(), publishAt:publishAt||null, unpublishAt:unpublishAt||null }; const schemes=readDB('schemes'); schemes.push(scheme); writeDB('schemes',schemes); res.status(201).json(scheme); } catch(e) { console.error('Upload error:',e); res.status(500).json({error:e.message}); } });
+app.post('/api/admin/schemes', adminAuth, upload.fields([{name:'document'},{name:'cover'}]), async (r,res) => { if(!B2_ENABLED) return res.status(503).json({error:'B2 unavailable'}); try { const {title,subject,grade,term,price,weeks,pages,visible,publishAt,unpublishAt}=r.body; if(!title||!subject||!grade||!term||!price||!r.files?.document) return res.status(400).json({error:'Missing fields'}); const docKey = await uploadBufferToB2(r.files.document[0].buffer, r.files.document[0].originalname, r.files.document[0].mimetype, 'schemes'); let coverKey=null; if(r.files.cover) coverKey = await uploadBufferToB2(r.files.cover[0].buffer, r.files.cover[0].originalname, r.files.cover[0].mimetype, 'covers'); const scheme = { id:crypto.randomUUID(), title, subject, grade, term:Number(term), price:Number(price), weeks:weeks?Number(weeks):null, pages:pages?Number(pages):null, fileKey:docKey, originalName:r.files.document[0].originalname, coverKey, visible:visible!=='false', createdAt:new Date().toISOString(), publishAt:publishAt||null, unpublishAt:unpublishAt||null }; const schemes=readDB('schemes'); schemes.push(scheme); writeDB('schemes',schemes); res.status(201).json(scheme); } catch(e) { res.status(500).json({error:e.message}); } });
 app.patch('/api/admin/schemes/:id', adminAuth, (r,res) => { const schemes=readDB('schemes'); const idx=schemes.findIndex(s=>s.id===r.params.id); if(idx===-1) return res.status(404).json({error:'Not found'}); const {price,weeks,visible,publishAt,unpublishAt}=r.body; if(price!==undefined) schemes[idx].price=Number(price); if(weeks!==undefined) schemes[idx].weeks=Number(weeks)||null; if(visible!==undefined) schemes[idx].visible=Boolean(visible); if(publishAt!==undefined) schemes[idx].publishAt=publishAt||null; if(unpublishAt!==undefined) schemes[idx].unpublishAt=unpublishAt||null; writeDB('schemes',schemes); res.json(schemes[idx]); });
 app.post('/api/admin/schemes/:id/cover', adminAuth, upload.single('cover'), async (r,res) => { if(!B2_ENABLED) return res.status(503).json({error:'B2 unavailable'}); const schemes=readDB('schemes'); const scheme=schemes.find(s=>s.id===r.params.id); if(!scheme) return res.status(404).json({error:'Not found'}); if(!r.file) return res.status(400).json({error:'No file'}); try { scheme.coverKey = await uploadBufferToB2(r.file.buffer, r.file.originalname, r.file.mimetype, 'covers'); writeDB('schemes',schemes); res.json({ok:true}); } catch(e) { res.status(500).json({error:e.message}); } });
 app.delete('/api/admin/schemes/:id', adminAuth, (r,res) => { writeDB('schemes', readDB('schemes').filter(s=>s.id!==r.params.id)); res.json({ok:true}); });
