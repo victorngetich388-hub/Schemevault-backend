@@ -106,7 +106,7 @@ app.get('/api/popups', (r,res) => res.json(readDB('popups')));
 app.get('/api/cover/:id', async (r,res) => { const s = readDB('schemes').find(s=>s.id===r.params.id); if (!s?.coverKey) return res.status(404).send('No cover'); try { await streamFileFromB2(s.coverKey, res); } catch { res.status(404).send('Cover not found'); } });
 app.get('/api/grades/available', (r,res) => { const set = readDB('settings',{}), schemes = readDB('schemes').filter(s=>s.visible!==false); let grades = readDB('grades'); if(!grades.length){ grades = Array.from({length:9}, (_,i)=>({id:crypto.randomUUID(), name:`Grade ${i+1}`, active:true})); writeDB('grades',grades); } if(set.showAllGrades) return res.json(grades.filter(g=>g.active)); const gradeSet = new Set(); schemes.forEach(s=>{ if(s.grade) gradeSet.add(s.grade); }); res.json(Array.from(gradeSet).sort().map(n=> grades.find(g=>g.name===n)||{name:n,active:true})); });
 
-// ---------- PAYMENT ROUTES (FIXED – VERIFICATION TOKEN STORED FIRST) ----------
+// ---------- PAYMENT ROUTES (FIXED) ----------
 function normalisePhone(raw) { let p = String(raw).replace(/\D/g,''); if(p.startsWith('0')&&p.length===10) p='254'+p.slice(1); if(p.startsWith('7')&&p.length===9) p='254'+p; return (p.startsWith('254')&&p.length===12)?p:null; }
 
 app.post('/api/initiate-payment', async (r,res) => {
@@ -161,15 +161,10 @@ app.get('/api/payment-status/:id', async (r,res) => {
     const receipt = inner.mpesa_receipt_number;
 
     if (status === 'completed' && receipt) {
-      // ✅ STORE VERIFICATION TOKEN FIRST
       const vt = crypto.randomBytes(16).toString('hex');
       verificationTokens[vt] = { productId: tx.productId, expiresAt: Date.now() + 5 * 60 * 1000 };
-      
-      // Update transaction
       transactions[r.params.id] = { ...tx, status: 'success', verificationToken: vt, mpesaReceipt: receipt };
       saveTx();
-      
-      // Record sale (non-blocking)
       const scheme = readDB('schemes').find(s => s.id === tx.productId);
       if (scheme) {
         const sales = readDB('sales');
@@ -178,7 +173,6 @@ app.get('/api/payment-status/:id', async (r,res) => {
         incStat('sales');
         sendSaleNotification(scheme, tx.phone, scheme.price);
       }
-      
       return res.json({ status: 'success', verificationToken: vt });
     }
     if (['failed','cancelled','expired'].includes(status)) {
@@ -194,61 +188,55 @@ app.get('/api/payment-status/:id', async (r,res) => {
 app.post('/api/request-download', (r,res) => { const { verificationToken, productId } = r.body; const vt = verificationTokens[verificationToken]; if (!vt||vt.productId!==productId||Date.now()>vt.expiresAt) return res.status(403).json({error:'Invalid token'}); const scheme = readDB('schemes').find(s=>s.id===productId); if (!scheme?.fileKey) return res.status(404).json({error:'File not found'}); const dt = crypto.randomBytes(16).toString('hex'); downloadTokens[dt] = { key: scheme.fileKey, fileName: scheme.originalName, expiresAt: Date.now()+2*60*1000 }; delete verificationTokens[verificationToken]; incStat('downloads'); res.json({ downloadToken: dt }); });
 app.get('/api/download/:token', async (r,res) => { const dt = downloadTokens[r.params.token]; if (!dt||Date.now()>dt.expiresAt) return res.status(403).send('Expired'); delete downloadTokens[r.params.token]; try { await streamFileFromB2(dt.key, res); } catch { res.status(404).send('File not found'); } });
 
-// ---------- ADMIN ROUTES (ORIGINAL, FULLY FUNCTIONAL) ----------
+// ---------- ADMIN ROUTES ----------
 app.post('/api/admin/login', (r,res) => { const { password } = r.body; const s=readDB('settings',{}); if(password===s.adminPassword) res.json({token:password,ok:true}); else res.status(401).json({error:'Wrong password'}); });
 app.get('/api/admin/verify', adminAuth, (r,res) => res.json({ok:true}));
 app.get('/api/admin/stats', adminAuth, (r,res) => { const s=readDB('stats',{}); res.json({ visits:s.visits||0, downloads:s.downloads||0, sales:s.sales||0, schemes:readDB('schemes').length, activeUsers:Object.keys(userSessions).length }); });
 app.get('/api/admin/schemes', adminAuth, (r,res) => res.json(readDB('schemes')));
 app.post('/api/admin/schemes', adminAuth, upload.fields([{name:'document'},{name:'cover'}]), async (r,res) => { if(!B2_ENABLED) return res.status(503).json({error:'B2 unavailable'}); try { const {title,subject,grade,term,price,weeks,pages,visible,publishAt,unpublishAt}=r.body; if(!title||!subject||!grade||!term||!price||!r.files?.document) return res.status(400).json({error:'Missing fields'}); const docKey = await uploadBufferToB2(r.files.document[0].buffer, r.files.document[0].originalname, r.files.document[0].mimetype, 'schemes'); let coverKey=null; if(r.files.cover) coverKey = await uploadBufferToB2(r.files.cover[0].buffer, r.files.cover[0].originalname, r.files.cover[0].mimetype, 'covers'); const scheme = { id:crypto.randomUUID(), title, subject, grade, term:Number(term), price:Number(price), weeks:weeks?Number(weeks):null, pages:pages?Number(pages):null, fileKey:docKey, originalName:r.files.document[0].originalname, coverKey, visible:visible!=='false', createdAt:new Date().toISOString(), publishAt:publishAt||null, unpublishAt:unpublishAt||null }; const schemes=readDB('schemes'); schemes.push(scheme); writeDB('schemes',schemes); res.status(201).json(scheme); } catch(e) { res.status(500).json({error:e.message}); } });
-app.patch('/api/admin/schemes/:id', adminAuth, (r,res) => { const schemes=readDB('schemes'); const idx=schemes.findIndex(s=>s.id===r.params.id); if(idx===-1) return res.status(404).json({error:'Not found'}); const {price,weeks,visible,publishAt,unpublishAt}=r.body; if(price!==undefined) schemes[idx].price=Number(price); if(weeks!==undefined) schemes[idx].weeks=Number(weeks)||null; if(visible!==undefined) schemes[idx].visible=Boolean(visible); if(publishAt!==undefined) schemes[idx].publishAt=publishAt||null; if(unpublishAt!==undefined) schemes[idx].unpublishAt=unpublishAt||null; writeDB('schemes',schemes); res.json(schemes[idx]); });
+
+// Extended PATCH route – now supports title, grade, term
+app.patch('/api/admin/schemes/:id', adminAuth, (r,res) => {
+  const schemes=readDB('schemes'); const idx=schemes.findIndex(s=>s.id===r.params.id);
+  if(idx===-1) return res.status(404).json({error:'Not found'});
+  const { title, grade, term, price, weeks, visible, publishAt, unpublishAt } = r.body;
+  if (title !== undefined) schemes[idx].title = title;
+  if (grade !== undefined) schemes[idx].grade = grade;
+  if (term !== undefined) schemes[idx].term = Number(term);
+  if (price !== undefined) schemes[idx].price = Number(price);
+  if (weeks !== undefined) schemes[idx].weeks = Number(weeks) || null;
+  if (visible !== undefined) schemes[idx].visible = Boolean(visible);
+  if (publishAt !== undefined) schemes[idx].publishAt = publishAt || null;
+  if (unpublishAt !== undefined) schemes[idx].unpublishAt = unpublishAt || null;
+  writeDB('schemes', schemes);
+  res.json(schemes[idx]);
+});
+
 app.post('/api/admin/schemes/:id/cover', adminAuth, upload.single('cover'), async (r,res) => { if(!B2_ENABLED) return res.status(503).json({error:'B2 unavailable'}); const schemes=readDB('schemes'); const scheme=schemes.find(s=>s.id===r.params.id); if(!scheme) return res.status(404).json({error:'Not found'}); if(!r.file) return res.status(400).json({error:'No file'}); try { scheme.coverKey = await uploadBufferToB2(r.file.buffer, r.file.originalname, r.file.mimetype, 'covers'); writeDB('schemes',schemes); res.json({ok:true}); } catch(e) { res.status(500).json({error:e.message}); } });
 app.delete('/api/admin/schemes/:id', adminAuth, (r,res) => { writeDB('schemes', readDB('schemes').filter(s=>s.id!==r.params.id)); res.json({ok:true}); });
 app.post('/api/admin/schemes/bulk', adminAuth, upload.fields([{name:'documents'},{name:'covers'}]), async (r,res) => { if(!B2_ENABLED) return res.status(503).json({error:'B2 unavailable'}); const {title,subject,grade,term,price,weeks,pages,visible}=r.body; if(!title||!subject||!grade||!term||!price||!r.files?.documents) return res.status(400).json({error:'Missing fields'}); const docs=r.files.documents, covers=r.files.covers||[], schemes=readDB('schemes'), created=[]; for(let i=0;i<docs.length;i++) { try { const docKey=await uploadBufferToB2(docs[i].buffer,docs[i].originalname,docs[i].mimetype,'schemes'); let coverKey=null; if(covers[i]) coverKey=await uploadBufferToB2(covers[i].buffer,covers[i].originalname,covers[i].mimetype,'covers'); const scheme={ id:crypto.randomUUID(), title: docs.length>1?`${title} (${i+1})`:title, subject, grade, term:Number(term), price:Number(price), weeks:weeks?Number(weeks):null, pages:pages?Number(pages):null, fileKey:docKey, originalName:docs[i].originalname, coverKey, visible:visible!=='false', createdAt:new Date().toISOString() }; schemes.push(scheme); created.push(scheme); } catch(e){} } writeDB('schemes',schemes); res.status(201).json({created:created.length}); });
 
-// SMART BULK UPLOAD – Files with pre‑detected metadata (editable)
-app.post('/api/admin/schemes/bulk-smart', adminAuth, upload.fields([
-  { name: 'documents', maxCount: 50 },
-  { name: 'covers', maxCount: 50 }
-]), async (req, res) => {
-  if (!B2_ENABLED || !b2Client) {
-    return res.status(503).json({ error: 'Storage service unavailable. Check B2 configuration.' });
-  }
-
+// SMART BULK UPLOAD
+app.post('/api/admin/schemes/bulk-smart', adminAuth, upload.fields([{ name: 'documents', maxCount: 50 }, { name: 'covers', maxCount: 50 }]), async (req, res) => {
+  if (!B2_ENABLED || !b2Client) return res.status(503).json({ error: 'Storage unavailable' });
   try {
     const { filesMeta } = req.body;
-    if (!filesMeta) {
-      return res.status(400).json({ error: 'Missing files metadata' });
-    }
-
+    if (!filesMeta) return res.status(400).json({ error: 'Missing files metadata' });
     let metadataArray;
-    try {
-      metadataArray = JSON.parse(filesMeta);
-    } catch (e) {
-      return res.status(400).json({ error: 'Invalid metadata JSON' });
-    }
-
+    try { metadataArray = JSON.parse(filesMeta); } catch (e) { return res.status(400).json({ error: 'Invalid metadata JSON' }); }
     const documents = req.files.documents || [];
     const covers = req.files.covers || [];
-
-    if (documents.length !== metadataArray.length) {
-      return res.status(400).json({ error: 'File count mismatch' });
-    }
-
+    if (documents.length !== metadataArray.length) return res.status(400).json({ error: 'File count mismatch' });
     const schemes = readDB('schemes');
     const created = [];
-
     for (let i = 0; i < documents.length; i++) {
       const doc = documents[i];
       const meta = metadataArray[i];
       const cover = covers[i] || null;
-
       try {
         const docKey = await uploadBufferToB2(doc.buffer, doc.originalname, doc.mimetype, 'schemes');
         let coverKey = null;
-        if (cover) {
-          coverKey = await uploadBufferToB2(cover.buffer, cover.originalname, cover.mimetype, 'covers');
-        }
-
+        if (cover) coverKey = await uploadBufferToB2(cover.buffer, cover.originalname, cover.mimetype, 'covers');
         const scheme = {
           id: crypto.randomUUID(),
           title: meta.title || doc.originalname.replace(/\.[^/.]+$/, ''),
@@ -266,20 +254,37 @@ app.post('/api/admin/schemes/bulk-smart', adminAuth, upload.fields([
           publishAt: meta.publishAt || null,
           unpublishAt: meta.unpublishAt || null
         };
-
         schemes.push(scheme);
         created.push(scheme);
-      } catch (e) {
-        console.error(`Failed to upload ${doc.originalname}:`, e);
-      }
+      } catch (e) { console.error('Smart bulk item failed:', e); }
     }
-
     writeDB('schemes', schemes);
-    res.status(201).json({ created: created.length, schemes: created });
-  } catch (err) {
-    console.error('Smart bulk upload error:', err);
-    res.status(500).json({ error: err.message || 'Upload failed' });
-  }
+    res.status(201).json({ created: created.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// BULK COVER ASSIGNMENT (NEW)
+app.post('/api/admin/schemes/bulk-cover', adminAuth, upload.array('covers', 50), async (req, res) => {
+  if (!B2_ENABLED || !b2Client) return res.status(503).json({ error: 'Storage unavailable' });
+  try {
+    const { grade, term, subject } = req.body;
+    const coverFiles = req.files;
+    if (!grade || !term || !subject) return res.status(400).json({ error: 'Grade, term, and subject required' });
+    if (!coverFiles || coverFiles.length === 0) return res.status(400).json({ error: 'No cover images' });
+    const schemes = readDB('schemes');
+    const matching = schemes.filter(s => s.grade === grade && s.term === Number(term) && s.subject === subject).sort((a,b) => a.title.localeCompare(b.title));
+    if (matching.length === 0) return res.status(404).json({ error: 'No matching schemes' });
+    let assigned = 0;
+    for (let i = 0; i < Math.min(coverFiles.length, matching.length); i++) {
+      try {
+        const coverKey = await uploadBufferToB2(coverFiles[i].buffer, coverFiles[i].originalname, coverFiles[i].mimetype, 'covers');
+        matching[i].coverKey = coverKey;
+        assigned++;
+      } catch (e) { console.error('Cover upload failed:', e); }
+    }
+    writeDB('schemes', schemes);
+    res.json({ ok: true, assigned, total: matching.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/admin/schemes/bulk-price', adminAuth, (r,res) => { const {schemeIds,price,operation='set'}=r.body; const schemes=readDB('schemes'); let updated=0; schemes.forEach(s=>{ if(schemeIds.includes(s.id)) { if(operation==='set') s.price=Number(price); else if(operation==='increase') s.price=Math.max(0,s.price+Number(price)); else if(operation==='decrease') s.price=Math.max(0,s.price-Number(price)); updated++; } }); writeDB('schemes',schemes); res.json({ok:true,updated}); });
