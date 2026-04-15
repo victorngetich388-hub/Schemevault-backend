@@ -204,6 +204,84 @@ app.patch('/api/admin/schemes/:id', adminAuth, (r,res) => { const schemes=readDB
 app.post('/api/admin/schemes/:id/cover', adminAuth, upload.single('cover'), async (r,res) => { if(!B2_ENABLED) return res.status(503).json({error:'B2 unavailable'}); const schemes=readDB('schemes'); const scheme=schemes.find(s=>s.id===r.params.id); if(!scheme) return res.status(404).json({error:'Not found'}); if(!r.file) return res.status(400).json({error:'No file'}); try { scheme.coverKey = await uploadBufferToB2(r.file.buffer, r.file.originalname, r.file.mimetype, 'covers'); writeDB('schemes',schemes); res.json({ok:true}); } catch(e) { res.status(500).json({error:e.message}); } });
 app.delete('/api/admin/schemes/:id', adminAuth, (r,res) => { writeDB('schemes', readDB('schemes').filter(s=>s.id!==r.params.id)); res.json({ok:true}); });
 app.post('/api/admin/schemes/bulk', adminAuth, upload.fields([{name:'documents'},{name:'covers'}]), async (r,res) => { if(!B2_ENABLED) return res.status(503).json({error:'B2 unavailable'}); const {title,subject,grade,term,price,weeks,pages,visible}=r.body; if(!title||!subject||!grade||!term||!price||!r.files?.documents) return res.status(400).json({error:'Missing fields'}); const docs=r.files.documents, covers=r.files.covers||[], schemes=readDB('schemes'), created=[]; for(let i=0;i<docs.length;i++) { try { const docKey=await uploadBufferToB2(docs[i].buffer,docs[i].originalname,docs[i].mimetype,'schemes'); let coverKey=null; if(covers[i]) coverKey=await uploadBufferToB2(covers[i].buffer,covers[i].originalname,covers[i].mimetype,'covers'); const scheme={ id:crypto.randomUUID(), title: docs.length>1?`${title} (${i+1})`:title, subject, grade, term:Number(term), price:Number(price), weeks:weeks?Number(weeks):null, pages:pages?Number(pages):null, fileKey:docKey, originalName:docs[i].originalname, coverKey, visible:visible!=='false', createdAt:new Date().toISOString() }; schemes.push(scheme); created.push(scheme); } catch(e){} } writeDB('schemes',schemes); res.status(201).json({created:created.length}); });
+
+// SMART BULK UPLOAD – Files with pre‑detected metadata (editable)
+app.post('/api/admin/schemes/bulk-smart', adminAuth, upload.fields([
+  { name: 'documents', maxCount: 50 },
+  { name: 'covers', maxCount: 50 }
+]), async (req, res) => {
+  if (!B2_ENABLED || !b2Client) {
+    return res.status(503).json({ error: 'Storage service unavailable. Check B2 configuration.' });
+  }
+
+  try {
+    const { filesMeta } = req.body;
+    if (!filesMeta) {
+      return res.status(400).json({ error: 'Missing files metadata' });
+    }
+
+    let metadataArray;
+    try {
+      metadataArray = JSON.parse(filesMeta);
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid metadata JSON' });
+    }
+
+    const documents = req.files.documents || [];
+    const covers = req.files.covers || [];
+
+    if (documents.length !== metadataArray.length) {
+      return res.status(400).json({ error: 'File count mismatch' });
+    }
+
+    const schemes = readDB('schemes');
+    const created = [];
+
+    for (let i = 0; i < documents.length; i++) {
+      const doc = documents[i];
+      const meta = metadataArray[i];
+      const cover = covers[i] || null;
+
+      try {
+        const docKey = await uploadBufferToB2(doc.buffer, doc.originalname, doc.mimetype, 'schemes');
+        let coverKey = null;
+        if (cover) {
+          coverKey = await uploadBufferToB2(cover.buffer, cover.originalname, cover.mimetype, 'covers');
+        }
+
+        const scheme = {
+          id: crypto.randomUUID(),
+          title: meta.title || doc.originalname.replace(/\.[^/.]+$/, ''),
+          subject: meta.subject,
+          grade: meta.grade,
+          term: Number(meta.term),
+          price: Number(meta.price),
+          weeks: meta.weeks ? Number(meta.weeks) : null,
+          pages: meta.pages ? Number(meta.pages) : null,
+          fileKey: docKey,
+          originalName: doc.originalname,
+          coverKey,
+          visible: meta.visible !== false,
+          createdAt: new Date().toISOString(),
+          publishAt: meta.publishAt || null,
+          unpublishAt: meta.unpublishAt || null
+        };
+
+        schemes.push(scheme);
+        created.push(scheme);
+      } catch (e) {
+        console.error(`Failed to upload ${doc.originalname}:`, e);
+      }
+    }
+
+    writeDB('schemes', schemes);
+    res.status(201).json({ created: created.length, schemes: created });
+  } catch (err) {
+    console.error('Smart bulk upload error:', err);
+    res.status(500).json({ error: err.message || 'Upload failed' });
+  }
+});
+
 app.post('/api/admin/schemes/bulk-price', adminAuth, (r,res) => { const {schemeIds,price,operation='set'}=r.body; const schemes=readDB('schemes'); let updated=0; schemes.forEach(s=>{ if(schemeIds.includes(s.id)) { if(operation==='set') s.price=Number(price); else if(operation==='increase') s.price=Math.max(0,s.price+Number(price)); else if(operation==='decrease') s.price=Math.max(0,s.price-Number(price)); updated++; } }); writeDB('schemes',schemes); res.json({ok:true,updated}); });
 app.post('/api/admin/schemes/bulk-visibility', adminAuth, (r,res) => { const {schemeIds,visible}=r.body; const schemes=readDB('schemes'); let updated=0; schemes.forEach(s=>{ if(schemeIds.includes(s.id)) { s.visible=Boolean(visible); updated++; } }); writeDB('schemes',schemes); res.json({ok:true,updated}); });
 app.get('/api/admin/schemes/featured', adminAuth, (r,res) => res.json({featuredSchemeIds:readDB('settings',{}).featuredSchemeIds||[]}));
